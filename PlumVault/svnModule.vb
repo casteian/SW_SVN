@@ -943,6 +943,46 @@ Public Module svnModule
 
         status = getFileSVNStatus(bCheckServer:=True, modDocArr)
         If IsNothing(status) Then Exit Sub
+        Dim outOfDateBeforeLock As String() = status.sFilterUpToDate9("*")
+
+        If outOfDateBeforeLock IsNot Nothing Then
+            Dim msg As String =
+        "One or more selected files are out of date." & vbCrLf & vbCrLf &
+        "You should update to the latest geometry before getting locks." & vbCrLf & vbCrLf &
+        "Out-of-date files:" & vbCrLf &
+        stringArrToSingleStringWithNewLines(outOfDateBeforeLock, bTrimFileNames:=True, iLimit:=10) & vbCrLf &
+        "Would you like to update them now?"
+
+            Dim result As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+        msg,
+        swMessageBoxIcon_e.swMbWarning,
+        swMessageBoxBtn_e.swMbYesNo
+    )
+
+            If result = swMessageBoxResult_e.swMbHitYes Then
+                myGetLatestOrRevert(modDocArr, getLatestType.update, bVerbose:=True)
+
+                status = getFileSVNStatus(bCheckServer:=True, modDocArr)
+                If IsNothing(status) Then Exit Sub
+
+                outOfDateBeforeLock = status.sFilterUpToDate9("*")
+                If outOfDateBeforeLock IsNot Nothing Then
+                    iSwApp.SendMsgToUser2(
+                "The selected files are still out of date after update. Lock cancelled.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+                    Exit Sub
+                End If
+            Else
+                iSwApp.SendMsgToUser2(
+            "Lock cancelled. Update to latest geometry before locking.",
+            swMessageBoxIcon_e.swMbInformation,
+            swMessageBoxBtn_e.swMbOk
+        )
+                Exit Sub
+            End If
+        End If
         'If Not IsNothing(status.statError(0).sMessage) Then
         '    'If status.statError(0).sMessage <> "" Then
         '    '    iSwApp.SendMsgToUser(status.statError(0).sMessage)
