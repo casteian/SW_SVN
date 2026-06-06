@@ -33,6 +33,7 @@ Public Class SVNStatus
         Public addWithHist4 As String
         Public switchWParent5 As String
         Public lock6 As String
+        Public lockOwner As String
         Public tree7 As String
         'col 8 is blank
         Public upToDate9 As String
@@ -70,6 +71,7 @@ Public Class SVNStatus
         fp(j).addWithHist4 = sOutputLine.Substring(3, 1)
         fp(j).switchWParent5 = sOutputLine.Substring(4, 1)
         fp(j).lock6 = sOutputLine.Substring(5, 1)
+        fp(j).lockOwner = ""
         fp(j).tree7 = sOutputLine.Substring(6, 1)
         'col 8 is blank
         If bCheckServer Then

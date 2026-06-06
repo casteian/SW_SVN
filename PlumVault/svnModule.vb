@@ -72,6 +72,66 @@ Public Module svnModule
         Return bWhatToReturn
     End Function
 
+    Private Function normalizeSvnPath(pathInput As String) As String
+        If String.IsNullOrWhiteSpace(pathInput) Then Return ""
+
+        Try
+            If Not Path.IsPathRooted(pathInput) Then
+                pathInput = Path.Combine(myUserControl.localRepoPath.Text.TrimEnd("\"c), pathInput)
+            End If
+
+            Return Path.GetFullPath(pathInput).TrimEnd("\"c).ToLowerInvariant()
+        Catch
+            Return pathInput.Replace("/", "\").TrimEnd("\"c).ToLowerInvariant()
+        End Try
+    End Function
+
+    Private Function getSvnLockOwnersByPath(targetPath As String) As Dictionary(Of String, String)
+        Dim lockOwners As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        If String.IsNullOrWhiteSpace(targetPath) Then Return lockOwners
+
+        Dim xmlStatus As rawProcessReturn = runSvnProcess(
+        sSVNPath,
+        "status -u --xml --non-interactive """ & targetPath.TrimEnd("\"c) & """"
+    )
+
+        If xmlStatus.output Is Nothing Then Return lockOwners
+        If xmlStatus.outputError IsNot Nothing AndAlso xmlStatus.outputError.Trim() <> "" Then Return lockOwners
+        If xmlStatus.output.Trim() = "" Then Return lockOwners
+
+        Dim doc As New XmlDocument()
+
+        Try
+            doc.LoadXml(xmlStatus.output)
+        Catch
+            Return lockOwners
+        End Try
+
+        Dim entries As XmlNodeList = doc.SelectNodes("/status/target/entry")
+
+        For Each entry As XmlNode In entries
+            If entry.Attributes Is Nothing Then Continue For
+            If entry.Attributes("path") Is Nothing Then Continue For
+
+            Dim entryPath As String = entry.Attributes("path").Value
+            Dim ownerNode As XmlNode = entry.SelectSingleNode("repos-status/lock/owner")
+
+            If ownerNode Is Nothing Then
+                ownerNode = entry.SelectSingleNode("wc-status/lock/owner")
+            End If
+
+            If ownerNode Is Nothing Then Continue For
+
+            Dim owner As String = ownerNode.InnerText.Trim()
+            If owner = "" Then Continue For
+
+            lockOwners(normalizeSvnPath(entryPath)) = owner
+        Next
+
+        Return lockOwners
+    End Function
+
     Public Function getFileSVNStatus(ByVal bCheckServer As Boolean,
                               Optional ByRef modDocArr() As ModelDoc2 = Nothing,
                               Optional ByRef bUpdateStatusOfAllOpenModels As Boolean = True,
@@ -96,6 +156,7 @@ Public Module svnModule
 
         Dim statusProcessOutput As rawProcessReturn
         Dim sPropArr(,) As String
+        Dim lockOwnersByPath As Dictionary(Of String, String) = Nothing
 
         'Dim iOutputUbound As Integer
         Dim i As Integer = 0
@@ -134,6 +195,11 @@ Public Module svnModule
 
         'iSwApp.SendMsgToUser(sSVNPath)
         statusProcessOutput = runSvnProcess(sSVNPath, statusArguments)
+        If bCheckServer Then
+            lockOwnersByPath = getSvnLockOwnersByPath(myUserControl.localRepoPath.Text.TrimEnd("\"c))
+        Else
+            lockOwnersByPath = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+        End If
 
         sOutputLines = statusProcessOutput.output.Split(ControlChars.CrLf.ToCharArray(), StringSplitOptions.RemoveEmptyEntries)
         sOutputErrorLines = statusProcessOutput.outputError.Split(ControlChars.CrLf.ToCharArray(), StringSplitOptions.RemoveEmptyEntries)
@@ -253,12 +319,28 @@ Public Module svnModule
             If modDocTemp Is Nothing Then Continue For
 
             entireSVNStatus.addOutputLineToSVNStatus(sOutputLines(i), m, sFilePathTemp, modDocTemp, bCheckServer, vLookup(sFilePathTemp.Replace("\", "/"), sPropArr, 1))
+
+            Dim lockOwnerTemp As String = ""
+            If lockOwnersByPath IsNot Nothing Then
+                lockOwnersByPath.TryGetValue(normalizeSvnPath(sFilePathTemp), lockOwnerTemp)
+            End If
+
+            entireSVNStatus.fp(m).lockOwner = lockOwnerTemp
+
             m = m + 1
 
             If Not IsNothing(sModDocPathArr) Then
                 Index = svnAddInUtils.findIndexContains(sModDocPathArr, sFilePathTemp)
                 If Index = -1 Then Continue For
                 svnStatusOfPassedModDoc.addOutputLineToSVNStatus(sOutputLines(i), j, sFilePathTemp, modDocTemp, bCheckServer, vLookup(sFilePathTemp.Replace("\", "/"), sPropArr, returnColumn:=1))
+
+                Dim lockOwnerTemp2 As String = ""
+                If lockOwnersByPath IsNot Nothing Then
+                    lockOwnersByPath.TryGetValue(normalizeSvnPath(sFilePathTemp), lockOwnerTemp2)
+                End If
+
+                svnStatusOfPassedModDoc.fp(j).lockOwner = lockOwnerTemp2
+
                 j += 1
             End If
         Next i

@@ -753,6 +753,18 @@ Public Class UserControl1
         Return getModDocAttachedToNode
     End Function
 
+    Private Function stripStatusSuffix(nodeText As String) As String
+        If String.IsNullOrWhiteSpace(nodeText) Then Return nodeText
+
+        Dim suffixStart As Integer = nodeText.IndexOf(" [Locked", StringComparison.OrdinalIgnoreCase)
+
+        If suffixStart >= 0 Then
+            Return nodeText.Substring(0, suffixStart)
+        End If
+
+        Return nodeText
+    End Function
+
     Sub setNodeColorFromStatus(
         ByRef rootNode As TreeNode)
 
@@ -773,7 +785,11 @@ Public Class UserControl1
         'End If
 
         modDoc = getModDocAttachedToNode(rootNode)
-        status1 = findStatusForFile(rootNode.Text) 'IMPROVE ME FIXME. We want to include description, but still need to find the filename. Try separating by "*" since that is not allowed in filenames
+
+        Dim baseNodeText As String = stripStatusSuffix(rootNode.Text)
+        rootNode.Text = baseNodeText
+
+        status1 = findStatusForFile(baseNodeText)
 
         If modDoc Is Nothing Then
             bModelDocAttached = False
@@ -794,7 +810,8 @@ Public Class UserControl1
 
         ElseIf status1.fp(0).lock6 = "K" Then
             rootNode.BackColor = myCol.lockedByYou
-            rootNode.ToolTipText = "You have the Lock"
+            rootNode.ToolTipText = "Locked by you"
+            rootNode.Text &= " [Locked by you]"
 
             If bModelDocAttached Then
                 docMenu.Items.AddRange({myContextMenu.release})
@@ -816,9 +833,17 @@ Public Class UserControl1
             rootNode.ToolTipText = "Your Copy is Out Of Date"
             'If bModelDocAttached Then docMenu.Items.AddRange({myContextMenu.getLocksStealLabel})
 
-        ElseIf status1.fp(0).lock6 = "O" Then
+        ElseIf status1.fp(0).lock6 = "O" OrElse
+            (Not String.IsNullOrWhiteSpace(status1.fp(0).lockOwner) AndAlso status1.fp(0).lock6 <> "K") Then
             rootNode.BackColor = myCol.lockedBySomeoneElse
-            rootNode.ToolTipText = "Locked By Someone Else"
+
+            If Not String.IsNullOrWhiteSpace(status1.fp(0).lockOwner) Then
+                rootNode.ToolTipText = "Locked by: " & status1.fp(0).lockOwner
+                rootNode.Text &= " [Locked: " & status1.fp(0).lockOwner & "]"
+            Else
+                rootNode.ToolTipText = "Locked by someone else"
+                rootNode.Text &= " [Locked]"
+            End If
             If bModelDocAttached Then
                 docMenu.Items.AddRange({myContextMenu.getLocksStealLabel})
                 'If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
