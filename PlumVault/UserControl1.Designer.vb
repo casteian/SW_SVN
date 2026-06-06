@@ -81,14 +81,15 @@ Partial Class UserControl1
         Me.TreeView1.Anchor = CType((((System.Windows.Forms.AnchorStyles.Top Or System.Windows.Forms.AnchorStyles.Bottom) _
             Or System.Windows.Forms.AnchorStyles.Left) _
             Or System.Windows.Forms.AnchorStyles.Right), System.Windows.Forms.AnchorStyles)
-        Me.TreeView1.Location = New System.Drawing.Point(4, 621)
-        Me.TreeView1.MinimumSize = New System.Drawing.Size(250, 194)
+        Me.TreeView1.Location = New System.Drawing.Point(3, 530)
+        Me.TreeView1.Margin = New System.Windows.Forms.Padding(2)
+        Me.TreeView1.MinimumSize = New System.Drawing.Size(168, 131)
         Me.TreeView1.Name = "TreeView1"
         TreeNode1.Name = "Node0"
         TreeNode1.Text = "Open a File to See its Status"
         Me.TreeView1.Nodes.AddRange(New System.Windows.Forms.TreeNode() {TreeNode1})
         Me.TreeView1.ShowNodeToolTips = True
-        Me.TreeView1.Size = New System.Drawing.Size(562, 329)
+        Me.TreeView1.Size = New System.Drawing.Size(515, 150)
         Me.TreeView1.TabIndex = 10
         '
         'onlineCheckBox
@@ -96,27 +97,30 @@ Partial Class UserControl1
         Me.onlineCheckBox.AutoSize = True
         Me.onlineCheckBox.Checked = True
         Me.onlineCheckBox.CheckState = System.Windows.Forms.CheckState.Checked
-        Me.onlineCheckBox.Location = New System.Drawing.Point(4, 43)
+        Me.onlineCheckBox.Location = New System.Drawing.Point(3, 29)
+        Me.onlineCheckBox.Margin = New System.Windows.Forms.Padding(2)
         Me.onlineCheckBox.Name = "onlineCheckBox"
-        Me.onlineCheckBox.Size = New System.Drawing.Size(80, 24)
+        Me.onlineCheckBox.Size = New System.Drawing.Size(56, 17)
         Me.onlineCheckBox.TabIndex = 14
         Me.onlineCheckBox.Text = "Online"
         Me.onlineCheckBox.UseVisualStyleBackColor = True
         '
         'localRepoPath
         '
-        Me.localRepoPath.Location = New System.Drawing.Point(4, 3)
+        Me.localRepoPath.Location = New System.Drawing.Point(3, 2)
+        Me.localRepoPath.Margin = New System.Windows.Forms.Padding(2)
         Me.localRepoPath.Name = "localRepoPath"
-        Me.localRepoPath.Size = New System.Drawing.Size(538, 26)
+        Me.localRepoPath.Size = New System.Drawing.Size(360, 20)
         Me.localRepoPath.TabIndex = 15
         Me.localRepoPath.Text = "Enter Path to Local Repository"
         '
         'butPickFolder
         '
         Me.butPickFolder.Cursor = System.Windows.Forms.Cursors.Hand
-        Me.butPickFolder.Location = New System.Drawing.Point(103, 42)
+        Me.butPickFolder.Location = New System.Drawing.Point(190, 175)
+        Me.butPickFolder.Margin = New System.Windows.Forms.Padding(2)
         Me.butPickFolder.Name = "butPickFolder"
-        Me.butPickFolder.Size = New System.Drawing.Size(126, 25)
+        Me.butPickFolder.Size = New System.Drawing.Size(100, 22)
         Me.butPickFolder.TabIndex = 16
         Me.butPickFolder.Text = "Pick Folder"
         Me.butPickFolder.UseVisualStyleBackColor = True
@@ -126,9 +130,10 @@ Partial Class UserControl1
         '
         Me.butRefresh.Cursor = System.Windows.Forms.Cursors.Hand
         Me.butRefresh.Font = New System.Drawing.Font("Microsoft Sans Serif", 10.0!, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, CType(0, Byte))
-        Me.butRefresh.Location = New System.Drawing.Point(4, 571)
+        Me.butRefresh.Location = New System.Drawing.Point(3, 495)
+        Me.butRefresh.Margin = New System.Windows.Forms.Padding(2)
         Me.butRefresh.Name = "butRefresh"
-        Me.butRefresh.Size = New System.Drawing.Size(136, 44)
+        Me.butRefresh.Size = New System.Drawing.Size(91, 29)
         Me.butRefresh.TabIndex = 17
         Me.butRefresh.Text = "Refresh"
         Me.butRefresh.UseVisualStyleBackColor = True
@@ -139,9 +144,10 @@ Partial Class UserControl1
         Me.butCleanup.BackgroundImageLayout = System.Windows.Forms.ImageLayout.Stretch
         Me.butCleanup.Cursor = System.Windows.Forms.Cursors.Hand
         Me.butCleanup.Font = New System.Drawing.Font("Microsoft Sans Serif", 8.0!)
-        Me.butCleanup.Location = New System.Drawing.Point(246, 42)
+        Me.butCleanup.Location = New System.Drawing.Point(190, 202)
+        Me.butCleanup.Margin = New System.Windows.Forms.Padding(2)
         Me.butCleanup.Name = "butCleanup"
-        Me.butCleanup.Size = New System.Drawing.Size(156, 25)
+        Me.butCleanup.Size = New System.Drawing.Size(110, 22)
         Me.butCleanup.TabIndex = 12
         Me.butCleanup.Text = "SVN Clean Up"
         Me.butCleanup.UseVisualStyleBackColor = False
@@ -151,9 +157,10 @@ Partial Class UserControl1
         '
         Me.butFindComponent.Enabled = False
         Me.butFindComponent.Font = New System.Drawing.Font("Microsoft Sans Serif", 10.0!, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, CType(0, Byte))
-        Me.butFindComponent.Location = New System.Drawing.Point(146, 571)
+        Me.butFindComponent.Location = New System.Drawing.Point(97, 495)
+        Me.butFindComponent.Margin = New System.Windows.Forms.Padding(2)
         Me.butFindComponent.Name = "butFindComponent"
-        Me.butFindComponent.Size = New System.Drawing.Size(89, 44)
+        Me.butFindComponent.Size = New System.Drawing.Size(59, 29)
         Me.butFindComponent.TabIndex = 23
         Me.butFindComponent.Text = "Find"
         Me.butFindComponent.UseVisualStyleBackColor = True
@@ -199,12 +206,12 @@ Partial Class UserControl1
         Me.ToolStrip1.ImageScalingSize = New System.Drawing.Size(36, 50)
         Me.ToolStrip1.Items.AddRange(New System.Windows.Forms.ToolStripItem() {Me.ToolStripSplitButFolder, Me.ToolStripDropDownButGetLocks, Me.ToolStripDropDownButCommit, Me.ToolStripDropDownButUnlock, Me.ToolStripDropDownButGetLatest, Me.ToolStripDropDownButReleases})
         Me.ToolStrip1.LayoutStyle = System.Windows.Forms.ToolStripLayoutStyle.VerticalStackWithOverflow
-        Me.ToolStrip1.Location = New System.Drawing.Point(4, 73)
-        Me.ToolStrip1.MaximumSize = New System.Drawing.Size(400, 800)
-        Me.ToolStrip1.MinimumSize = New System.Drawing.Size(100, 200)
+        Me.ToolStrip1.Location = New System.Drawing.Point(3, 48)
+        Me.ToolStrip1.MaximumSize = New System.Drawing.Size(267, 533)
+        Me.ToolStrip1.MinimumSize = New System.Drawing.Size(67, 133)
         Me.ToolStrip1.Name = "ToolStrip1"
-        Me.ToolStrip1.Padding = New System.Windows.Forms.Padding(4, 5, 4, 0)
-        Me.ToolStrip1.Size = New System.Drawing.Size(183, 509)
+        Me.ToolStrip1.Padding = New System.Windows.Forms.Padding(3, 3, 3, 0)
+        Me.ToolStrip1.Size = New System.Drawing.Size(180, 439)
         Me.ToolStrip1.Stretch = True
         Me.ToolStrip1.TabIndex = 0
         '
@@ -219,7 +226,7 @@ Partial Class UserControl1
         Me.ToolStripSplitButFolder.ImageTransparentColor = System.Drawing.Color.Magenta
         Me.ToolStripSplitButFolder.Margin = New System.Windows.Forms.Padding(0, 5, 0, 5)
         Me.ToolStripSplitButFolder.Name = "ToolStripSplitButFolder"
-        Me.ToolStripSplitButFolder.Padding = New System.Windows.Forms.Padding(2, 50, 2, 50)
+        Me.ToolStripSplitButFolder.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
         Me.ToolStripSplitButFolder.Size = New System.Drawing.Size(174, 40)
         Me.ToolStripSplitButFolder.Text = "File..."
         Me.ToolStripSplitButFolder.TextImageRelation = System.Windows.Forms.TextImageRelation.Overlay
@@ -228,108 +235,108 @@ Partial Class UserControl1
         '
         Me.PickSVNFolderToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.OpenFolderPickerToolStripMenuItem})
         Me.PickSVNFolderToolStripMenuItem.Name = "PickSVNFolderToolStripMenuItem"
-        Me.PickSVNFolderToolStripMenuItem.Size = New System.Drawing.Size(305, 34)
+        Me.PickSVNFolderToolStripMenuItem.Size = New System.Drawing.Size(203, 22)
         Me.PickSVNFolderToolStripMenuItem.Text = "Pick SVN Folder"
         '
         'OpenFolderPickerToolStripMenuItem
         '
         Me.OpenFolderPickerToolStripMenuItem.Name = "OpenFolderPickerToolStripMenuItem"
-        Me.OpenFolderPickerToolStripMenuItem.Size = New System.Drawing.Size(270, 34)
+        Me.OpenFolderPickerToolStripMenuItem.Size = New System.Drawing.Size(174, 22)
         Me.OpenFolderPickerToolStripMenuItem.Text = "Open Folder Picker"
         '
         'SVNCleanupToolStripMenuItem
         '
         Me.SVNCleanupToolStripMenuItem.Name = "SVNCleanupToolStripMenuItem"
-        Me.SVNCleanupToolStripMenuItem.Size = New System.Drawing.Size(305, 34)
+        Me.SVNCleanupToolStripMenuItem.Size = New System.Drawing.Size(203, 22)
         Me.SVNCleanupToolStripMenuItem.Text = "SVN Cleanup"
         '
         'CopyToClipboardToolStripMenuItem
         '
         Me.CopyToClipboardToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.CopyFileNameToolStripMenuItem, Me.CopyActiveFilesParentFolderToolStripMenuItem, Me.CopyFullPathToolStripMenuItem, Me.CopySvnUrlToolStripMenuItem, Me.ShareWithColleagueToolStripMenuItem})
         Me.CopyToClipboardToolStripMenuItem.Name = "CopyToClipboardToolStripMenuItem"
-        Me.CopyToClipboardToolStripMenuItem.Size = New System.Drawing.Size(305, 34)
+        Me.CopyToClipboardToolStripMenuItem.Size = New System.Drawing.Size(203, 22)
         Me.CopyToClipboardToolStripMenuItem.Text = "Copy ... to Clipboard"
         '
         'CopyFileNameToolStripMenuItem
         '
         Me.CopyFileNameToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.CopyFileNameWithDependentsToolStripMenuItem})
         Me.CopyFileNameToolStripMenuItem.Name = "CopyFileNameToolStripMenuItem"
-        Me.CopyFileNameToolStripMenuItem.Size = New System.Drawing.Size(280, 34)
+        Me.CopyFileNameToolStripMenuItem.Size = New System.Drawing.Size(184, 22)
         Me.CopyFileNameToolStripMenuItem.Text = "File Name"
         '
         'CopyFileNameWithDependentsToolStripMenuItem
         '
         Me.CopyFileNameWithDependentsToolStripMenuItem.Name = "CopyFileNameWithDependentsToolStripMenuItem"
-        Me.CopyFileNameWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(252, 34)
+        Me.CopyFileNameWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(165, 22)
         Me.CopyFileNameWithDependentsToolStripMenuItem.Text = "With Dependents"
         '
         'CopyActiveFilesParentFolderToolStripMenuItem
         '
         Me.CopyActiveFilesParentFolderToolStripMenuItem.Name = "CopyActiveFilesParentFolderToolStripMenuItem"
-        Me.CopyActiveFilesParentFolderToolStripMenuItem.Size = New System.Drawing.Size(280, 34)
+        Me.CopyActiveFilesParentFolderToolStripMenuItem.Size = New System.Drawing.Size(184, 22)
         Me.CopyActiveFilesParentFolderToolStripMenuItem.Text = "Parent Folder"
         '
         'CopyFullPathToolStripMenuItem
         '
         Me.CopyFullPathToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.CopyFilesPathsWithDependentsToolStripMenuItem})
         Me.CopyFullPathToolStripMenuItem.Name = "CopyFullPathToolStripMenuItem"
-        Me.CopyFullPathToolStripMenuItem.Size = New System.Drawing.Size(280, 34)
+        Me.CopyFullPathToolStripMenuItem.Size = New System.Drawing.Size(184, 22)
         Me.CopyFullPathToolStripMenuItem.Text = "Full Path"
         '
         'CopyFilesPathsWithDependentsToolStripMenuItem
         '
         Me.CopyFilesPathsWithDependentsToolStripMenuItem.Name = "CopyFilesPathsWithDependentsToolStripMenuItem"
-        Me.CopyFilesPathsWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(252, 34)
+        Me.CopyFilesPathsWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(165, 22)
         Me.CopyFilesPathsWithDependentsToolStripMenuItem.Text = "With Dependents"
         '
         'CopySvnUrlToolStripMenuItem
         '
         Me.CopySvnUrlToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.CopySvnUrlWithDependentsToolStripMenuItem})
         Me.CopySvnUrlToolStripMenuItem.Name = "CopySvnUrlToolStripMenuItem"
-        Me.CopySvnUrlToolStripMenuItem.Size = New System.Drawing.Size(280, 34)
+        Me.CopySvnUrlToolStripMenuItem.Size = New System.Drawing.Size(184, 22)
         Me.CopySvnUrlToolStripMenuItem.Text = "SVN URL"
         '
         'CopySvnUrlWithDependentsToolStripMenuItem
         '
         Me.CopySvnUrlWithDependentsToolStripMenuItem.Name = "CopySvnUrlWithDependentsToolStripMenuItem"
-        Me.CopySvnUrlWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(252, 34)
+        Me.CopySvnUrlWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(165, 22)
         Me.CopySvnUrlWithDependentsToolStripMenuItem.Text = "With Dependents"
         '
         'ShareWithColleagueToolStripMenuItem
         '
         Me.ShareWithColleagueToolStripMenuItem.Name = "ShareWithColleagueToolStripMenuItem"
-        Me.ShareWithColleagueToolStripMenuItem.Size = New System.Drawing.Size(280, 34)
+        Me.ShareWithColleagueToolStripMenuItem.Size = New System.Drawing.Size(184, 22)
         Me.ShareWithColleagueToolStripMenuItem.Text = "Sharing File Message"
         '
         'SearchFileNameOnlineToolStripMenuItem
         '
         Me.SearchFileNameOnlineToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.GoogleToolStripMenuItem, Me.McToolStripMenuItem, Me.DigikeyToolStripMenuItem})
         Me.SearchFileNameOnlineToolStripMenuItem.Name = "SearchFileNameOnlineToolStripMenuItem"
-        Me.SearchFileNameOnlineToolStripMenuItem.Size = New System.Drawing.Size(305, 34)
+        Me.SearchFileNameOnlineToolStripMenuItem.Size = New System.Drawing.Size(203, 22)
         Me.SearchFileNameOnlineToolStripMenuItem.Text = "Search File Name Online"
         '
         'GoogleToolStripMenuItem
         '
         Me.GoogleToolStripMenuItem.Name = "GoogleToolStripMenuItem"
-        Me.GoogleToolStripMenuItem.Size = New System.Drawing.Size(231, 34)
+        Me.GoogleToolStripMenuItem.Size = New System.Drawing.Size(154, 22)
         Me.GoogleToolStripMenuItem.Text = "Google"
         '
         'McToolStripMenuItem
         '
         Me.McToolStripMenuItem.Name = "McToolStripMenuItem"
-        Me.McToolStripMenuItem.Size = New System.Drawing.Size(231, 34)
+        Me.McToolStripMenuItem.Size = New System.Drawing.Size(154, 22)
         Me.McToolStripMenuItem.Text = "McMaster-Carr"
         '
         'DigikeyToolStripMenuItem
         '
         Me.DigikeyToolStripMenuItem.Name = "DigikeyToolStripMenuItem"
-        Me.DigikeyToolStripMenuItem.Size = New System.Drawing.Size(231, 34)
+        Me.DigikeyToolStripMenuItem.Size = New System.Drawing.Size(154, 22)
         Me.DigikeyToolStripMenuItem.Text = "Digikey"
         '
         'OpenFileFromURLToolStripMenuItem
         '
         Me.OpenFileFromURLToolStripMenuItem.Name = "OpenFileFromURLToolStripMenuItem"
-        Me.OpenFileFromURLToolStripMenuItem.Size = New System.Drawing.Size(305, 34)
+        Me.OpenFileFromURLToolStripMenuItem.Size = New System.Drawing.Size(203, 22)
         Me.OpenFileFromURLToolStripMenuItem.Text = "Open File From URL"
         Me.OpenFileFromURLToolStripMenuItem.Visible = False
         '
@@ -337,14 +344,14 @@ Partial Class UserControl1
         '
         Me.CreateSvnFilelistToolStripMenuItem.DropDownItems.AddRange(New System.Windows.Forms.ToolStripItem() {Me.CreateSvnFilelistWithDependentsToolStripMenuItem})
         Me.CreateSvnFilelistToolStripMenuItem.Name = "CreateSvnFilelistToolStripMenuItem"
-        Me.CreateSvnFilelistToolStripMenuItem.Size = New System.Drawing.Size(305, 34)
+        Me.CreateSvnFilelistToolStripMenuItem.Size = New System.Drawing.Size(203, 22)
         Me.CreateSvnFilelistToolStripMenuItem.Text = "Create SVN FileList"
         Me.CreateSvnFilelistToolStripMenuItem.Visible = False
         '
         'CreateSvnFilelistWithDependentsToolStripMenuItem
         '
         Me.CreateSvnFilelistWithDependentsToolStripMenuItem.Name = "CreateSvnFilelistWithDependentsToolStripMenuItem"
-        Me.CreateSvnFilelistWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(252, 34)
+        Me.CreateSvnFilelistWithDependentsToolStripMenuItem.Size = New System.Drawing.Size(165, 22)
         Me.CreateSvnFilelistWithDependentsToolStripMenuItem.Text = "With Dependents"
         '
         'ToolStripDropDownButGetLocks
@@ -357,14 +364,14 @@ Partial Class UserControl1
         Me.ToolStripDropDownButGetLocks.Margin = New System.Windows.Forms.Padding(0, 5, 0, 5)
         Me.ToolStripDropDownButGetLocks.Name = "ToolStripDropDownButGetLocks"
         Me.ToolStripDropDownButGetLocks.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
-        Me.ToolStripDropDownButGetLocks.Size = New System.Drawing.Size(174, 75)
+        Me.ToolStripDropDownButGetLocks.Size = New System.Drawing.Size(173, 67)
         Me.ToolStripDropDownButGetLocks.Text = "Get Locks"
         Me.ToolStripDropDownButGetLocks.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageAboveText
         '
         'dropDownGetLocksWithDependents
         '
         Me.dropDownGetLocksWithDependents.Name = "dropDownGetLocksWithDependents"
-        Me.dropDownGetLocksWithDependents.Size = New System.Drawing.Size(230, 34)
+        Me.dropDownGetLocksWithDependents.Size = New System.Drawing.Size(165, 22)
         Me.dropDownGetLocksWithDependents.Text = "With Dependents"
         '
         'ToolStripDropDownButCommit
@@ -377,7 +384,7 @@ Partial Class UserControl1
         Me.ToolStripDropDownButCommit.Margin = New System.Windows.Forms.Padding(0, 5, 0, 5)
         Me.ToolStripDropDownButCommit.Name = "ToolStripDropDownButCommit"
         Me.ToolStripDropDownButCommit.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
-        Me.ToolStripDropDownButCommit.Size = New System.Drawing.Size(174, 75)
+        Me.ToolStripDropDownButCommit.Size = New System.Drawing.Size(173, 67)
         Me.ToolStripDropDownButCommit.Tag = "butTagCommit"
         Me.ToolStripDropDownButCommit.Text = "Commit"
         Me.ToolStripDropDownButCommit.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageAboveText
@@ -386,13 +393,13 @@ Partial Class UserControl1
         'dropDownCommitWithDependents
         '
         Me.dropDownCommitWithDependents.Name = "dropDownCommitWithDependents"
-        Me.dropDownCommitWithDependents.Size = New System.Drawing.Size(230, 34)
+        Me.dropDownCommitWithDependents.Size = New System.Drawing.Size(165, 22)
         Me.dropDownCommitWithDependents.Text = "With Dependents"
         '
         'dropDownCommitAll
         '
         Me.dropDownCommitAll.Name = "dropDownCommitAll"
-        Me.dropDownCommitAll.Size = New System.Drawing.Size(230, 34)
+        Me.dropDownCommitAll.Size = New System.Drawing.Size(165, 22)
         Me.dropDownCommitAll.Text = "All"
         '
         'ToolStripDropDownButUnlock
@@ -405,20 +412,20 @@ Partial Class UserControl1
         Me.ToolStripDropDownButUnlock.Margin = New System.Windows.Forms.Padding(0, 5, 0, 5)
         Me.ToolStripDropDownButUnlock.Name = "ToolStripDropDownButUnlock"
         Me.ToolStripDropDownButUnlock.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
-        Me.ToolStripDropDownButUnlock.Size = New System.Drawing.Size(174, 74)
+        Me.ToolStripDropDownButUnlock.Size = New System.Drawing.Size(173, 66)
         Me.ToolStripDropDownButUnlock.Text = "Unlock && Revert"
         Me.ToolStripDropDownButUnlock.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageAboveText
         '
         'dropDownUnlockWithDependents
         '
         Me.dropDownUnlockWithDependents.Name = "dropDownUnlockWithDependents"
-        Me.dropDownUnlockWithDependents.Size = New System.Drawing.Size(223, 34)
+        Me.dropDownUnlockWithDependents.Size = New System.Drawing.Size(146, 22)
         Me.dropDownUnlockWithDependents.Text = "With Dependents"
         '
         'dropDownUnlockAll
         '
         Me.dropDownUnlockAll.Name = "dropDownUnlockAll"
-        Me.dropDownUnlockAll.Size = New System.Drawing.Size(223, 34)
+        Me.dropDownUnlockAll.Size = New System.Drawing.Size(146, 22)
         Me.dropDownUnlockAll.Text = "All"
         '
         'ToolStripDropDownButGetLatest
@@ -431,20 +438,20 @@ Partial Class UserControl1
         Me.ToolStripDropDownButGetLatest.Margin = New System.Windows.Forms.Padding(0, 5, 0, 5)
         Me.ToolStripDropDownButGetLatest.Name = "ToolStripDropDownButGetLatest"
         Me.ToolStripDropDownButGetLatest.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
-        Me.ToolStripDropDownButGetLatest.Size = New System.Drawing.Size(174, 75)
+        Me.ToolStripDropDownButGetLatest.Size = New System.Drawing.Size(173, 67)
         Me.ToolStripDropDownButGetLatest.Text = "Get Latest"
         Me.ToolStripDropDownButGetLatest.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageAboveText
         '
         'dropDownGetLatestAllOpenFiles
         '
         Me.dropDownGetLatestAllOpenFiles.Name = "dropDownGetLatestAllOpenFiles"
-        Me.dropDownGetLatestAllOpenFiles.Size = New System.Drawing.Size(205, 34)
+        Me.dropDownGetLatestAllOpenFiles.Size = New System.Drawing.Size(145, 22)
         Me.dropDownGetLatestAllOpenFiles.Text = "All Open Files"
         '
         'dropDownGetLatestAll
         '
         Me.dropDownGetLatestAll.Name = "dropDownGetLatestAll"
-        Me.dropDownGetLatestAll.Size = New System.Drawing.Size(205, 34)
+        Me.dropDownGetLatestAll.Size = New System.Drawing.Size(145, 22)
         Me.dropDownGetLatestAll.Text = "All"
         '
         'ToolStripDropDownButReleases
@@ -457,20 +464,20 @@ Partial Class UserControl1
         Me.ToolStripDropDownButReleases.Margin = New System.Windows.Forms.Padding(0, 5, 0, 5)
         Me.ToolStripDropDownButReleases.Name = "ToolStripDropDownButReleases"
         Me.ToolStripDropDownButReleases.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
-        Me.ToolStripDropDownButReleases.Size = New System.Drawing.Size(174, 75)
+        Me.ToolStripDropDownButReleases.Size = New System.Drawing.Size(173, 67)
         Me.ToolStripDropDownButReleases.Text = "Releases"
         Me.ToolStripDropDownButReleases.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageAboveText
         '
         'ApproveReleaseToolStripMenuItem
         '
         Me.ApproveReleaseToolStripMenuItem.Name = "ApproveReleaseToolStripMenuItem"
-        Me.ApproveReleaseToolStripMenuItem.Size = New System.Drawing.Size(264, 34)
+        Me.ApproveReleaseToolStripMenuItem.Size = New System.Drawing.Size(186, 22)
         Me.ApproveReleaseToolStripMenuItem.Text = "RELEASE and Approve"
         '
         'EditNewRevisionToolStripMenuItem
         '
         Me.EditNewRevisionToolStripMenuItem.Name = "EditNewRevisionToolStripMenuItem"
-        Me.EditNewRevisionToolStripMenuItem.Size = New System.Drawing.Size(264, 34)
+        Me.EditNewRevisionToolStripMenuItem.Size = New System.Drawing.Size(186, 22)
         Me.EditNewRevisionToolStripMenuItem.Text = "EDIT New Revision"
         '
         'ContentPanel
@@ -480,19 +487,19 @@ Partial Class UserControl1
         'versionLabel
         '
         Me.versionLabel.AutoSize = True
-        Me.versionLabel.Location = New System.Drawing.Point(251, 112)
+        Me.versionLabel.Location = New System.Drawing.Point(167, 75)
+        Me.versionLabel.Margin = New System.Windows.Forms.Padding(2, 0, 2, 0)
         Me.versionLabel.Name = "versionLabel"
-        Me.versionLabel.Size = New System.Drawing.Size(121, 20)
+        Me.versionLabel.Size = New System.Drawing.Size(80, 13)
         Me.versionLabel.TabIndex = 24
         Me.versionLabel.Text = "Version number"
         '
         'UserControl1
         '
-        Me.AutoScaleDimensions = New System.Drawing.SizeF(144.0!, 144.0!)
-        Me.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi
+        Me.AutoScaleMode = System.Windows.Forms.AutoScaleMode.None
         Me.AutoScroll = True
-        Me.AutoSize = True
-        Me.AutoSizeMode = System.Windows.Forms.AutoSizeMode.GrowAndShrink
+        Me.AutoSize = False
+        Me.AutoSizeMode = System.Windows.Forms.AutoSizeMode.GrowOnly
         Me.Controls.Add(Me.versionLabel)
         Me.Controls.Add(Me.ToolStrip1)
         Me.Controls.Add(Me.butFindComponent)
@@ -502,9 +509,8 @@ Partial Class UserControl1
         Me.Controls.Add(Me.onlineCheckBox)
         Me.Controls.Add(Me.butCleanup)
         Me.Controls.Add(Me.TreeView1)
-        Me.Margin = New System.Windows.Forms.Padding(4)
         Me.Name = "UserControl1"
-        Me.Size = New System.Drawing.Size(569, 952)
+        Me.Size = New System.Drawing.Size(519, 745)
         Me.ToolStrip1.ResumeLayout(False)
         Me.ToolStrip1.PerformLayout()
         Me.ResumeLayout(False)
