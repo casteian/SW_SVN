@@ -734,6 +734,67 @@ Public Module svnModule
         End If
     End Function
 
+    Function commitAllowedOnlyIfUpToDate(ByRef modDocArr() As ModelDoc2) As Boolean
+        If modDocArr Is Nothing Then Return False
+        If modDocArr.Length = 0 Then Return False
+
+        Dim modDocArrToCheckForLatest As ModelDoc2() = modDocArr
+
+        Try
+            For Each docToCheck As ModelDoc2 In modDocArr
+                If docToCheck Is Nothing Then Continue For
+
+                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    modDocArrToCheckForLatest = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                    modDocArr,
+                    bResolveLightweight:=True
+                )
+                    Exit For
+                End If
+            Next
+        Catch
+            modDocArrToCheckForLatest = modDocArr
+        End Try
+
+        If modDocArrToCheckForLatest Is Nothing Then modDocArrToCheckForLatest = modDocArr
+
+        Dim statusForCommitCheck As SVNStatus = getFileSVNStatus(
+        bCheckServer:=True,
+        modDocArr:=modDocArrToCheckForLatest
+    )
+
+        If statusForCommitCheck Is Nothing Then
+            iSwApp.SendMsgToUser2(
+            "Commit blocked. Could not verify latest SVN status.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
+        Dim outOfDateFiles As String() = statusForCommitCheck.sFilterUpToDate9("*")
+
+        If outOfDateFiles IsNot Nothing Then
+            Dim msg As String =
+            "Commit blocked." & vbCrLf & vbCrLf &
+            "One or more files related to this commit are out of date." & vbCrLf & vbCrLf &
+            "To commit assemblies safely, all referenced geometry must be up to date." & vbCrLf & vbCrLf &
+            "Out-of-date files:" & vbCrLf &
+            stringArrToSingleStringWithNewLines(outOfDateFiles, bTrimFileNames:=True, iLimit:=10) & vbCrLf &
+            "Use Get Latest, confirm the assembly geometry, then commit again."
+
+            iSwApp.SendMsgToUser2(
+            msg,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+            Return False
+        End If
+
+        Return True
+    End Function
+
     Sub unlockDocs(Optional ByRef modDocArr() As ModelDoc2 = Nothing)
         Dim bSuccess As Boolean
         Dim Status As SVNStatus
@@ -792,6 +853,7 @@ Public Module svnModule
             iSwApp.SendMsgToUser("Active Document not found")
             Exit Sub
         End If
+        If Not commitAllowedOnlyIfUpToDate(modDocArr) Then Exit Sub
 
         'Filter out read-only files
         For i = 0 To UBound(modDocArr)
@@ -935,15 +997,39 @@ Public Module svnModule
         Dim sDocPathsToCheckout(modDocArr.Length - 1) As String
         Dim sPathsOfReleased() As String
         Dim status As SVNStatus
+        Dim statusForLatestCheck As SVNStatus
+        Dim statusForLocking As SVNStatus
         Dim bSuccess As Boolean = False
         Dim sCatMessage As String = ""
         Dim sCatMessageLocked As String = ""
         Dim sFilter As String
         Dim bEachSuccess() As Boolean
 
-        status = getFileSVNStatus(bCheckServer:=True, modDocArr)
-        If IsNothing(status) Then Exit Sub
-        Dim outOfDateBeforeLock As String() = status.sFilterUpToDate9("*")
+        Dim modDocArrToCheckForLatest As ModelDoc2() = modDocArr
+
+        Try
+            For Each docToCheck As ModelDoc2 In modDocArr
+                If docToCheck Is Nothing Then Continue For
+
+                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    modDocArrToCheckForLatest = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                modDocArr,
+                bResolveLightweight:=True
+            )
+                    Exit For
+                End If
+            Next
+        Catch
+            modDocArrToCheckForLatest = modDocArr
+        End Try
+
+        If modDocArrToCheckForLatest Is Nothing Then modDocArrToCheckForLatest = modDocArr
+
+        'This status is ONLY for checking/updating latest geometry.
+        statusForLatestCheck = getFileSVNStatus(bCheckServer:=True, modDocArrToCheckForLatest)
+        If IsNothing(statusForLatestCheck) Then Exit Sub
+
+        Dim outOfDateBeforeLock As String() = statusForLatestCheck.sFilterUpToDate9("*")
 
         If outOfDateBeforeLock IsNot Nothing Then
             Dim msg As String =
@@ -960,12 +1046,12 @@ Public Module svnModule
     )
 
             If result = swMessageBoxResult_e.swMbHitYes Then
-                myGetLatestOrRevert(modDocArr, getLatestType.update, bVerbose:=True)
+                myGetLatestOrRevert(modDocArrToCheckForLatest, getLatestType.update, bVerbose:=True)
 
-                status = getFileSVNStatus(bCheckServer:=True, modDocArr)
-                If IsNothing(status) Then Exit Sub
+                statusForLatestCheck = getFileSVNStatus(bCheckServer:=True, modDocArrToCheckForLatest)
+                If IsNothing(statusForLatestCheck) Then Exit Sub
 
-                outOfDateBeforeLock = status.sFilterUpToDate9("*")
+                outOfDateBeforeLock = statusForLatestCheck.sFilterUpToDate9("*")
                 If outOfDateBeforeLock IsNot Nothing Then
                     iSwApp.SendMsgToUser2(
                 "The selected files are still out of date after update. Lock cancelled.",
@@ -983,6 +1069,14 @@ Public Module svnModule
                 Exit Sub
             End If
         End If
+
+        'This status is ONLY for deciding what to lock.
+        'Normal Get Locks locks only the original modDocArr.
+        'Get Locks With Dependents already passes dependents in modDocArr, so it still locks dependents.
+        statusForLocking = getFileSVNStatus(bCheckServer:=True, modDocArr)
+        If IsNothing(statusForLocking) Then Exit Sub
+
+        status = statusForLocking
         'If Not IsNothing(status.statError(0).sMessage) Then
         '    'If status.statError(0).sMessage <> "" Then
         '    '    iSwApp.SendMsgToUser(status.statError(0).sMessage)
