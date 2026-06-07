@@ -34,6 +34,47 @@ Public Class UserControl1
     Public allTreeViews As TreeView() = {New TreeView}
     'Public allTreeViews As New List(Of TreeView())
 
+    Private WithEvents liveChangeCheckTimer As System.Windows.Forms.Timer
+    Private refreshTreeNeedsUpdate As Boolean = False
+    Private normalRefreshTreeBackColor As Color
+    Private lastLiveCheckedActivePath As String = ""
+
+    Private Sub setRefreshTreeButtonNormal()
+        refreshTreeNeedsUpdate = False
+
+        butRefresh.Text = "Refresh Tree"
+        butRefresh.Size = New Size(220, 32)
+        butRefresh.Font = New Font(butRefresh.Font.FontFamily, 10.0!, FontStyle.Bold)
+        butRefresh.BackColor = normalRefreshTreeBackColor
+        butRefresh.UseVisualStyleBackColor = True
+    End Sub
+
+    Private Sub setRefreshTreeButtonUpdateNeeded()
+        refreshTreeNeedsUpdate = True
+
+        butRefresh.Text = "Changes made - Update now"
+        butRefresh.Size = New Size(220, 32)
+        butRefresh.Font = New Font(butRefresh.Font.FontFamily, 9.0!, FontStyle.Bold)
+        butRefresh.BackColor = Color.LightGreen
+        butRefresh.UseVisualStyleBackColor = False
+    End Sub
+
+    Private Function getActiveAssemblyTreeForLiveCheck() As ModelDoc2()
+        Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
+
+        If activeModDoc Is Nothing Then Return Nothing
+
+        Try
+            If activeModDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then
+                Return Nothing
+            End If
+
+            Return getComponentsOfAssemblyOptionalUpdateTree(New ModelDoc2() {activeModDoc})
+        Catch
+            Return Nothing
+        End Try
+    End Function
+
     Private Sub UserControl1_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
 
         Dim docMenu As ContextMenuStrip
@@ -48,7 +89,37 @@ Public Class UserControl1
 
         Me.ContextMenuStrip = docMenu
 
+        normalRefreshTreeBackColor = butRefresh.BackColor
+        setRefreshTreeButtonNormal()
 
+        liveChangeCheckTimer = New System.Windows.Forms.Timer()
+        liveChangeCheckTimer.Interval = 30000 '30 seconds
+        liveChangeCheckTimer.Start()
+
+
+    End Sub
+
+    Private Sub liveChangeCheckTimer_Tick(sender As Object, e As EventArgs) Handles liveChangeCheckTimer.Tick
+        Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
+        If activeModDoc Is Nothing Then Exit Sub
+
+        Dim activePath As String = activeModDoc.GetPathName()
+
+        If Not String.Equals(activePath, lastLiveCheckedActivePath, StringComparison.OrdinalIgnoreCase) Then
+            lastLiveCheckedActivePath = activePath
+            setRefreshTreeButtonNormal()
+        End If
+
+        If refreshTreeNeedsUpdate Then Exit Sub
+
+        Dim docsToCheck As ModelDoc2() = getActiveAssemblyTreeForLiveCheck()
+        If docsToCheck Is Nothing Then Exit Sub
+
+        If svnModule.liveCheckForAssemblyServerChangesOnly(docsToCheck) Then
+            setRefreshTreeButtonUpdateNeeded()
+        Else
+            setRefreshTreeButtonNormal()
+        End If
     End Sub
 
     Friend Sub myInitialize(ByRef swAppin As SldWorks)
@@ -87,12 +158,35 @@ Public Class UserControl1
         getLocksOfDocs(GetSelectedModDocList(iSwApp))
         updateStatusStrip()
     End Sub
+
     Private Sub dropDownGetLocksWithDependents_Click(sender As Object, e As EventArgs) Handles dropDownGetLocksWithDependents.Click
+        Dim selectedDocs() As ModelDoc2
         Dim modDocArr() As ModelDoc2
 
-        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp))
+        selectedDocs = GetSelectedModDocList(iSwApp)
 
-        If modDocArr Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
+        If selectedDocs Is Nothing Then
+            iSwApp.SendMsgToUser("Error: Active Document not found")
+            Exit Sub
+        End If
+
+        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
+
+        If modDocArr Is Nothing Then
+            iSwApp.SendMsgToUser("Error: Active Document not found")
+            Exit Sub
+        End If
+
+        If Not svnModule.prepareExternalReferencesForSvnAction(modDocArr) Then Exit Sub
+
+        'Important: rebuild the dependency list after external references are relinked.
+        selectedDocs = GetSelectedModDocList(iSwApp)
+        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
+
+        If modDocArr Is Nothing Then
+            iSwApp.SendMsgToUser("Error: Could not rebuild dependents after relinking external references.")
+            Exit Sub
+        End If
 
         getLocksOfDocs(modDocArr)
         updateStatusStrip()
@@ -105,8 +199,37 @@ Public Class UserControl1
         tortCommitDocs(GetSelectedModDocList(iSwApp))
         updateStatusStrip()
     End Sub
+
     Private Sub dropDownCommitWithDependents_Click(sender As Object, e As EventArgs) Handles dropDownCommitWithDependents.Click
-        tortCommitDocs(getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp)))
+        Dim selectedDocs() As ModelDoc2
+        Dim modDocArr() As ModelDoc2
+
+        selectedDocs = GetSelectedModDocList(iSwApp)
+
+        If selectedDocs Is Nothing Then
+            iSwApp.SendMsgToUser("Error: Active Document not found")
+            Exit Sub
+        End If
+
+        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
+
+        If modDocArr Is Nothing Then
+            iSwApp.SendMsgToUser("Error: Active Document not found")
+            Exit Sub
+        End If
+
+        If Not svnModule.prepareExternalReferencesForSvnAction(modDocArr) Then Exit Sub
+
+        'Important: rebuild the dependency list after external references are relinked.
+        selectedDocs = GetSelectedModDocList(iSwApp)
+        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
+
+        If modDocArr Is Nothing Then
+            iSwApp.SendMsgToUser("Error: Could not rebuild dependents after relinking external references.")
+            Exit Sub
+        End If
+
+        tortCommitDocs(modDocArr)
         updateStatusStrip()
     End Sub
     Private Sub dropDownCommitAll_Click(sender As Object, e As EventArgs) Handles dropDownCommitAll.Click
@@ -168,6 +291,16 @@ Public Class UserControl1
         TreeView1.Nodes(0).Expand()
     End Sub
     Private Sub butRefresh_Click(sender As Object, e As EventArgs) Handles butRefresh.Click
+
+        If refreshTreeNeedsUpdate Then
+            Dim docsToUpdate As ModelDoc2() = getActiveAssemblyTreeForLiveCheck()
+
+            If docsToUpdate IsNot Nothing Then
+                svnModule.myGetLatestOrRevert(docsToUpdate, getLatestType.update, bVerbose:=True)
+            End If
+
+            setRefreshTreeButtonNormal()
+        End If
 
         'CLEANUP
         If iSwApp.GetDocumentCount() = 0 Then
@@ -756,7 +889,18 @@ Public Class UserControl1
     Private Function stripStatusSuffix(nodeText As String) As String
         If String.IsNullOrWhiteSpace(nodeText) Then Return nodeText
 
-        Dim suffixStart As Integer = nodeText.IndexOf(" [Locked", StringComparison.OrdinalIgnoreCase)
+        Dim lockedStart As Integer = nodeText.IndexOf(" [Locked", StringComparison.OrdinalIgnoreCase)
+        Dim notCommittedStart As Integer = nodeText.IndexOf(" [Not committed", StringComparison.OrdinalIgnoreCase)
+
+        Dim suffixStart As Integer = -1
+
+        If lockedStart >= 0 Then suffixStart = lockedStart
+
+        If notCommittedStart >= 0 Then
+            If suffixStart = -1 OrElse notCommittedStart < suffixStart Then
+                suffixStart = notCommittedStart
+            End If
+        End If
 
         If suffixStart >= 0 Then
             Return nodeText.Substring(0, suffixStart)
@@ -789,7 +933,27 @@ Public Class UserControl1
         Dim baseNodeText As String = stripStatusSuffix(rootNode.Text)
         rootNode.Text = baseNodeText
 
-        status1 = findStatusForFile(baseNodeText)
+        If modDoc IsNot Nothing Then
+            status1 = findStatusForFile(modDoc.GetPathName())
+        Else
+            Dim nodeFilePath As String = ""
+
+            Try
+                If TypeOf rootNode.Tag Is Component2 Then
+                    nodeFilePath = CType(rootNode.Tag, Component2).GetPathName()
+                ElseIf TypeOf rootNode.Tag Is ModelDoc2 Then
+                    nodeFilePath = CType(rootNode.Tag, ModelDoc2).GetPathName()
+                End If
+            Catch
+                nodeFilePath = ""
+            End Try
+
+            If Not String.IsNullOrWhiteSpace(nodeFilePath) Then
+                status1 = findStatusForFile(nodeFilePath)
+            Else
+                status1 = findStatusForFile(baseNodeText)
+            End If
+        End If
 
         If modDoc Is Nothing Then
             bModelDocAttached = False
@@ -807,6 +971,26 @@ Public Class UserControl1
         If status1 Is Nothing Then
             rootNode.BackColor = myCol.unknown
             rootNode.ToolTipText = "Unknown"
+
+        ElseIf status1.fp(0).upToDate9 = "*" Then
+            rootNode.BackColor = myCol.outOfDate
+            rootNode.ToolTipText = "Your Copy is Out Of Date"
+            'If bModelDocAttached Then docMenu.Items.AddRange({myContextMenu.getLocksStealLabel})
+
+        ElseIf status1.fp(0).addDelChg1 = "M" OrElse
+            status1.fp(0).addDelChg1 = "A" OrElse
+            status1.fp(0).addDelChg1 = "?" Then
+
+            rootNode.BackColor = myCol.localChangesNotCommitted
+            rootNode.ToolTipText = "Local changes not committed"
+            rootNode.Text &= " [Not committed]"
+
+            If bModelDocAttached Then
+                docMenu.Items.Add(myContextMenu.commitLabel)
+                If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    docMenu.Items.Add(myContextMenu.commitWithDependentsLabel)
+                End If
+            End If
 
         ElseIf status1.fp(0).lock6 = "K" Then
             rootNode.BackColor = myCol.lockedByYou
@@ -828,10 +1012,6 @@ Public Class UserControl1
                 End If
             End If
 
-        ElseIf status1.fp(0).upToDate9 = "*" Then
-            rootNode.BackColor = myCol.outOfDate
-            rootNode.ToolTipText = "Your Copy is Out Of Date"
-            'If bModelDocAttached Then docMenu.Items.AddRange({myContextMenu.getLocksStealLabel})
 
         ElseIf status1.fp(0).lock6 = "O" OrElse
             (Not String.IsNullOrWhiteSpace(status1.fp(0).lockOwner) AndAlso status1.fp(0).lock6 <> "K") Then
@@ -973,6 +1153,7 @@ Public Class UserControl1
     End Function
     Class myColours
         Public lighterPurple As Drawing.Color
+        Public localChangesNotCommitted As Drawing.Color
         Public darkerPurple As Drawing.Color
         Public lockedByYou As Drawing.Color
         Public lockedBySomeoneElse As Drawing.Color
@@ -985,6 +1166,7 @@ Public Class UserControl1
             lighterPurple = Drawing.Color.FromArgb(208, 207, 229) 'used in icons
             darkerPurple = Drawing.Color.FromArgb(152, 150, 182) 'used in icons
             lockedByYou = Drawing.Color.FromArgb(159, 223, 159) 'Drawing.Color.Aquamarine
+            localChangesNotCommitted = Drawing.Color.Orange
             lockedBySomeoneElse = Drawing.Color.FromArgb(255, 255, 153)
             available = Drawing.Color.White
             unknown = Drawing.Color.LightGray

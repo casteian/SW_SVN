@@ -135,7 +135,7 @@ Partial Class UserControl1
         Me.butRefresh.Name = "butRefresh"
         Me.butRefresh.Size = New System.Drawing.Size(91, 29)
         Me.butRefresh.TabIndex = 17
-        Me.butRefresh.Text = "Refresh"
+        Me.butRefresh.Text = "Refresh Tree"
         Me.butRefresh.UseVisualStyleBackColor = True
         '
         'butCleanup

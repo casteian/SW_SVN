@@ -10,10 +10,16 @@ Imports System.Windows.Forms.VisualStyles.VisualStyleElement
 Imports System.Xml
 
 Public Module svnModule
+    Private Class ExternalReferenceInfo
+        Public Property oldPath As String
+        Public Property newPath As String
+        Public Property fileName As String
+    End Class
 
     Dim myUserControl As UserControl1
     Dim iSwApp As SldWorks
     Dim statusOfAllOpenModels As SVNStatus
+    Private liveAssemblyChangeCheckInProgress As Boolean = False
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -70,6 +76,36 @@ Public Module svnModule
             myUserControl.refreshAllTreeViewsVariable()
         End If
         Return bWhatToReturn
+    End Function
+
+    Public Function liveCheckForAssemblyServerChangesOnly(ByRef modDocArr() As ModelDoc2) As Boolean
+        If liveAssemblyChangeCheckInProgress Then Return False
+        If myUserControl Is Nothing Then Return False
+        If iSwApp Is Nothing Then Return False
+        If modDocArr Is Nothing Then Return False
+        If modDocArr.Length = 0 Then Return False
+        If Not myUserControl.onlineCheckBox.Checked Then Return False
+
+        liveAssemblyChangeCheckInProgress = True
+
+        Try
+            Dim liveStatus As SVNStatus = getFileSVNStatus(
+            bCheckServer:=True,
+            modDocArr:=modDocArr,
+            bUpdateStatusOfAllOpenModels:=False
+        )
+
+            If liveStatus Is Nothing Then Return False
+
+            Dim outOfDateFiles As String() = liveStatus.sFilterUpToDate9("*")
+
+            Return outOfDateFiles IsNot Nothing
+
+        Catch
+            Return False
+        Finally
+            liveAssemblyChangeCheckInProgress = False
+        End Try
     End Function
 
     Private Function normalizeSvnPath(pathInput As String) As String
@@ -610,8 +646,8 @@ Public Module svnModule
                 End If
 
             Else
-                    'commit failed, so rollback the propset back to edit
-                    svnPropset(getFilePathsFromModDocArr({componentAndDrawingModDoc(0)}), "addin:release_state", "||EDIT||")
+                'commit failed, so rollback the propset back to edit
+                svnPropset(getFilePathsFromModDocArr({componentAndDrawingModDoc(0)}), "addin:release_state", "||EDIT||")
                 svnPropset(getFilePathsFromModDocArr({componentAndDrawingModDoc(0)}), "addin:approved", "unknown")
                 bSuccess1 = False
                 iSwApp.SendMsgToUser2("Failed to Commit " & componentAndDrawingModDoc(0).GetTitle, swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
@@ -734,6 +770,317 @@ Public Module svnModule
         End If
     End Function
 
+    Private Function isPathInsideLocalRepo(filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If myUserControl Is Nothing Then Return False
+
+        Try
+            Dim repoRoot As String = Path.GetFullPath(myUserControl.localRepoPath.Text).TrimEnd("\"c)
+            Dim fullPath As String = Path.GetFullPath(filePath).TrimEnd("\"c)
+
+            If String.Equals(fullPath, repoRoot, StringComparison.OrdinalIgnoreCase) Then
+                Return True
+            End If
+
+            Return fullPath.StartsWith(repoRoot & "\", StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function isSolidWorksTempOrVirtualPath(filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Try
+            Dim fullPath As String = Path.GetFullPath(filePath)
+
+            If fullPath.IndexOf("\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) >= 0 Then Return True
+            If fullPath.IndexOf("\swx", StringComparison.OrdinalIgnoreCase) >= 0 AndAlso
+           fullPath.IndexOf("\Temp\", StringComparison.OrdinalIgnoreCase) >= 0 Then Return True
+
+            If Path.GetFileName(fullPath).Contains("^") Then Return True
+
+        Catch
+            If filePath.IndexOf("\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) >= 0 Then Return True
+            If filePath.Contains("^") Then Return True
+        End Try
+
+        Return False
+    End Function
+
+    Private Function getExternalCadReferences(ByRef modDocArr() As ModelDoc2) As List(Of ExternalReferenceInfo)
+        Dim externalRefs As New List(Of ExternalReferenceInfo)
+        Dim seenPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If modDocArr Is Nothing Then Return externalRefs
+
+        For Each doc As ModelDoc2 In modDocArr
+            If doc Is Nothing Then Continue For
+
+            Dim docPath As String = ""
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                Continue For
+            End Try
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+
+            If isSolidWorksTempOrVirtualPath(docPath) Then
+                externalRefs.Add(New ExternalReferenceInfo With {
+                    .oldPath = docPath,
+                    .fileName = Path.GetFileName(docPath)
+                                 })
+                Continue For
+            End If
+
+            Dim ext As String = Path.GetExtension(docPath).ToUpperInvariant()
+
+            If ext <> ".SLDPRT" AndAlso ext <> ".SLDASM" AndAlso ext <> ".SLDDRW" Then Continue For
+
+            If Not isPathInsideLocalRepo(docPath) Then
+                Dim normalized As String = ""
+                Try
+                    normalized = Path.GetFullPath(docPath)
+                Catch
+                    normalized = docPath
+                End Try
+
+                If Not seenPaths.Contains(normalized) Then
+                    seenPaths.Add(normalized)
+
+                    externalRefs.Add(New ExternalReferenceInfo With {
+                    .oldPath = normalized,
+                    .fileName = Path.GetFileName(normalized)
+                })
+                End If
+            End If
+        Next
+
+        Return externalRefs
+    End Function
+
+    Private Function pickVaultDestinationFolder() As String
+        Using fbd As New FolderBrowserDialog()
+            fbd.Description = "Choose a folder inside the SVN working copy for the external CAD files."
+            fbd.SelectedPath = myUserControl.localRepoPath.Text
+
+            If fbd.ShowDialog() <> DialogResult.OK Then Return ""
+
+            Dim selectedPath As String = fbd.SelectedPath
+
+            If Not isPathInsideLocalRepo(selectedPath) Then
+                iSwApp.SendMsgToUser2(
+                "Selected folder is not inside the SVN working copy. Please choose a folder under:" & vbCrLf &
+                myUserControl.localRepoPath.Text,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+                Return ""
+            End If
+
+            Return selectedPath
+        End Using
+    End Function
+
+    Private Function copyExternalRefsToVault(ByRef externalRefs As List(Of ExternalReferenceInfo), destinationFolder As String) As Boolean
+        If externalRefs Is Nothing Then Return True
+        If externalRefs.Count = 0 Then Return True
+        If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            Dim destPath As String = Path.Combine(destinationFolder, refInfo.fileName)
+
+            If File.Exists(destPath) Then
+                Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+                "A file with this name already exists in the selected SVN folder:" & vbCrLf & vbCrLf &
+                destPath & vbCrLf & vbCrLf &
+                "Use the existing SVN file instead?",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbYesNo
+            )
+
+                If response <> swMessageBoxResult_e.swMbHitYes Then Return False
+            Else
+                Try
+                    File.Copy(refInfo.oldPath, destPath, overwrite:=False)
+                Catch ex As Exception
+                    iSwApp.SendMsgToUser2(
+                    "Failed to copy external CAD file into SVN folder:" & vbCrLf & vbCrLf &
+                    refInfo.oldPath & vbCrLf & vbCrLf &
+                    "Error:" & vbCrLf & ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                    Return False
+                End Try
+            End If
+
+            refInfo.newPath = destPath
+        Next
+
+        Return True
+    End Function
+
+    Private Function relinkExternalRefsToVaultCopies(ByRef externalRefs As List(Of ExternalReferenceInfo)) As Boolean
+        If externalRefs Is Nothing Then Return True
+        If externalRefs.Count = 0 Then Return True
+
+        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+        If activeDoc Is Nothing Then Return False
+
+        Dim activePath As String = activeDoc.GetPathName()
+        Dim okAll As Boolean = True
+
+        Try
+            activeDoc.ForceRebuild3(False)
+            activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
+        Catch
+        End Try
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            Try
+                Dim ok As Boolean = iSwApp.ReplaceReferencedDocument(activePath, refInfo.oldPath, refInfo.newPath)
+
+                If Not ok Then
+                    okAll = False
+                    iSwApp.SendMsgToUser2(
+                    "Failed to relink reference:" & vbCrLf & vbCrLf &
+                    refInfo.oldPath & vbCrLf & "→" & vbCrLf & refInfo.newPath,
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                End If
+            Catch ex As Exception
+                okAll = False
+                iSwApp.SendMsgToUser2(
+                "Error while relinking reference:" & vbCrLf & vbCrLf &
+                refInfo.oldPath & vbCrLf & vbCrLf &
+                ex.Message,
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+            End Try
+        Next
+
+        Try
+            iSwApp.CloseDoc(activeDoc.GetTitle())
+            Dim errors As Integer = 0
+            Dim warnings As Integer = 0
+            iSwApp.OpenDoc6(activePath, activeDoc.GetType(), swOpenDocOptions_e.swOpenDocOptions_Silent, "", errors, warnings)
+        Catch
+        End Try
+
+        Return okAll
+    End Function
+
+    Private Function verifyExternalRefsFixed(ByRef modDocArr() As ModelDoc2) As Boolean
+        Dim remainingExternal As List(Of ExternalReferenceInfo) = getExternalCadReferences(modDocArr)
+
+        If remainingExternal.Count = 0 Then Return True
+
+        Dim msg As String = "External CAD references still remain. SVN action cancelled." & vbCrLf & vbCrLf
+
+        For Each refInfo As ExternalReferenceInfo In remainingExternal
+            msg &= refInfo.fileName & vbCrLf & refInfo.oldPath & vbCrLf & vbCrLf
+        Next
+
+        iSwApp.SendMsgToUser2(
+        msg,
+        swMessageBoxIcon_e.swMbStop,
+        swMessageBoxBtn_e.swMbOk
+    )
+
+        Return False
+    End Function
+
+    Public Function prepareExternalReferencesForSvnAction(ByRef modDocArr() As ModelDoc2) As Boolean
+        If modDocArr Is Nothing Then Return True
+        If modDocArr.Length = 0 Then Return True
+
+        Dim externalRefs As List(Of ExternalReferenceInfo) = getExternalCadReferences(modDocArr)
+
+        If externalRefs.Count = 0 Then Return True
+
+        Dim virtualOrTempRefs As New List(Of ExternalReferenceInfo)
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If isSolidWorksTempOrVirtualPath(refInfo.oldPath) Then
+                virtualOrTempRefs.Add(refInfo)
+            End If
+        Next
+
+        If virtualOrTempRefs.Count > 0 Then
+            Dim virtualMsg As String =
+        "This assembly contains virtual or temporary SolidWorks components." & vbCrLf & vbCrLf &
+        "These cannot be automatically added to SVN safely." & vbCrLf & vbCrLf &
+        "Virtual/temp files:" & vbCrLf
+
+            For Each refInfo As ExternalReferenceInfo In virtualOrTempRefs
+                virtualMsg &= refInfo.fileName & vbCrLf & refInfo.oldPath & vbCrLf & vbCrLf
+            Next
+
+            virtualMsg &= "Please save these as external files inside the SVN working copy first." & vbCrLf & vbCrLf &
+                  "In SolidWorks: right click the component → Save Part(in External File)." & vbCrLf & vbCrLf &
+                  "Save under:" & vbCrLf &
+                  myUserControl.localRepoPath.Text
+
+            iSwApp.SendMsgToUser2(
+        virtualMsg,
+        swMessageBoxIcon_e.swMbStop,
+        swMessageBoxBtn_e.swMbOk
+    )
+
+            Return False
+        End If
+
+        Dim msg As String =
+        "This assembly references CAD outside the SVN working copy." & vbCrLf & vbCrLf &
+        "External files:" & vbCrLf
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            msg &= refInfo.fileName & vbCrLf & refInfo.oldPath & vbCrLf & vbCrLf
+        Next
+
+        msg &= "Would you like to copy these files into the SVN vault and relink the assembly?"
+
+        Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+        msg,
+        swMessageBoxIcon_e.swMbWarning,
+        swMessageBoxBtn_e.swMbYesNo
+    )
+
+        If response <> swMessageBoxResult_e.swMbHitYes Then Return False
+
+        Dim destinationFolder As String = pickVaultDestinationFolder()
+        If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
+
+        If Not copyExternalRefsToVault(externalRefs, destinationFolder) Then Return False
+        If Not relinkExternalRefsToVaultCopies(externalRefs) Then Return False
+
+        Dim copiedPaths As New List(Of String)
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If Not String.IsNullOrWhiteSpace(refInfo.newPath) Then copiedPaths.Add(refInfo.newPath)
+        Next
+
+        If copiedPaths.Count > 0 Then
+            runSvnByArgs(copiedPaths.ToArray(), "add", bEach:=True)
+        End If
+
+        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+        If activeDoc IsNot Nothing Then
+            Try
+                activeDoc.ForceRebuild3(False)
+                activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
+            Catch
+            End Try
+        End If
+
+        Return True
+    End Function
+
     Function commitAllowedOnlyIfUpToDate(ByRef modDocArr() As ModelDoc2) As Boolean
         If modDocArr Is Nothing Then Return False
         If modDocArr.Length = 0 Then Return False
@@ -853,6 +1200,26 @@ Public Module svnModule
             iSwApp.SendMsgToUser("Active Document not found")
             Exit Sub
         End If
+
+        Dim docsForExternalRefCheck As ModelDoc2() = modDocArr
+
+        Try
+            For Each docToCheck As ModelDoc2 In modDocArr
+                If docToCheck Is Nothing Then Continue For
+
+                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    docsForExternalRefCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                modDocArr,
+                bResolveLightweight:=True
+            )
+                    Exit For
+                End If
+            Next
+        Catch
+            docsForExternalRefCheck = modDocArr
+        End Try
+
+        If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
         If Not commitAllowedOnlyIfUpToDate(modDocArr) Then Exit Sub
 
         'Filter out read-only files
@@ -988,6 +1355,26 @@ Public Module svnModule
     Public Sub getLocksOfDocs(ByRef modDocArr() As ModelDoc2, Optional bBreakLocks As Boolean = False, Optional bUseTortoise As Boolean = True, Optional sMessage As String = "")
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc()
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Active Document not found") : Exit Sub
+
+        Dim docsForExternalRefCheck As ModelDoc2() = modDocArr
+
+        Try
+            For Each docToCheck As ModelDoc2 In modDocArr
+                If docToCheck Is Nothing Then Continue For
+
+                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    docsForExternalRefCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                modDocArr,
+                bResolveLightweight:=True
+            )
+                    Exit For
+                End If
+            Next
+        Catch
+            docsForExternalRefCheck = modDocArr
+        End Try
+
+        If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
 
         'Dim sw As New Stopwatch
         'sw.Start()
