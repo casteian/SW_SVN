@@ -264,6 +264,7 @@
     <None Include="icons\CommitAll.png" />
   </ItemGroup>
   <ItemGroup>
+    <EmbeddedResource Include="icons\addVendorPartToVault.png" />
     <Content Include="icons\Commit Icon Only.png" />
     <Content Include="icons\GetLatestIconOnly.png" />
     <Content Include="icons\GetLocksIconOnly.png" />

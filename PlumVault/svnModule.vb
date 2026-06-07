@@ -808,6 +808,236 @@ Public Module svnModule
         Return False
     End Function
 
+    Private Function getGrc27RootPath() As String
+        Return Path.Combine(myUserControl.localRepoPath.Text.TrimEnd("\"c), "GRC27")
+    End Function
+
+    Private Function getVendorPartsRootPath() As String
+        Return Path.Combine(getGrc27RootPath(), "Vendor Parts")
+    End Function
+
+    Private Function isPathInsideFolder(filePath As String, folderPath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If String.IsNullOrWhiteSpace(folderPath) Then Return False
+
+        Try
+            Dim root As String = Path.GetFullPath(folderPath).TrimEnd("\"c)
+            Dim fullPath As String = Path.GetFullPath(filePath).TrimEnd("\"c)
+
+            If String.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase) Then Return True
+
+            Return fullPath.StartsWith(root & "\", StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function isVendorPartPath(filePath As String) As Boolean
+        Return isPathInsideFolder(filePath, getVendorPartsRootPath())
+    End Function
+
+    Private Function isCadFilePath(filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Dim ext As String = Path.GetExtension(filePath).ToUpperInvariant()
+
+        Return ext = ".SLDPRT" OrElse ext = ".SLDASM" OrElse ext = ".SLDDRW"
+    End Function
+
+    Private Function isValidGrc27FileName(filePathOrName As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePathOrName) Then Return False
+
+        Dim fileName As String = Path.GetFileName(filePathOrName)
+
+        Return System.Text.RegularExpressions.Regex.IsMatch(
+        fileName,
+        "^GRC27_(BR|DT|AE|FR|EL|ST|SU|WT|MI)_[A-Z]{0,3}\d+_R\d+\.(SLDPRT|SLDASM|SLDDRW)$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase
+    )
+    End Function
+
+    Private Function promptForValidGrc27FileName(originalPath As String) As String
+        Dim ext As String = Path.GetExtension(originalPath)
+        Dim originalNameNoExt As String = Path.GetFileNameWithoutExtension(originalPath)
+
+        Do
+            Dim inputName As String = InputBox(
+            "This file does not follow the GRC27 naming convention." & vbCrLf & vbCrLf &
+            "Original file:" & vbCrLf &
+            Path.GetFileName(originalPath) & vbCrLf & vbCrLf &
+            "Required format:" & vbCrLf &
+            "GRC27_CODE_00000_R# or GRC27_CODE_A0000_R# or GRC27_CODE_AB0000_R# or GRC27_CODE_ABC0000_R#" & vbCrLf & vbCrLf &
+            "Allowed codes:" & vbCrLf &
+            "BR, DT, AE, FR, EL, ST, SU, WT, MI" & vbCrLf & vbCrLf &
+            "Enter the new file name without extension:",
+            "GRC27 File Naming Required",
+            originalNameNoExt
+        )
+
+            If String.IsNullOrWhiteSpace(inputName) Then Return ""
+
+            inputName = inputName.Trim()
+
+            If Not inputName.EndsWith(ext, StringComparison.OrdinalIgnoreCase) Then
+                inputName &= ext
+            End If
+
+            If isValidGrc27FileName(inputName) Then
+                Return inputName
+            End If
+
+            iSwApp.SendMsgToUser2(
+            "Invalid file name." & vbCrLf & vbCrLf &
+            "Please use this format:" & vbCrLf &
+            "GRC27_CODE_00000_R# or GRC27_CODE_A0000_R# or GRC27_CODE_AB0000_R# or GRC27_CODE_ABC0000_R#" & vbCrLf & vbCrLf &
+            "Allowed codes:" & vbCrLf &
+            "BR, DT, AE, FR, EL, ST, SU, WT, MI" & vbCrLf & vbCrLf &
+            "Example:" & vbCrLf &
+            "GRC27_AE_00001_R1" & ext & vbCrLf &
+            "GRC27_AE_A0001_R1" & ext & vbCrLf &
+            "GRC27_AE_AB0001_R1" & ext & vbCrLf &
+            "GRC27_AE_ABC0001_R1" & ext,
+            swMessageBoxIcon_e.swMbWarning,
+            swMessageBoxBtn_e.swMbOk
+)
+        Loop
+    End Function
+
+    Private Function renameCadFileToGrc27Name(modDoc As ModelDoc2) As Boolean
+        If modDoc Is Nothing Then Return False
+
+        Dim oldPath As String = ""
+
+        Try
+            oldPath = modDoc.GetPathName()
+        Catch
+            Return False
+        End Try
+
+        If String.IsNullOrWhiteSpace(oldPath) Then Return False
+        If Not isCadFilePath(oldPath) Then Return True
+
+        If isVendorPartPath(oldPath) Then Return True
+        If isValidGrc27FileName(oldPath) Then Return True
+
+        Dim newFileName As String = promptForValidGrc27FileName(oldPath)
+
+        If String.IsNullOrWhiteSpace(newFileName) Then Return False
+
+        Dim folderPath As String = Path.GetDirectoryName(oldPath)
+        Dim newPath As String = Path.Combine(folderPath, newFileName)
+
+        If File.Exists(newPath) Then
+            iSwApp.SendMsgToUser2(
+            "Cannot rename file because this file already exists:" & vbCrLf & vbCrLf &
+            newPath,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
+        Try
+            Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+            Dim activePath As String = ""
+
+            If activeDoc IsNot Nothing Then
+                activePath = activeDoc.GetPathName()
+            End If
+
+            'Save a copy using the new GRC27 name.
+            Dim errors As Integer = 0
+            Dim warnings As Integer = 0
+
+            Dim saveOk As Boolean = modDoc.Extension.SaveAs3(
+            newPath,
+            swSaveAsVersion_e.swSaveAsCurrentVersion,
+            swSaveAsOptions_e.swSaveAsOptions_Silent,
+            Nothing,
+            Nothing,
+            errors,
+            warnings
+        )
+
+            If Not saveOk Then
+                iSwApp.SendMsgToUser2(
+                "Failed to rename/save file as:" & vbCrLf & vbCrLf &
+                newPath & vbCrLf & vbCrLf &
+                "SolidWorks errors: " & errors & vbCrLf &
+                "Warnings: " & warnings,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+                Return False
+            End If
+
+            'If active assembly was referencing the old file, point it to the new file.
+            If activeDoc IsNot Nothing AndAlso
+           activeDoc.GetType = swDocumentTypes_e.swDocASSEMBLY AndAlso
+           Not String.IsNullOrWhiteSpace(activePath) Then
+
+                Try
+                    iSwApp.ReplaceReferencedDocument(activePath, oldPath, newPath)
+                Catch
+                End Try
+            End If
+
+            runSvnByArgs({newPath}, "add", bEach:=True)
+
+            Return True
+
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+            "Error while renaming file:" & vbCrLf & vbCrLf &
+            oldPath & vbCrLf & vbCrLf &
+            ex.Message,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End Try
+    End Function
+
+    Private Function validateCadNamesBeforeCommit(ByRef modDocArr() As ModelDoc2) As Boolean
+        If modDocArr Is Nothing Then Return True
+
+        For Each doc As ModelDoc2 In modDocArr
+            If doc Is Nothing Then Continue For
+
+            Dim docPath As String = ""
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                Continue For
+            End Try
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+            If Not isCadFilePath(docPath) Then Continue For
+
+            'Vendor parts are allowed to keep vendor naming, but only inside Vendor Parts.
+            If isVendorPartPath(docPath) Then Continue For
+
+            If Not isValidGrc27FileName(docPath) Then
+                Dim result As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+                "This CAD file does not follow the GRC27 naming convention:" & vbCrLf & vbCrLf &
+                Path.GetFileName(docPath) & vbCrLf & vbCrLf &
+                "Normal CAD must use:" & vbCrLf &
+                "GRC27_CODE_00000_R# or GRC27_CODE_A0000_R# or GRC27_CODE_AB0000_R# or GRC27_CODE_ABC0000_R#" & vbCrLf & vbCrLf &
+                "Would you like to rename it now?",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbYesNo
+            )
+
+                If result <> swMessageBoxResult_e.swMbHitYes Then Return False
+
+                If Not renameCadFileToGrc27Name(doc) Then Return False
+            End If
+        Next
+
+        Return True
+    End Function
+
     Private Function getExternalCadReferences(ByRef modDocArr() As ModelDoc2) As List(Of ExternalReferenceInfo)
         Dim externalRefs As New List(Of ExternalReferenceInfo)
         Dim seenPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -889,33 +1119,50 @@ Public Module svnModule
         If externalRefs.Count = 0 Then Return True
         If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
 
+        If isVendorPartPath(destinationFolder) Then
+            iSwApp.SendMsgToUser2(
+            "Use the Add Vendor Part button for vendor/standard CAD." & vbCrLf & vbCrLf &
+            "Normal CAD added through this flow must follow the GRC27 naming convention.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
         For Each refInfo As ExternalReferenceInfo In externalRefs
-            Dim destPath As String = Path.Combine(destinationFolder, refInfo.fileName)
+            Dim finalFileName As String = refInfo.fileName
+
+            If Not isValidGrc27FileName(finalFileName) Then
+                finalFileName = promptForValidGrc27FileName(refInfo.oldPath)
+
+                If String.IsNullOrWhiteSpace(finalFileName) Then Return False
+            End If
+
+            Dim destPath As String = Path.Combine(destinationFolder, finalFileName)
 
             If File.Exists(destPath) Then
-                Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+                iSwApp.SendMsgToUser2(
                 "A file with this name already exists in the selected SVN folder:" & vbCrLf & vbCrLf &
                 destPath & vbCrLf & vbCrLf &
-                "Use the existing SVN file instead?",
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbYesNo
+                "Please choose a different GRC27 file name.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
             )
-
-                If response <> swMessageBoxResult_e.swMbHitYes Then Return False
-            Else
-                Try
-                    File.Copy(refInfo.oldPath, destPath, overwrite:=False)
-                Catch ex As Exception
-                    iSwApp.SendMsgToUser2(
-                    "Failed to copy external CAD file into SVN folder:" & vbCrLf & vbCrLf &
-                    refInfo.oldPath & vbCrLf & vbCrLf &
-                    "Error:" & vbCrLf & ex.Message,
-                    swMessageBoxIcon_e.swMbStop,
-                    swMessageBoxBtn_e.swMbOk
-                )
-                    Return False
-                End Try
+                Return False
             End If
+
+            Try
+                File.Copy(refInfo.oldPath, destPath, overwrite:=False)
+            Catch ex As Exception
+                iSwApp.SendMsgToUser2(
+                "Failed to copy external CAD file into SVN folder:" & vbCrLf & vbCrLf &
+                refInfo.oldPath & vbCrLf & vbCrLf &
+                "Error:" & vbCrLf & ex.Message,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+                Return False
+            End Try
 
             refInfo.newPath = destPath
         Next
@@ -1081,6 +1328,144 @@ Public Module svnModule
         Return True
     End Function
 
+    Public Function addVendorPartToVault() As Boolean
+        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+
+        If activeDoc Is Nothing Then
+            iSwApp.SendMsgToUser2(
+            "Open the assembly that should reference the vendor part first.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
+        If activeDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then
+            iSwApp.SendMsgToUser2(
+            "Add Vendor Part should be used from an active assembly.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
+        Dim vendorRoot As String = getVendorPartsRootPath()
+
+        Try
+            If Not Directory.Exists(vendorRoot) Then
+                Directory.CreateDirectory(vendorRoot)
+            End If
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+            "Could not create Vendor Parts folder:" & vbCrLf & vbCrLf &
+            vendorRoot & vbCrLf & vbCrLf &
+            ex.Message,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End Try
+
+        Dim filesToAdd As New List(Of String)
+
+        Using ofd As New OpenFileDialog()
+            ofd.Title = "Select vendor CAD file(s)"
+            ofd.Filter = "SolidWorks CAD (*.sldprt;*.sldasm)|*.sldprt;*.sldasm|All files (*.*)|*.*"
+            ofd.Multiselect = True
+
+            If ofd.ShowDialog() <> DialogResult.OK Then Return False
+
+            filesToAdd.AddRange(ofd.FileNames)
+        End Using
+
+        If filesToAdd.Count = 0 Then Return False
+
+        Dim destinationFolder As String = ""
+
+        Using fbd As New FolderBrowserDialog()
+            fbd.Description = "Choose a folder under GRC27\Vendor Parts for the vendor CAD."
+            fbd.SelectedPath = vendorRoot
+
+            If fbd.ShowDialog() <> DialogResult.OK Then Return False
+
+            destinationFolder = fbd.SelectedPath
+        End Using
+
+        If Not isPathInsideFolder(destinationFolder, vendorRoot) Then
+            iSwApp.SendMsgToUser2(
+            "Vendor CAD must be saved under:" & vbCrLf & vbCrLf &
+            vendorRoot,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
+        Dim activePath As String = activeDoc.GetPathName()
+        Dim copiedPaths As New List(Of String)
+
+        For Each sourcePath As String In filesToAdd
+            If Not File.Exists(sourcePath) Then Continue For
+
+            Dim destPath As String = Path.Combine(destinationFolder, Path.GetFileName(sourcePath))
+
+            If File.Exists(destPath) Then
+                Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+                "This vendor file already exists in the selected Vendor Parts folder:" & vbCrLf & vbCrLf &
+                destPath & vbCrLf & vbCrLf &
+                "Use the existing SVN copy?",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbYesNo
+            )
+
+                If response <> swMessageBoxResult_e.swMbHitYes Then Return False
+            Else
+                Try
+                    File.Copy(sourcePath, destPath, overwrite:=False)
+                Catch ex As Exception
+                    iSwApp.SendMsgToUser2(
+                    "Failed to copy vendor part:" & vbCrLf & vbCrLf &
+                    sourcePath & vbCrLf & vbCrLf &
+                    ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                    Return False
+                End Try
+            End If
+
+            copiedPaths.Add(destPath)
+
+            Try
+                iSwApp.ReplaceReferencedDocument(activePath, sourcePath, destPath)
+            Catch
+            End Try
+        Next
+
+        If copiedPaths.Count = 0 Then Return False
+
+        Try
+            activeDoc.ForceRebuild3(False)
+            activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
+        Catch
+        End Try
+
+        runSvnByArgs(copiedPaths.ToArray(), "add", bEach:=True)
+
+        iSwApp.SendMsgToUser2(
+        "Vendor part(s) added to SVN Vendor Parts folder." & vbCrLf & vbCrLf &
+        "The files have been copied and svn add has been run." & vbCrLf &
+        "Commit the vendor part(s) and the assembly together.",
+        swMessageBoxIcon_e.swMbInformation,
+        swMessageBoxBtn_e.swMbOk
+    )
+
+        updateLockStatusPublic(bRefreshAllTreeViews:=True)
+        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+
+        Return True
+    End Function
+
     Function commitAllowedOnlyIfUpToDate(ByRef modDocArr() As ModelDoc2) As Boolean
         If modDocArr Is Nothing Then Return False
         If modDocArr.Length = 0 Then Return False
@@ -1220,6 +1605,7 @@ Public Module svnModule
         End Try
 
         If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
+        If Not validateCadNamesBeforeCommit(modDocArr) Then Exit Sub
         If Not commitAllowedOnlyIfUpToDate(modDocArr) Then Exit Sub
 
         'Filter out read-only files

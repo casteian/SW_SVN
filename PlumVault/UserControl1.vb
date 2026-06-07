@@ -290,6 +290,10 @@ Public Class UserControl1
         TreeView1.CollapseAll()
         TreeView1.Nodes(0).Expand()
     End Sub
+    Private Sub butAddVendorPart_Click(sender As Object, e As EventArgs) Handles butAddVendorPart.Click
+        svnModule.addVendorPartToVault()
+        updateStatusStrip()
+    End Sub
     Private Sub butRefresh_Click(sender As Object, e As EventArgs) Handles butRefresh.Click
 
         If refreshTreeNeedsUpdate Then
@@ -1534,4 +1538,7 @@ Public Class UserControl1
         openFileNameInWebpage("https://www.digikey.com/en/products/result?keywords=%s", modDocArr(0))
     End Sub
 
+    Private Sub Button1_Click(sender As Object, e As EventArgs) Handles butAddVendorPart.Click
+
+    End Sub
 End Class
