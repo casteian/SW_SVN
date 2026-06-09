@@ -40,6 +40,8 @@ Imports System.Windows.Forms
         )>
 Public Class SwAddin
     Implements SolidWorks.Interop.swpublished.SwAddin
+    Private closeGuardHooked As Boolean = False
+    Private closeGuardWindowHook As SolidWorksCloseGuardWindowHook = Nothing
 
 #Region "Local Variables"
     Dim WithEvents iSwApp As SldWorks
@@ -163,10 +165,13 @@ Public Class SwAddin
             AddTaskPane()
         End If
 
+        InstallMainWindowCloseGuard()
+
         ConnectToSW = True
     End Function
     Function DisconnectFromSW() As Boolean Implements SolidWorks.Interop.swpublished.SwAddin.DisconnectFromSW
 
+        UninstallMainWindowCloseGuard()
         'RemoveCommandMgr()
         RemoveTaskPane()
         DetachEventHandlers()
@@ -236,6 +241,64 @@ Public Class SwAddin
         Catch ex As Exception
         End Try
     End Sub
+
+    Private Sub InstallMainWindowCloseGuard()
+        Try
+            If closeGuardWindowHook IsNot Nothing Then Exit Sub
+
+            Dim hwnd As IntPtr = IntPtr.Zero
+
+            Try
+                Dim frameObj As Object = iSwApp.Frame()
+
+                If frameObj IsNot Nothing Then
+                    hwnd = New IntPtr(Convert.ToInt64(frameObj.GetHWnd()))
+                End If
+            Catch
+                hwnd = IntPtr.Zero
+            End Try
+
+            If hwnd = IntPtr.Zero Then
+                iSwApp.SendMsgToUser2(
+                "Warning: Could not attach SolidWorks close guard. Main window handle was not found.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+                Exit Sub
+            End If
+
+            closeGuardWindowHook = New SolidWorksCloseGuardWindowHook()
+            closeGuardWindowHook.AssignSolidWorksHandle(hwnd)
+
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+            "Warning: Failed to install SolidWorks close guard." & vbCrLf & vbCrLf &
+            ex.Message,
+            swMessageBoxIcon_e.swMbWarning,
+            swMessageBoxBtn_e.swMbOk
+        )
+        End Try
+    End Sub
+
+    Private Sub UninstallMainWindowCloseGuard()
+        Try
+            If closeGuardWindowHook IsNot Nothing Then
+                closeGuardWindowHook.ReleaseSolidWorksHandle()
+                closeGuardWindowHook = Nothing
+            End If
+        Catch
+            closeGuardWindowHook = Nothing
+        End Try
+    End Sub
+
+    Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
+
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1
+        End If
+
+        Return 0
+    End Function
 
     'Public Sub AddCommandMgr()
 
@@ -437,7 +500,7 @@ Public Class SwAddin
         AttachSWEvents()
 
         'Listen for events on all currently open docs
-        'AttachEventsToAllDocuments()
+        AttachEventsToAllDocuments()
     End Sub
 
     Sub DetachEventHandlers()
@@ -469,6 +532,12 @@ Public Class SwAddin
             AddHandler iSwApp.FileNewNotify2, AddressOf Me.SldWorks_FileNewNotify2
             AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.SldWorks_ActiveModelDocChangeNotify
             AddHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
+
+            If Not closeGuardHooked Then
+                AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+                closeGuardHooked = True
+            End If
+
         Catch e As Exception
             Console.WriteLine(e.Message)
         End Try
@@ -481,6 +550,12 @@ Public Class SwAddin
             RemoveHandler iSwApp.FileNewNotify2, AddressOf Me.SldWorks_FileNewNotify2
             RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.SldWorks_ActiveModelDocChangeNotify
             RemoveHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
+
+            If closeGuardHooked Then
+                RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+                closeGuardHooked = False
+            End If
+
         Catch e As Exception
             Console.WriteLine(e.Message)
         End Try
@@ -537,7 +612,9 @@ Public Class SwAddin
     'End Function
 
     Function SldWorks_FileNewNotify2(ByVal newDoc As Object, ByVal doctype As Integer, ByVal templateName As String) As Integer
-        'AttachEventsToAllDocuments()
+        AttachEventsToAllDocuments()
+
+        Return 0
     End Function
 
     Function SldWorks_ActiveModelDocChangeNotify() As Integer
@@ -549,13 +626,42 @@ Public Class SwAddin
     End Function
 
     Function SldWorks_FileOpenPostNotify(ByVal FileName As String) As Integer
-        'AttachEventsToAllDocuments()
+        AttachEventsToAllDocuments()
+
         myTaskPaneHost.switchTreeViewToCurrentModel()
         myTaskPaneHost.externalSetReadWriteFromLockStatus1()
-        'Dim mycontextmenu As New UserControl1.myContextMenuClass(iSwApp.ActiveDoc, iSwApp)
-        'myTaskPaneHost.ContextMenuStripmenu.openLabel})
 
+        Return 0
     End Function
+
+    Public Class SolidWorksCloseGuardWindowHook
+        Inherits NativeWindow
+
+        Private Const WM_CLOSE As Integer = &H10
+
+        Public Sub AssignSolidWorksHandle(hwnd As IntPtr)
+            If hwnd = IntPtr.Zero Then Exit Sub
+            Me.AssignHandle(hwnd)
+        End Sub
+
+        Public Sub ReleaseSolidWorksHandle()
+            Try
+                Me.ReleaseHandle()
+            Catch
+            End Try
+        End Sub
+
+        Protected Overrides Sub WndProc(ByRef m As Message)
+            If m.Msg = WM_CLOSE Then
+                If svnModule.blockCloseIfOpenDocsUnsafe() Then
+                    'Block SolidWorks from closing.
+                    Return
+                End If
+            End If
+
+            MyBase.WndProc(m)
+        End Sub
+    End Class
 #End Region
 
 #Region "UI Callbacks"

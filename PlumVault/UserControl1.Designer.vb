@@ -23,7 +23,6 @@ Partial Class UserControl1
     <System.Diagnostics.DebuggerStepThrough()>
     Private Sub InitializeComponent()
         Dim TreeNode1 As System.Windows.Forms.TreeNode = New System.Windows.Forms.TreeNode("Open a File to See its Status")
-        Dim resources As System.ComponentModel.ComponentResourceManager = New System.ComponentModel.ComponentResourceManager(GetType(UserControl1))
         Me.TreeView1 = New System.Windows.Forms.TreeView()
         Me.onlineCheckBox = New System.Windows.Forms.CheckBox()
         Me.localRepoPath = New System.Windows.Forms.TextBox()
@@ -74,7 +73,6 @@ Partial Class UserControl1
         Me.ContextMenu1 = New System.Windows.Forms.ContextMenu()
         Me.ContextMenu2 = New System.Windows.Forms.ContextMenu()
         Me.versionLabel = New System.Windows.Forms.Label()
-        Me.butAddVendorPart = New System.Windows.Forms.Button()
         Me.ToolStrip1.SuspendLayout()
         Me.SuspendLayout()
         '
@@ -373,7 +371,7 @@ Partial Class UserControl1
         'dropDownGetLocksWithDependents
         '
         Me.dropDownGetLocksWithDependents.Name = "dropDownGetLocksWithDependents"
-        Me.dropDownGetLocksWithDependents.Size = New System.Drawing.Size(180, 22)
+        Me.dropDownGetLocksWithDependents.Size = New System.Drawing.Size(165, 22)
         Me.dropDownGetLocksWithDependents.Text = "With Dependents"
         '
         'ToolStripDropDownButCommit
@@ -496,22 +494,10 @@ Partial Class UserControl1
         Me.versionLabel.TabIndex = 24
         Me.versionLabel.Text = "Version number"
         '
-        'butAddVendorPart
-        '
-        Me.butAddVendorPart.Image = CType(resources.GetObject("butAddVendorPart.Image"), System.Drawing.Image)
-        Me.butAddVendorPart.Location = New System.Drawing.Point(190, 390)
-        Me.butAddVendorPart.Name = "butAddVendorPart"
-        Me.butAddVendorPart.Size = New System.Drawing.Size(161, 97)
-        Me.butAddVendorPart.TabIndex = 25
-        Me.butAddVendorPart.Text = "Add Vendor Part"
-        Me.butAddVendorPart.TextAlign = System.Drawing.ContentAlignment.BottomCenter
-        Me.butAddVendorPart.UseVisualStyleBackColor = True
-        '
         'UserControl1
         '
         Me.AutoScaleMode = System.Windows.Forms.AutoScaleMode.None
         Me.AutoScroll = True
-        Me.Controls.Add(Me.butAddVendorPart)
         Me.Controls.Add(Me.versionLabel)
         Me.Controls.Add(Me.ToolStrip1)
         Me.Controls.Add(Me.butFindComponent)
@@ -579,5 +565,4 @@ Partial Class UserControl1
     Friend WithEvents DigikeyToolStripMenuItem As ToolStripMenuItem
     Friend WithEvents OpenFolderPickerToolStripMenuItem As ToolStripMenuItem
     Friend WithEvents CopySvnUrlWithDependentsToolStripMenuItem As ToolStripMenuItem
-    Friend WithEvents butAddVendorPart As Button
 End Class

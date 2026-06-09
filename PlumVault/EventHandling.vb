@@ -17,7 +17,6 @@ Public Class DocumentEventHandler
     Overridable Function DetachEventHandlers() As Boolean
     End Function
 
-
     Function ConnectModelViews() As Boolean
         Dim iModelView As ModelView
         iModelView = iDocument.GetFirstModelView()
@@ -29,6 +28,7 @@ Public Class DocumentEventHandler
                 mView.AttachEventHandlers()
                 openModelViews.Add(iModelView, mView)
             End If
+
             iModelView = iModelView.GetNext
         End While
     End Function
@@ -43,6 +43,7 @@ Public Class DocumentEventHandler
 
         'Remove all ModelView event handlers
         openModelViews.Keys.CopyTo(keys, 0)
+
         For Each key In keys
             mView = openModelViews.Item(key)
             mView.DetachEventHandlers()
@@ -54,13 +55,13 @@ Public Class DocumentEventHandler
 
     Sub DetachModelViewEventHandler(ByVal mView As ModelView)
         Dim docView As DocView
+
         If openModelViews.Contains(mView) Then
             docView = openModelViews.Item(mView)
             openModelViews.Remove(mView)
             mView = Nothing
             docView = Nothing
         End If
-
     End Sub
 End Class
 
@@ -81,24 +82,32 @@ Public Class PartEventHandler
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+        AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+
         'AddHandler iPart.NewSelectionNotify, AddressOf Me.PartDoc_NewSelectionNotify
         'AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.PartDoc_ActiveModelDocChangeNotify
         'AddHandler iSwApp.FileOpenPostNotify, AddressOf Me.PartDoc_FileOpenPostNotify
+
         ConnectModelViews()
     End Function
 
     Overrides Function DetachEventHandlers() As Boolean
         RemoveHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+        RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+
         'RemoveHandler iPart.NewSelectionNotify, AddressOf Me.PartDoc_NewSelectionNotify
         'RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.PartDoc_ActiveModelDocChangeNotify
         'RemoveHandler iSwApp.FileOpenPostNotify, AddressOf Me.PartDoc_FileOpenPostNotify
+
         DisconnectModelViews()
 
         userAddin.DetachModelEventHandler(iDocument)
     End Function
+
     Function PartDoc_FileOpenPostNotify() As Integer
 
     End Function
+
     Function PartDoc_ActiveModelDocChangeNotify() As Integer
 
         'THIS CODE WILL BE RUN 1X THE NUMBER OF OPEN PARTS IN YOUR ASSEMBLY EACH TIME THE WINDOW CHANGES
@@ -113,8 +122,28 @@ Public Class PartEventHandler
         'swAddin.myTaskPaneHost.switchTreeViewToCurrentModel()
     End Function
 
+    Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
+        iSwApp.SendMsgToUser2(
+        "DEBUG: PartEventHandler FileCloseNotify fired.",
+        swMessageBoxIcon_e.swMbInformation,
+        swMessageBoxBtn_e.swMbOk
+    )
+
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1 'Cancel close
+        End If
+
+        Return 0 'Allow close
+    End Function
+
     Function PartDoc_DestroyNotify() As Integer
+
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1 'Cancel close
+        End If
+
         DetachEventHandlers()
+        Return 0 'Allow close
     End Function
 
     Function PartDoc_NewSelectionNotify() As Integer
@@ -135,7 +164,6 @@ Public Class AssemblyEventHandler
         iDocument = iAssembly
         iSwApp = sw
         swAddin = addin
-
     End Function
 
     Overrides Function AttachEventHandlers() As Boolean
@@ -145,6 +173,7 @@ Public Class AssemblyEventHandler
         AddHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
         AddHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
         AddHandler iAssembly.ComponentDisplayStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentDisplayStateChangeNotify
+        AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         'AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.AssemblyDoc_ActiveModelDocChangeNotify
         'AddHandler iSwApp.FileCloseNotify, AddressOf Me.DSldWorksEvents_FileCloseNotifyEventHandler
@@ -159,6 +188,7 @@ Public Class AssemblyEventHandler
         RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
         RemoveHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
         RemoveHandler iAssembly.ComponentDisplayStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentDisplayStateChangeNotify
+        RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         'RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.AssemblyDoc_ActiveModelDocChangeNotify
         'RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.DSldWorksEvents_FileCloseNotifyEventHandler
@@ -167,26 +197,40 @@ Public Class AssemblyEventHandler
 
         userAddin.DetachModelEventHandler(iDocument)
     End Function
+
     Function AssemblyDoc_ActiveModelDocChangeNotify() As Integer
         'This code will be run 1X the number of assemblies open = RUN SO MANY TIMES
     End Function
+
     Function DSldWorksEvents_FileOpenPostNotifyEventHandler() As Integer
 
     End Function
 
     Function AssemblyDoc_DestroyNotify() As Integer
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1 'Cancel close
+        End If
+
         DetachEventHandlers()
+        Return 0 'Allow close
     End Function
 
     Function AssemblyDoc_NewSelectionNotify() As Integer
 
     End Function
 
+    Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1 'Cancel close
+        End If
+
+        Return 0 'Allow close
+    End Function
+
     Protected Function ComponentStateChange(ByVal componentModel As Object, Optional ByVal newCompState As Short = swComponentSuppressionState_e.swComponentResolved) As Integer
 
         Dim modDoc As ModelDoc2 = componentModel
         Dim newState As swComponentSuppressionState_e = newCompState
-
 
         Select Case newState
 
@@ -215,7 +259,6 @@ Public Class AssemblyEventHandler
         Return ComponentStateChange(componentModel, newCompState)
 
     End Function
-
 
     Public Function AssemblyDoc_ComponentVisiblePropertiesChangeNotify(ByVal swObject As Object) As Integer
 
@@ -260,8 +303,6 @@ Public Class AssemblyEventHandler
         Return ComponentStateChange(modDoc)
 
     End Function
-
-
 End Class
 
 'Class to listen for Drawing Events
@@ -275,12 +316,12 @@ Public Class DrawingEventHandler
         iDrawing = model
         iDocument = iDrawing
         iSwApp = sw
-
     End Function
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
         AddHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
+        AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         ConnectModelViews()
     End Function
@@ -288,6 +329,7 @@ Public Class DrawingEventHandler
     Overrides Function DetachEventHandlers() As Boolean
         RemoveHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
         RemoveHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
+        RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         DisconnectModelViews()
 
@@ -295,11 +337,24 @@ Public Class DrawingEventHandler
     End Function
 
     Function DrawingDoc_DestroyNotify() As Integer
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1 'Cancel close
+        End If
+
         DetachEventHandlers()
+        Return 0 'Allow close
     End Function
 
     Function DrawingDoc_NewSelectionNotify() As Integer
 
+    End Function
+
+    Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
+        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+            Return 1 'Cancel close
+        End If
+
+        Return 0 'Allow close
     End Function
 End Class
 

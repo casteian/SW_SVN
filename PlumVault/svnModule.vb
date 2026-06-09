@@ -20,6 +20,10 @@ Public Module svnModule
     Dim iSwApp As SldWorks
     Dim statusOfAllOpenModels As SVNStatus
     Private liveAssemblyChangeCheckInProgress As Boolean = False
+    Private pendingExternalRefCommitPaths As New List(Of String)
+    Private pendingExternalRefSkipNameCheckPaths As New List(Of String)
+    Private closeGuardMessageShowing As Boolean = False
+    Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -107,6 +111,359 @@ Public Module svnModule
             liveAssemblyChangeCheckInProgress = False
         End Try
     End Function
+
+
+    Public Function blockCloseIfOpenDocsUnsafe() As Boolean
+        If iSwApp Is Nothing Then Return False
+        If myUserControl Is Nothing Then Return False
+        If Not myUserControl.onlineCheckBox.Checked Then Return False
+
+        If closeGuardMessageShowing Then Return False
+
+        Dim openPaths As New List(Of String)
+
+        Try
+            Dim docsObj As Object = iSwApp.GetDocuments()
+
+            If docsObj Is Nothing Then Return False
+
+            Dim docs As Object() = CType(docsObj, Object())
+
+            For Each docObj As Object In docs
+                Dim doc As ModelDoc2 = TryCast(docObj, ModelDoc2)
+                If doc Is Nothing Then Continue For
+
+                Dim docPath As String = ""
+
+                Try
+                    docPath = doc.GetPathName()
+                Catch
+                    Continue For
+                End Try
+
+                Dim title As String = ""
+
+                Try
+                    title = doc.GetTitle()
+                Catch
+                    title = "<unknown document>"
+                End Try
+
+                Dim isDirty As Boolean = False
+
+                Try
+                    isDirty = doc.GetSaveFlag()
+                Catch
+                    isDirty = False
+                End Try
+
+                If isDirty Then
+                    openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
+                    Continue For
+                End If
+
+                If String.IsNullOrWhiteSpace(docPath) Then
+                    openPaths.Add("[UNSAVED_NEW_FILE] " & title)
+                    Continue For
+                End If
+
+                If Not isCadFilePath(docPath) Then Continue For
+                If Not isPathInsideLocalRepo(docPath) Then Continue For
+
+                openPaths.Add(docPath)
+
+            Next
+        Catch
+            Return False
+        End Try
+
+        If openPaths.Count = 0 Then Return False
+
+        Dim unsafeMsg As String = getUnsafeCloseStatusMessage(openPaths)
+
+        If String.IsNullOrWhiteSpace(unsafeMsg) Then
+            Return False
+        End If
+
+        Try
+            closeGuardMessageShowing = True
+
+            Dim response As Integer = iSwApp.SendMsgToUser2(
+                "One or more open CAD files are not safe to close yet." & vbCrLf & vbCrLf &
+                unsafeMsg & vbCrLf &
+                "Choose an action:" & vbCrLf &
+                "Yes = I will Commit / push the changes now" & vbCrLf &
+                "No = I will Revert / discard the local changes now" & vbCrLf &
+                "Cancel = Stay open and do nothing",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbYesNoCancel
+            )
+
+            If response = swMessageBoxResult_e.swMbHitYes Then
+                iSwApp.SendMsgToUser2(
+                    "Close cancelled." & vbCrLf & vbCrLf &
+                    "Click Commit in the SVN task pane, then close SolidWorks again.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk
+                )
+
+                Return True 'Block close
+            End If
+
+            If response = swMessageBoxResult_e.swMbHitNo Then
+                iSwApp.SendMsgToUser2(
+                    "Close cancelled." & vbCrLf & vbCrLf &
+                    "Click Unlock && Revert in the SVN task pane, then close SolidWorks again.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk
+                )
+
+                Return True 'Block close
+            End If
+
+            Return True 'Cancel = block close
+
+        Finally
+            closeGuardMessageShowing = False
+        End Try
+    End Function
+
+
+
+    Private Function getUnsafeCloseStatusMessage(openPaths As List(Of String)) As String
+        If openPaths Is Nothing OrElse openPaths.Count = 0 Then Return ""
+
+        Dim msg As String = ""
+
+        For Each filePath As String In openPaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            If filePath.StartsWith("[UNSAVED_SOLIDWORKS_CHANGES]") Then
+                msg &= filePath.Replace("[UNSAVED_SOLIDWORKS_CHANGES] ", "") & vbCrLf &
+                "SolidWorks has unsaved changes." & vbCrLf & vbCrLf
+                Continue For
+            End If
+
+            If filePath.StartsWith("[UNSAVED_NEW_FILE]") Then
+                msg &= filePath.Replace("[UNSAVED_NEW_FILE] ", "") & vbCrLf &
+           "New SolidWorks file has not been saved yet." & vbCrLf & vbCrLf
+                Continue For
+            End If
+
+            If Not File.Exists(filePath) Then Continue For
+
+            Try
+                Dim statusResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "status -u --non-interactive """ & filePath & """"
+            )
+
+                Dim outputText As String = ""
+                If statusResult.output IsNot Nothing Then outputText = statusResult.output.Trim()
+
+                Dim errorText As String = ""
+                If statusResult.outputError IsNot Nothing Then errorText = statusResult.outputError.Trim()
+
+                If errorText <> "" Then
+                    msg &= Path.GetFileName(filePath) & vbCrLf &
+                       "SVN status error: " & errorText & vbCrLf & vbCrLf
+                    Continue For
+                End If
+
+                If String.IsNullOrWhiteSpace(outputText) Then Continue For
+
+                Dim lines() As String = outputText.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
+
+                For Each line As String In lines
+                    If String.IsNullOrWhiteSpace(line) Then Continue For
+                    If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+                    Dim reason As String = getHumanReadableSvnCloseReason(line)
+
+                    If reason <> "" Then
+                        msg &= Path.GetFileName(filePath) & vbCrLf &
+                           reason & vbCrLf & vbCrLf
+                        Exit For
+                    End If
+                Next
+
+            Catch ex As Exception
+                msg &= Path.GetFileName(filePath) & vbCrLf &
+                   "Could not verify SVN status before close." & vbCrLf & vbCrLf
+            End Try
+        Next
+
+        Return msg
+    End Function
+
+    Private Function getHumanReadableSvnCloseReason(statusLine As String) As String
+        If String.IsNullOrWhiteSpace(statusLine) Then Return ""
+
+        Dim wcStatus As Char = " "c
+        Dim remoteStatus As Char = " "c
+
+        If statusLine.Length >= 1 Then wcStatus = statusLine(0)
+        If statusLine.Length >= 9 Then remoteStatus = statusLine(8)
+
+        Select Case wcStatus
+            Case "?"c
+                Return "Saved inside the SVN folder but not added/committed yet. Click Commit first."
+            Case "A"c
+                Return "Scheduled for addition but not committed yet."
+            Case "M"c
+                Return "Modified locally and not committed."
+            Case "D"c
+                Return "Scheduled for deletion and not committed."
+            Case "R"c
+                Return "Scheduled for replacement and not committed."
+            Case "C"c
+                Return "SVN conflict detected."
+            Case "!"c
+                Return "Missing from disk but still tracked by SVN."
+            Case "~"c
+                Return "Obstructed or wrong item type in working copy."
+        End Select
+
+        If remoteStatus = "*"c Then
+            Return "Out of date compared to SVN server. Use Get Latest before closing."
+        End If
+
+        Return ""
+    End Function
+
+    Private Function filterOutNewUnversionedOrAddedDocs(ByRef modDocArr() As ModelDoc2) As ModelDoc2()
+        If modDocArr Is Nothing Then Return Nothing
+
+        Dim filteredDocs As New List(Of ModelDoc2)
+
+        For Each doc As ModelDoc2 In modDocArr
+            If doc Is Nothing Then Continue For
+
+            Dim docPath As String = ""
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                Continue For
+            End Try
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+
+            If isNewUnversionedOrAddedFile(docPath) Then
+                Continue For
+            End If
+
+            filteredDocs.Add(doc)
+        Next
+
+        Return filteredDocs.ToArray()
+    End Function
+
+    Private Function getFirstSvnStatusChar(filePath As String) As Char
+        If String.IsNullOrWhiteSpace(filePath) Then Return ChrW(0)
+        If Not File.Exists(filePath) Then Return ChrW(0)
+        If Not isPathInsideLocalRepo(filePath) Then Return ChrW(0)
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+            sSVNPath,
+            "status --non-interactive """ & filePath & """"
+        )
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Return ChrW(0)
+            End If
+
+            Dim statusText As String = ""
+
+            If statusResult.output IsNot Nothing Then
+                statusText = statusResult.output.Trim()
+            End If
+
+            If String.IsNullOrWhiteSpace(statusText) Then
+                Return " "c 'Clean/versioned
+            End If
+
+            Return statusText(0)
+
+        Catch
+            Return ChrW(0)
+        End Try
+    End Function
+
+
+    Private Function isNewUnversionedOrAddedFile(filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+        If Not isPathInsideLocalRepo(filePath) Then Return False
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+            sSVNPath,
+            "status --non-interactive """ & filePath & """"
+        )
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Return False
+            End If
+
+            Dim statusText As String = ""
+
+            If statusResult.output IsNot Nothing Then
+                statusText = statusResult.output.Trim()
+            End If
+
+            If String.IsNullOrWhiteSpace(statusText) Then
+                Return False
+            End If
+
+            Dim firstStatusChar As Char = statusText(0)
+
+            '? = unversioned but inside working copy
+            'A = scheduled for addition
+            Return firstStatusChar = "?"c OrElse firstStatusChar = "A"c
+
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Sub keepNewUncommittedCadFilesWritable()
+        If iSwApp Is Nothing Then Exit Sub
+
+        Try
+            Dim docsObj As Object = iSwApp.GetDocuments()
+            If docsObj Is Nothing Then Exit Sub
+
+            Dim docs As Object() = CType(docsObj, Object())
+
+            For Each docObj As Object In docs
+                Dim doc As ModelDoc2 = TryCast(docObj, ModelDoc2)
+                If doc Is Nothing Then Continue For
+
+                Dim docPath As String = ""
+
+                Try
+                    docPath = doc.GetPathName()
+                Catch
+                    Continue For
+                End Try
+
+                If String.IsNullOrWhiteSpace(docPath) Then Continue For
+                If Not isCadFilePath(docPath) Then Continue For
+                If Not isPathInsideLocalRepo(docPath) Then Continue For
+
+                If isNewUnversionedOrAddedFile(docPath) Then
+                    Try
+                        File.SetAttributes(docPath, File.GetAttributes(docPath) And Not FileAttributes.ReadOnly)
+                    Catch
+                    End Try
+                End If
+            Next
+
+        Catch
+        End Try
+    End Sub
 
     Private Function normalizeSvnPath(pathInput As String) As String
         If String.IsNullOrWhiteSpace(pathInput) Then Return ""
@@ -813,7 +1170,7 @@ Public Module svnModule
     End Function
 
     Private Function getVendorPartsRootPath() As String
-        Return Path.Combine(getGrc27RootPath(), "Vendor Parts")
+        Return Path.Combine(myUserControl.localRepoPath.Text.TrimEnd("\"c), "Vendor Parts")
     End Function
 
     Private Function isPathInsideFolder(filePath As String, folderPath As String) As Boolean
@@ -903,6 +1260,144 @@ Public Module svnModule
         Loop
     End Function
 
+    Private Sub addModelDocToCommitArrayIfMissing(ByRef modDocArr() As ModelDoc2, docToAdd As ModelDoc2)
+        If docToAdd Is Nothing Then Exit Sub
+
+        Dim docToAddPath As String = ""
+
+        Try
+            docToAddPath = docToAdd.GetPathName()
+        Catch
+            Exit Sub
+        End Try
+
+        If String.IsNullOrWhiteSpace(docToAddPath) Then Exit Sub
+
+        If modDocArr Is Nothing Then
+            ReDim modDocArr(0)
+            modDocArr(0) = docToAdd
+            Exit Sub
+        End If
+
+        For Each existingDoc As ModelDoc2 In modDocArr
+            If existingDoc Is Nothing Then Continue For
+
+            Dim existingPath As String = ""
+
+            Try
+                existingPath = existingDoc.GetPathName()
+            Catch
+                Continue For
+            End Try
+
+            If String.Equals(existingPath, docToAddPath, StringComparison.OrdinalIgnoreCase) Then
+                Exit Sub
+            End If
+        Next
+
+        Dim oldUpper As Integer = UBound(modDocArr)
+        ReDim Preserve modDocArr(oldUpper + 1)
+        modDocArr(oldUpper + 1) = docToAdd
+    End Sub
+
+    Private Sub deleteOldUncommittedCadFileIfSafe(oldPath As String, newPath As String)
+        If String.IsNullOrWhiteSpace(oldPath) Then Exit Sub
+        If String.IsNullOrWhiteSpace(newPath) Then Exit Sub
+
+        Try
+            If Not File.Exists(oldPath) Then Exit Sub
+
+            If String.Equals(
+            Path.GetFullPath(oldPath),
+            Path.GetFullPath(newPath),
+            StringComparison.OrdinalIgnoreCase
+        ) Then
+                Exit Sub
+            End If
+
+            'Only auto-delete files inside the local SVN working copy.
+            If Not isPathInsideLocalRepo(oldPath) Then Exit Sub
+
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+            sSVNPath,
+            "status --non-interactive """ & oldPath & """"
+        )
+
+            Dim statusText As String = ""
+
+            If statusResult.output IsNot Nothing Then
+                statusText &= statusResult.output.Trim()
+            End If
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Exit Sub
+            End If
+
+            'If blank, SVN thinks the file is already versioned and clean.
+            'Do not auto-delete committed/versioned files.
+            If String.IsNullOrWhiteSpace(statusText) Then Exit Sub
+
+            Dim firstStatusChar As Char = statusText(0)
+
+            'Safe cases:
+            '?': unversioned junk file
+            'A': scheduled for add but not committed yet
+            If firstStatusChar = "?"c Then
+                File.SetAttributes(oldPath, FileAttributes.Normal)
+                File.Delete(oldPath)
+
+            ElseIf firstStatusChar = "A"c Then
+                runSvnProcess(sSVNPath, "revert """ & oldPath & """")
+                If File.Exists(oldPath) Then
+                    File.SetAttributes(oldPath, FileAttributes.Normal)
+                    File.Delete(oldPath)
+                End If
+            End If
+
+        Catch
+            'Do not block commit if cleanup fails.
+        End Try
+    End Sub
+
+    Private Function getOpenModelByPathSafe(filePath As String) As ModelDoc2
+        If String.IsNullOrWhiteSpace(filePath) Then Return Nothing
+        If iSwApp Is Nothing Then Return Nothing
+
+        Try
+            Dim doc As ModelDoc2 = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+            If doc IsNot Nothing Then Return doc
+        Catch
+        End Try
+
+        Try
+            Dim docsObj As Object = iSwApp.GetDocuments()
+            If docsObj Is Nothing Then Return Nothing
+
+            Dim docs As Object() = CType(docsObj, Object())
+
+            For Each docObj As Object In docs
+                Dim doc As ModelDoc2 = TryCast(docObj, ModelDoc2)
+                If doc Is Nothing Then Continue For
+
+                Dim p As String = ""
+
+                Try
+                    p = doc.GetPathName()
+                Catch
+                    Continue For
+                End Try
+
+                If String.Equals(p, filePath, StringComparison.OrdinalIgnoreCase) Then
+                    Return doc
+                End If
+            Next
+
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
     Private Function renameCadFileToGrc27Name(modDoc As ModelDoc2) As Boolean
         If modDoc Is Nothing Then Return False
 
@@ -984,6 +1479,50 @@ Public Module svnModule
 
             runSvnByArgs({newPath}, "add", bEach:=True)
 
+            Try
+                If File.Exists(newPath) Then
+                    File.SetAttributes(newPath, File.GetAttributes(newPath) And Not FileAttributes.ReadOnly)
+                End If
+            Catch
+            End Try
+
+            deleteOldUncommittedCadFileIfSafe(oldPath, newPath)
+
+            Try
+                Dim reboundDoc As ModelDoc2 = getOpenModelByPathSafe(newPath)
+
+                If reboundDoc IsNot Nothing Then
+                    iSwApp.ActivateDoc3(
+                        reboundDoc.GetTitle(),
+                        True,
+                        swRebuildOnActivation_e.swRebuildActiveDoc,
+                        0
+                    )
+
+                    Try
+                        reboundDoc.SetSaveFlag()
+                    Catch
+                    End Try
+                End If
+            Catch
+            End Try
+
+            Try
+                If myUserControl IsNot Nothing Then
+                    myUserControl.refreshAllTreeViewsVariable()
+                    myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+                End If
+            Catch
+            End Try
+
+            iSwApp.SendMsgToUser2(
+                "File renamed successfully." & vbCrLf & vbCrLf &
+                "The new file was added to SVN locally and will be committed on Commit." & vbCrLf &
+                "Commit the assembly and renamed child together.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+
             Return True
 
         Catch ex As Exception
@@ -996,6 +1535,79 @@ Public Module svnModule
         )
             Return False
         End Try
+    End Function
+
+    Private Function validateNoDuplicateCadFileNames(ByRef modDocArr() As ModelDoc2) As Boolean
+        If modDocArr Is Nothing Then Return True
+
+        Dim seenNames As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+        Dim duplicateMsg As String = ""
+
+        For Each doc As ModelDoc2 In modDocArr
+            If doc Is Nothing Then Continue For
+
+            Dim docPath As String = ""
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                Continue For
+            End Try
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+            If Not isCadFilePath(docPath) Then Continue For
+
+            Dim fileName As String = Path.GetFileName(docPath)
+
+            If seenNames.ContainsKey(fileName) Then
+                duplicateMsg &= fileName & vbCrLf &
+                            "1) " & seenNames(fileName) & vbCrLf &
+                            "2) " & docPath & vbCrLf & vbCrLf
+            Else
+                seenNames(fileName) = docPath
+            End If
+        Next
+
+        If duplicateMsg <> "" Then
+            iSwApp.SendMsgToUser2(
+            "Commit blocked." & vbCrLf & vbCrLf &
+            "Duplicate CAD file names were found in this commit/assembly." & vbCrLf &
+            "Each CAD file must have a unique file name." & vbCrLf & vbCrLf &
+            duplicateMsg &
+            "Rename one of the duplicate files before committing.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+            Return False
+        End If
+
+        Return True
+    End Function
+
+    Private Function shouldSkipNameCheckForPendingExternalRef(docPath As String) As Boolean
+        If String.IsNullOrWhiteSpace(docPath) Then Return False
+        If pendingExternalRefSkipNameCheckPaths Is Nothing Then Return False
+
+        For Each pendingPath As String In pendingExternalRefSkipNameCheckPaths
+            If String.IsNullOrWhiteSpace(pendingPath) Then Continue For
+
+            Try
+                If String.Equals(
+                Path.GetFullPath(docPath),
+                Path.GetFullPath(pendingPath),
+                StringComparison.OrdinalIgnoreCase
+            ) Then
+                    Return True
+                End If
+            Catch
+                If String.Equals(docPath, pendingPath, StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            End Try
+        Next
+
+        Return False
     End Function
 
     Private Function validateCadNamesBeforeCommit(ByRef modDocArr() As ModelDoc2) As Boolean
@@ -1015,6 +1627,9 @@ Public Module svnModule
             If String.IsNullOrWhiteSpace(docPath) Then Continue For
             If Not isCadFilePath(docPath) Then Continue For
 
+            'External/vendor refs already handled during this commit should not be forced through normal naming.
+            If shouldSkipNameCheckForPendingExternalRef(docPath) Then Continue For
+
             'Vendor parts are allowed to keep vendor naming, but only inside Vendor Parts.
             If isVendorPartPath(docPath) Then Continue For
 
@@ -1032,6 +1647,17 @@ Public Module svnModule
                 If result <> swMessageBoxResult_e.swMbHitYes Then Return False
 
                 If Not renameCadFileToGrc27Name(doc) Then Return False
+
+                Try
+                    Dim parentDoc As ModelDoc2 = iSwApp.ActiveDoc
+
+                    If parentDoc IsNot Nothing Then
+                        If parentDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                            addModelDocToCommitArrayIfMissing(modDocArr, parentDoc)
+                        End If
+                    End If
+                Catch
+                End Try
             End If
         Next
 
@@ -1114,28 +1740,20 @@ Public Module svnModule
         End Using
     End Function
 
-    Private Function copyExternalRefsToVault(ByRef externalRefs As List(Of ExternalReferenceInfo), destinationFolder As String) As Boolean
+    Private Function copyExternalRefsToVault(ByRef externalRefs As List(Of ExternalReferenceInfo), destinationFolder As String, Optional isVendorFlow As Boolean = False) As Boolean
         If externalRefs Is Nothing Then Return True
         If externalRefs.Count = 0 Then Return True
         If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
 
-        If isVendorPartPath(destinationFolder) Then
-            iSwApp.SendMsgToUser2(
-            "Use the Add Vendor Part button for vendor/standard CAD." & vbCrLf & vbCrLf &
-            "Normal CAD added through this flow must follow the GRC27 naming convention.",
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-            Return False
-        End If
-
         For Each refInfo As ExternalReferenceInfo In externalRefs
             Dim finalFileName As String = refInfo.fileName
 
-            If Not isValidGrc27FileName(finalFileName) Then
-                finalFileName = promptForValidGrc27FileName(refInfo.oldPath)
+            If Not isVendorFlow Then
+                If Not isValidGrc27FileName(finalFileName) Then
+                    finalFileName = promptForValidGrc27FileName(refInfo.oldPath)
 
-                If String.IsNullOrWhiteSpace(finalFileName) Then Return False
+                    If String.IsNullOrWhiteSpace(finalFileName) Then Return False
+                End If
             End If
 
             Dim destPath As String = Path.Combine(destinationFolder, finalFileName)
@@ -1177,33 +1795,72 @@ Public Module svnModule
         Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
         If activeDoc Is Nothing Then Return False
 
-        Dim activePath As String = activeDoc.GetPathName()
+        If activeDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then
+            Return True
+        End If
+
+        Dim assy As AssemblyDoc = CType(activeDoc, AssemblyDoc)
         Dim okAll As Boolean = True
 
-        Try
-            activeDoc.ForceRebuild3(False)
-            activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
-        Catch
-        End Try
-
         For Each refInfo As ExternalReferenceInfo In externalRefs
-            Try
-                Dim ok As Boolean = iSwApp.ReplaceReferencedDocument(activePath, refInfo.oldPath, refInfo.newPath)
+            If refInfo Is Nothing Then Continue For
+            If String.IsNullOrWhiteSpace(refInfo.oldPath) Then Continue For
+            If String.IsNullOrWhiteSpace(refInfo.newPath) Then Continue For
 
-                If Not ok Then
+            Dim replacedThisRef As Boolean = False
+
+            Try
+                Dim compsObj As Object = assy.GetComponents(False)
+
+                If compsObj Is Nothing Then
+                    okAll = False
+                    Continue For
+                End If
+
+                Dim comps As Object() = CType(compsObj, Object())
+
+                For Each compObj As Object In comps
+                    Dim comp As Component2 = TryCast(compObj, Component2)
+                    If comp Is Nothing Then Continue For
+
+                    Dim compPath As String = ""
+
+                    Try
+                        compPath = comp.GetPathName()
+                    Catch
+                        Continue For
+                    End Try
+
+                    If String.IsNullOrWhiteSpace(compPath) Then Continue For
+
+                    If String.Equals(
+                    Path.GetFullPath(compPath),
+                    Path.GetFullPath(refInfo.oldPath),
+                    StringComparison.OrdinalIgnoreCase
+                ) Then
+                        Dim replaceOk As Boolean = comp.ReplaceReference(refInfo.newPath)
+
+                        If replaceOk Then
+                            replacedThisRef = True
+                        End If
+                    End If
+                Next
+
+                If Not replacedThisRef Then
                     okAll = False
                     iSwApp.SendMsgToUser2(
-                    "Failed to relink reference:" & vbCrLf & vbCrLf &
+                    "Failed to relink reference in the open assembly:" & vbCrLf & vbCrLf &
                     refInfo.oldPath & vbCrLf & "→" & vbCrLf & refInfo.newPath,
                     swMessageBoxIcon_e.swMbWarning,
                     swMessageBoxBtn_e.swMbOk
                 )
                 End If
+
             Catch ex As Exception
                 okAll = False
                 iSwApp.SendMsgToUser2(
-                "Error while relinking reference:" & vbCrLf & vbCrLf &
-                refInfo.oldPath & vbCrLf & vbCrLf &
+                "Error while relinking reference in the open assembly:" & vbCrLf & vbCrLf &
+                refInfo.oldPath & vbCrLf & "→" & vbCrLf & refInfo.newPath & vbCrLf & vbCrLf &
                 ex.Message,
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk
@@ -1212,10 +1869,8 @@ Public Module svnModule
         Next
 
         Try
-            iSwApp.CloseDoc(activeDoc.GetTitle())
-            Dim errors As Integer = 0
-            Dim warnings As Integer = 0
-            iSwApp.OpenDoc6(activePath, activeDoc.GetType(), swOpenDocOptions_e.swOpenDocOptions_Silent, "", errors, warnings)
+            activeDoc.ForceRebuild3(False)
+            activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
         Catch
         End Try
 
@@ -1242,9 +1897,63 @@ Public Module svnModule
         Return False
     End Function
 
+    Private Function activeAssemblyMustBeLockedForReferenceChanges() As Boolean
+        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+
+        If activeDoc Is Nothing Then Return False
+
+        Try
+            If activeDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then
+                Return True
+            End If
+        Catch
+            Return False
+        End Try
+
+
+        Dim activePath As String = ""
+
+        Try
+            activePath = activeDoc.GetPathName()
+        Catch
+            activePath = ""
+        End Try
+
+        'Brand-new assemblies saved inside the SVN working copy cannot be locked yet,
+        'because they are not version controlled until the first commit.
+        'Allow them through so Commit can svn add + commit them.
+        If isNewUnversionedOrAddedFile(activePath) Then
+            Return True
+        End If
+        Dim lockCheckDocs() As ModelDoc2 = {activeDoc}
+
+        Try
+            Dim hasLocks As Boolean() = ensureUserHasLocks(lockCheckDocs, bRetry:=False)
+
+            If hasLocks IsNot Nothing AndAlso hasLocks.Length > 0 AndAlso hasLocks(0) Then
+                Return True
+            End If
+        Catch
+        End Try
+
+        iSwApp.SendMsgToUser2(
+        "Commit blocked." & vbCrLf & vbCrLf &
+        "The active assembly must be locked by you before external or vendor CAD can be added." & vbCrLf & vbCrLf &
+        "Why:" & vbCrLf &
+        "Adding vendor/external CAD changes the assembly references, so the assembly must be writable and locked first." & vbCrLf & vbCrLf &
+        "Please click Get Locks on the assembly, then try Commit again.",
+        swMessageBoxIcon_e.swMbStop,
+        swMessageBoxBtn_e.swMbOk
+    )
+
+        Return False
+    End Function
+
     Public Function prepareExternalReferencesForSvnAction(ByRef modDocArr() As ModelDoc2) As Boolean
         If modDocArr Is Nothing Then Return True
         If modDocArr.Length = 0 Then Return True
+        pendingExternalRefCommitPaths.Clear()
+        pendingExternalRefSkipNameCheckPaths.Clear()
 
         Dim externalRefs As List(Of ExternalReferenceInfo) = getExternalCadReferences(modDocArr)
 
@@ -1297,23 +2006,100 @@ Public Module svnModule
         swMessageBoxIcon_e.swMbWarning,
         swMessageBoxBtn_e.swMbYesNo
     )
-
         If response <> swMessageBoxResult_e.swMbHitYes Then Return False
 
-        Dim destinationFolder As String = pickVaultDestinationFolder()
-        If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
+        Dim vendorResponse As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+    "Are these vendor/standard parts?" & vbCrLf & vbCrLf &
+    "Yes = save under Vendor Parts and keep vendor file names." & vbCrLf &
+    "No = normal GRC27 CAD; naming convention will be enforced.",
+    swMessageBoxIcon_e.swMbQuestion,
+    swMessageBoxBtn_e.swMbYesNo
+)
 
-        If Not copyExternalRefsToVault(externalRefs, destinationFolder) Then Return False
+        Dim isVendorFlow As Boolean = (vendorResponse = swMessageBoxResult_e.swMbHitYes)
+
+        Dim destinationFolder As String = ""
+
+        If isVendorFlow Then
+            Dim vendorRoot As String = getVendorPartsRootPath()
+
+            Try
+                If Not Directory.Exists(vendorRoot) Then
+                    Directory.CreateDirectory(vendorRoot)
+                End If
+            Catch ex As Exception
+                iSwApp.SendMsgToUser2(
+            "Could not create Vendor Parts folder:" & vbCrLf & vbCrLf &
+            vendorRoot & vbCrLf & vbCrLf &
+            ex.Message,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+                Return False
+            End Try
+
+            Using fbd As New FolderBrowserDialog()
+                fbd.Description = "Choose a folder under Vendor Parts for the vendor CAD."
+                fbd.SelectedPath = vendorRoot
+
+                If fbd.ShowDialog() <> DialogResult.OK Then Return False
+
+                destinationFolder = fbd.SelectedPath
+            End Using
+
+            If Not isPathInsideFolder(destinationFolder, vendorRoot) Then
+                iSwApp.SendMsgToUser2(
+            "Vendor CAD must be saved under:" & vbCrLf & vbCrLf &
+            vendorRoot,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+                Return False
+            End If
+
+            runSvnProcess(sSVNPath, "add --parents --depth empty """ & vendorRoot & """")
+            runSvnProcess(sSVNPath, "add --parents --depth empty """ & destinationFolder & """")
+        Else
+            destinationFolder = pickVaultDestinationFolder()
+            If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
+
+            If isVendorPartPath(destinationFolder) Then
+                iSwApp.SendMsgToUser2(
+            "Normal GRC27 CAD cannot be saved inside Vendor Parts." & vbCrLf & vbCrLf &
+            "Choose Yes on the vendor question if this is a standard/vendor part.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+                Return False
+            End If
+        End If
+
+        If Not copyExternalRefsToVault(externalRefs, destinationFolder, isVendorFlow) Then Return False
         If Not relinkExternalRefsToVaultCopies(externalRefs) Then Return False
 
         Dim copiedPaths As New List(Of String)
 
         For Each refInfo As ExternalReferenceInfo In externalRefs
-            If Not String.IsNullOrWhiteSpace(refInfo.newPath) Then copiedPaths.Add(refInfo.newPath)
+            If refInfo Is Nothing Then Continue For
+
+            If Not String.IsNullOrWhiteSpace(refInfo.oldPath) Then
+                pendingExternalRefSkipNameCheckPaths.Add(refInfo.oldPath)
+            End If
+
+            If Not String.IsNullOrWhiteSpace(refInfo.newPath) Then
+                copiedPaths.Add(refInfo.newPath)
+                pendingExternalRefSkipNameCheckPaths.Add(refInfo.newPath)
+            End If
         Next
 
+        pendingExternalRefCommitPaths.Clear()
+        pendingExternalRefSkipNameCheckPaths.Clear()
+
         If copiedPaths.Count > 0 Then
-            runSvnByArgs(copiedPaths.ToArray(), "add", bEach:=True)
+            For Each copiedPath As String In copiedPaths
+                runSvnProcess(sSVNPath, "add --parents """ & copiedPath & """")
+                pendingExternalRefCommitPaths.Add(copiedPath)
+            Next
         End If
 
         Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
@@ -1324,144 +2110,6 @@ Public Module svnModule
             Catch
             End Try
         End If
-
-        Return True
-    End Function
-
-    Public Function addVendorPartToVault() As Boolean
-        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
-
-        If activeDoc Is Nothing Then
-            iSwApp.SendMsgToUser2(
-            "Open the assembly that should reference the vendor part first.",
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-            Return False
-        End If
-
-        If activeDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then
-            iSwApp.SendMsgToUser2(
-            "Add Vendor Part should be used from an active assembly.",
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-            Return False
-        End If
-
-        Dim vendorRoot As String = getVendorPartsRootPath()
-
-        Try
-            If Not Directory.Exists(vendorRoot) Then
-                Directory.CreateDirectory(vendorRoot)
-            End If
-        Catch ex As Exception
-            iSwApp.SendMsgToUser2(
-            "Could not create Vendor Parts folder:" & vbCrLf & vbCrLf &
-            vendorRoot & vbCrLf & vbCrLf &
-            ex.Message,
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-            Return False
-        End Try
-
-        Dim filesToAdd As New List(Of String)
-
-        Using ofd As New OpenFileDialog()
-            ofd.Title = "Select vendor CAD file(s)"
-            ofd.Filter = "SolidWorks CAD (*.sldprt;*.sldasm)|*.sldprt;*.sldasm|All files (*.*)|*.*"
-            ofd.Multiselect = True
-
-            If ofd.ShowDialog() <> DialogResult.OK Then Return False
-
-            filesToAdd.AddRange(ofd.FileNames)
-        End Using
-
-        If filesToAdd.Count = 0 Then Return False
-
-        Dim destinationFolder As String = ""
-
-        Using fbd As New FolderBrowserDialog()
-            fbd.Description = "Choose a folder under GRC27\Vendor Parts for the vendor CAD."
-            fbd.SelectedPath = vendorRoot
-
-            If fbd.ShowDialog() <> DialogResult.OK Then Return False
-
-            destinationFolder = fbd.SelectedPath
-        End Using
-
-        If Not isPathInsideFolder(destinationFolder, vendorRoot) Then
-            iSwApp.SendMsgToUser2(
-            "Vendor CAD must be saved under:" & vbCrLf & vbCrLf &
-            vendorRoot,
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-            Return False
-        End If
-
-        Dim activePath As String = activeDoc.GetPathName()
-        Dim copiedPaths As New List(Of String)
-
-        For Each sourcePath As String In filesToAdd
-            If Not File.Exists(sourcePath) Then Continue For
-
-            Dim destPath As String = Path.Combine(destinationFolder, Path.GetFileName(sourcePath))
-
-            If File.Exists(destPath) Then
-                Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
-                "This vendor file already exists in the selected Vendor Parts folder:" & vbCrLf & vbCrLf &
-                destPath & vbCrLf & vbCrLf &
-                "Use the existing SVN copy?",
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbYesNo
-            )
-
-                If response <> swMessageBoxResult_e.swMbHitYes Then Return False
-            Else
-                Try
-                    File.Copy(sourcePath, destPath, overwrite:=False)
-                Catch ex As Exception
-                    iSwApp.SendMsgToUser2(
-                    "Failed to copy vendor part:" & vbCrLf & vbCrLf &
-                    sourcePath & vbCrLf & vbCrLf &
-                    ex.Message,
-                    swMessageBoxIcon_e.swMbStop,
-                    swMessageBoxBtn_e.swMbOk
-                )
-                    Return False
-                End Try
-            End If
-
-            copiedPaths.Add(destPath)
-
-            Try
-                iSwApp.ReplaceReferencedDocument(activePath, sourcePath, destPath)
-            Catch
-            End Try
-        Next
-
-        If copiedPaths.Count = 0 Then Return False
-
-        Try
-            activeDoc.ForceRebuild3(False)
-            activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
-        Catch
-        End Try
-
-        runSvnByArgs(copiedPaths.ToArray(), "add", bEach:=True)
-
-        iSwApp.SendMsgToUser2(
-        "Vendor part(s) added to SVN Vendor Parts folder." & vbCrLf & vbCrLf &
-        "The files have been copied and svn add has been run." & vbCrLf &
-        "Commit the vendor part(s) and the assembly together.",
-        swMessageBoxIcon_e.swMbInformation,
-        swMessageBoxBtn_e.swMbOk
-    )
-
-        updateLockStatusPublic(bRefreshAllTreeViews:=True)
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
 
         Return True
     End Function
@@ -1591,7 +2239,6 @@ Public Module svnModule
         Try
             For Each docToCheck As ModelDoc2 In modDocArr
                 If docToCheck Is Nothing Then Continue For
-
                 If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
                     docsForExternalRefCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
                 modDocArr,
@@ -1604,8 +2251,46 @@ Public Module svnModule
             docsForExternalRefCheck = modDocArr
         End Try
 
+        If Not activeAssemblyMustBeLockedForReferenceChanges() Then Exit Sub
+
         If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
+
+        'After external/vendor CAD is copied and relinked, rebuild the commit array.
+        'This makes sure newly copied SVN files are included in the commit.
+        Try
+            For Each docToCheck As ModelDoc2 In modDocArr
+                If docToCheck Is Nothing Then Continue For
+
+                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    modDocArr = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                modDocArr,
+                bResolveLightweight:=True
+            )
+                    Exit For
+                End If
+            Next
+        Catch
+        End Try
+
         If Not validateCadNamesBeforeCommit(modDocArr) Then Exit Sub
+
+        Dim docsForDuplicateCheck As ModelDoc2() = modDocArr
+
+        Try
+            For Each d As ModelDoc2 In modDocArr
+                If d IsNot Nothing AndAlso d.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                    docsForDuplicateCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                modDocArr,
+                bResolveLightweight:=True
+            )
+                    Exit For
+                End If
+            Next
+        Catch
+            docsForDuplicateCheck = modDocArr
+        End Try
+
+        If Not validateNoDuplicateCadFileNames(docsForDuplicateCheck) Then Exit Sub
         If Not commitAllowedOnlyIfUpToDate(modDocArr) Then Exit Sub
 
         'Filter out read-only files
@@ -1628,19 +2313,49 @@ Public Module svnModule
         End If
         sModDocPathArr = getFilePathsFromModDocArr(modDocArr)
 
+        If pendingExternalRefCommitPaths IsNot Nothing AndAlso pendingExternalRefCommitPaths.Count > 0 Then
+            Dim mergedCommitPaths As New List(Of String)
+
+            If sModDocPathArr IsNot Nothing Then
+                mergedCommitPaths.AddRange(sModDocPathArr)
+            End If
+
+            For Each pendingPath As String In pendingExternalRefCommitPaths
+                If String.IsNullOrWhiteSpace(pendingPath) Then Continue For
+                If Not File.Exists(pendingPath) Then Continue For
+
+                Dim alreadyIncluded As Boolean = mergedCommitPaths.Any(
+            Function(existingPath)
+                If String.IsNullOrWhiteSpace(existingPath) Then Return False
+                Return String.Equals(
+                    Path.GetFullPath(existingPath),
+                    Path.GetFullPath(pendingPath),
+                    StringComparison.OrdinalIgnoreCase
+                )
+            End Function
+        )
+
+                If Not alreadyIncluded Then
+                    mergedCommitPaths.Add(pendingPath)
+                End If
+            Next
+
+            sModDocPathArr = mergedCommitPaths.ToArray()
+        End If
+
         runSvnByArgs(sModDocPathArr, "add", bEach:=True)  'adds any not added. 
         svnPropset(sModDocPathArr, "addin:release_state", "||EDIT||")
 
         If save3AndShowErrorMessages(modDocArr) <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
 
         bSuccess = runTortoiseProcexeWithMonitor("/command:commit /path:" &
-                                                 formatFilePathArrForProc(
-                                                    getFilePathsFromModDocArr(modDocArr)) & " /logmsg:""" & sCommitMessage & """" & " /closeonend:3")
+                                         formatFilePathArrForProc(
+                                            sModDocPathArr) & " /logmsg:""" & sCommitMessage & """" & " /closeonend:3")
         If Not bSuccess Then iSwApp.SendMsgToUser("Tortoise App Failed.") : Exit Sub
 
         'If Filter() files -> any In list have 'unknown' status before, then call server for updates.
 
-        bSuccess = updateLockStatusPublic(bRefreshAllTreeViews:=True)
+        bSuccess = updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True)
         If Not bSuccess Then Exit Sub
         myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
         statusOfAllOpenModels.setReadWriteFromLockStatus()
@@ -1672,6 +2387,7 @@ Public Module svnModule
         If Not bSuccess Then Exit Sub
         myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
         statusOfAllOpenModels.setReadWriteFromLockStatus()
+        keepNewUncommittedCadFilesWritable()
 
     End Sub
     Sub myRepoStatus()
@@ -1738,34 +2454,30 @@ Public Module svnModule
         tortCommitDocs(modDocArr)
 
     End Sub
+
     Public Sub getLocksOfDocs(ByRef modDocArr() As ModelDoc2, Optional bBreakLocks As Boolean = False, Optional bUseTortoise As Boolean = True, Optional sMessage As String = "")
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc()
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Active Document not found") : Exit Sub
 
-        Dim docsForExternalRefCheck As ModelDoc2() = modDocArr
+        modDocArr = filterOutNewUnversionedOrAddedDocs(modDocArr)
 
-        Try
-            For Each docToCheck As ModelDoc2 In modDocArr
-                If docToCheck Is Nothing Then Continue For
-
-                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    docsForExternalRefCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                modDocArr,
-                bResolveLightweight:=True
-            )
-                    Exit For
-                End If
-            Next
-        Catch
-            docsForExternalRefCheck = modDocArr
-        End Try
-
-        If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
+        If modDocArr Is Nothing OrElse modDocArr.Length = 0 Then
+            iSwApp.SendMsgToUser2(
+            "No SVN lock needed." & vbCrLf & vbCrLf &
+            "The selected file appears to be new and not committed yet." & vbCrLf &
+            "Click Commit instead. The plugin will add it to SVN during the first commit.",
+            swMessageBoxIcon_e.swMbInformation,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Exit Sub
+        End If
 
         'Dim sw As New Stopwatch
         'sw.Start()
 
         'Dim modDocArr() As ModelDoc2 = {modDoc}
+
+
         'Dim sActiveDocPath() As String = getFilePathsFromModDocArr(modDocArr)
         Dim sDocPathsToCheckout(modDocArr.Length - 1) As String
         Dim sPathsOfReleased() As String
@@ -1899,10 +2611,12 @@ Public Module svnModule
             bEachSuccess = svnlock(getFilePathsFromModDocArr(modDocArr), sMessage)
             svnPropset(boolFilter(sDocPathsToCheckout, bEachSuccess), "addin:release_state", "||EDIT||")
         End If
+
         bSuccess = updateLockStatusPublic(bRefreshAllTreeViews:=True)
         If Not bSuccess Then Exit Sub
         myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
         statusOfAllOpenModels.setReadWriteFromLockStatus()
+        keepNewUncommittedCadFilesWritable()
 
         'sw.Stop()
         'Debug.WriteLine("getLocksOfDocs Time Taken: " + sw.Elapsed.TotalMilliseconds.ToString("#,##0.00 'milliseconds'"))
@@ -2180,7 +2894,11 @@ Public Module svnModule
         Dim bSuccess As Boolean = True
         Dim sModDocPathArr As String() = getFilePathsFromModDocArr(modDocArr)
 
+        keepNewUncommittedCadFilesWritable()
+
         If save3AndShowErrorMessages(modDocArr) <> swMessageBoxResult_e.swMbHitYes Then Return False
+
+        keepNewUncommittedCadFilesWritable()
 
         processOutputArr = runSvnByArgs(sModDocPathArr, "commit", "-m", """" & sCommitMessage & """", bEach:=False)
 
