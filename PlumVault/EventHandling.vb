@@ -1,3 +1,6 @@
+Imports System.Collections.Generic
+Imports System.Runtime.InteropServices
+Imports System.Windows.Forms
 Imports SolidWorks.Interop.sldworks
 Imports SolidWorks.Interop.swconst
 
@@ -123,11 +126,6 @@ Public Class PartEventHandler
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
-        iSwApp.SendMsgToUser2(
-        "DEBUG: PartEventHandler FileCloseNotify fired.",
-        swMessageBoxIcon_e.swMbInformation,
-        swMessageBoxBtn_e.swMbOk
-    )
 
         If svnModule.blockCloseIfOpenDocsUnsafe() Then
             Return 1 'Cancel close
@@ -364,24 +362,125 @@ Public Class DocView
     Dim WithEvents iModelView As ModelView
     Dim userAddin As SwAddin
     Dim parentDoc As DocumentEventHandler
+    Dim docWindowCloseGuards As New List(Of SolidWorksDocumentCloseGuardWindowHook)
 
     Function Init(ByVal addin As SwAddin, ByVal mView As ModelView, ByVal parent As DocumentEventHandler) As Boolean
         userAddin = addin
-        iModelView = mView
+        IModelView = mView
         parentDoc = parent
     End Function
 
     Function AttachEventHandlers() As Boolean
         AddHandler iModelView.DestroyNotify2, AddressOf Me.ModelView_DestroyNotify2
         AddHandler iModelView.RepaintNotify, AddressOf Me.ModelView_RepaintNotify
+
+        Try
+            Dim hwnd As IntPtr = IntPtr.Zero
+
+            Try
+                hwnd = New IntPtr(Convert.ToInt64(iModelView.GetViewHWnd()))
+            Catch
+                hwnd = IntPtr.Zero
+            End Try
+
+            If hwnd <> IntPtr.Zero Then
+                HookDocumentWindowAndParents(hwnd)
+            End If
+
+        Catch
+            docWindowCloseGuards.Clear()
+        End Try
     End Function
+
+    Private Sub HookDocumentWindowAndParents(startHwnd As IntPtr)
+        Dim currentHwnd As IntPtr = startHwnd
+        Dim hookedHandles As New HashSet(Of IntPtr)()
+
+        'Walk upward through the model view parent windows.
+        'The little document X is usually on one of these parent MDI/document windows.
+        For i As Integer = 0 To 8
+            If currentHwnd = IntPtr.Zero Then Exit For
+
+            If Not hookedHandles.Contains(currentHwnd) Then
+                Dim hook As New SolidWorksDocumentCloseGuardWindowHook()
+                hook.AssignSolidWorksDocumentHandle(currentHwnd)
+                docWindowCloseGuards.Add(hook)
+                hookedHandles.Add(currentHwnd)
+            End If
+
+            currentHwnd = SolidWorksDocumentCloseGuardWindowHook.GetParentWindow(currentHwnd)
+        Next
+    End Sub
 
     Function DetachEventHandlers() As Boolean
         RemoveHandler iModelView.DestroyNotify2, AddressOf Me.ModelView_DestroyNotify2
         RemoveHandler iModelView.RepaintNotify, AddressOf Me.ModelView_RepaintNotify
 
+        Try
+            For Each hook As SolidWorksDocumentCloseGuardWindowHook In docWindowCloseGuards
+                If hook Is Nothing Then Continue For
+                hook.ReleaseSolidWorksDocumentHandle()
+            Next
+
+            docWindowCloseGuards.Clear()
+        Catch
+            docWindowCloseGuards.Clear()
+        End Try
+
         parentDoc.DetachModelViewEventHandler(iModelView)
     End Function
+
+    Public Class SolidWorksDocumentCloseGuardWindowHook
+        Inherits NativeWindow
+
+        Private Const WM_CLOSE As Integer = &H10
+        Private Const WM_SYSCOMMAND As Integer = &H112
+        Private Const SC_CLOSE As Integer = &HF060
+
+        <DllImport("user32.dll", SetLastError:=True)>
+        Private Shared Function GetParent(ByVal hWnd As IntPtr) As IntPtr
+        End Function
+
+        Public Shared Function GetParentWindow(hwnd As IntPtr) As IntPtr
+            Try
+                Return GetParent(hwnd)
+            Catch
+                Return IntPtr.Zero
+            End Try
+        End Function
+
+        Public Sub AssignSolidWorksDocumentHandle(hwnd As IntPtr)
+            If hwnd = IntPtr.Zero Then Exit Sub
+            Me.AssignHandle(hwnd)
+        End Sub
+
+        Public Sub ReleaseSolidWorksDocumentHandle()
+            Try
+                Me.ReleaseHandle()
+            Catch
+            End Try
+        End Sub
+
+        Protected Overrides Sub WndProc(ByRef m As Message)
+            If m.Msg = WM_CLOSE Then
+                If svnModule.blockCloseIfOpenDocsUnsafe() Then
+                    Return
+                End If
+            End If
+
+            If m.Msg = WM_SYSCOMMAND Then
+                Dim command As Integer = m.WParam.ToInt32() And &HFFF0
+
+                If command = SC_CLOSE Then
+                    If svnModule.blockCloseIfOpenDocsUnsafe() Then
+                        Return
+                    End If
+                End If
+            End If
+
+            MyBase.WndProc(m)
+        End Sub
+    End Class
 
     Function ModelView_DestroyNotify2(ByVal destroyTYpe As Integer) As Integer
         DetachEventHandlers()
