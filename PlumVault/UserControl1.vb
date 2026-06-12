@@ -101,24 +101,22 @@ Public Class UserControl1
     End Sub
 
     Private Sub liveChangeCheckTimer_Tick(sender As Object, e As EventArgs) Handles liveChangeCheckTimer.Tick
+        'Speed fix:
+        'Do NOT run SVN server checks on a timer.
+        'The old live check could call svn status -u against the repo and make SOLIDWORKS feel frozen.
         Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
         If activeModDoc Is Nothing Then Exit Sub
 
-        Dim activePath As String = activeModDoc.GetPathName()
+        Dim activePath As String = ""
+
+        Try
+            activePath = activeModDoc.GetPathName()
+        Catch
+            activePath = ""
+        End Try
 
         If Not String.Equals(activePath, lastLiveCheckedActivePath, StringComparison.OrdinalIgnoreCase) Then
             lastLiveCheckedActivePath = activePath
-            setRefreshTreeButtonNormal()
-        End If
-
-        If refreshTreeNeedsUpdate Then Exit Sub
-
-        Dim docsToCheck As ModelDoc2() = getActiveAssemblyTreeForLiveCheck()
-        If docsToCheck Is Nothing Then Exit Sub
-
-        If svnModule.liveCheckForAssemblyServerChangesOnly(docsToCheck) Then
-            setRefreshTreeButtonUpdateNeeded()
-        Else
             setRefreshTreeButtonNormal()
         End If
     End Sub
@@ -285,7 +283,7 @@ Public Class UserControl1
 
     ' ### Refresh
     Private Sub RefreshToolStripMenuItemEventHandler(sender As Object, e As EventArgs)
-        refreshAddIn()
+        performLightweightRefresh()
     End Sub
     Private Sub collapseTreeViewHandler2(sender As Object, e As EventArgs)
         TreeView1.CollapseAll()
@@ -293,20 +291,15 @@ Public Class UserControl1
     End Sub
 
     Private Sub butRefresh_Click(sender As Object, e As EventArgs) Handles butRefresh.Click
+        performLightweightRefresh()
+    End Sub
 
-        If refreshTreeNeedsUpdate Then
-            Dim docsToUpdate As ModelDoc2() = getActiveAssemblyTreeForLiveCheck()
+    Private Sub performLightweightRefresh()
+        'Speed fix:
+        'Refresh Tree should refresh status/tree only.
+        'It should NOT run Get Latest / SVN update, and it should NOT call refreshAddIn() again.
 
-            If docsToUpdate IsNot Nothing Then
-                svnModule.myGetLatestOrRevert(docsToUpdate, getLatestType.update, bVerbose:=True)
-            End If
-
-            setRefreshTreeButtonNormal()
-        End If
-
-        'CLEANUP
         If iSwApp.GetDocumentCount() = 0 Then
-            'No files are open
             If Me.onlineCheckBox.Checked Then
                 If verifyLocalRepoPath(, bCheckLocalFolder:=True, bCheckServer:=True) Then
                     iSwApp.SendMsgToUser2("Couldn't find any open files to refresh the status for, but you are successfully communicating with SVN server. This button doesn't do anything if you don't have files open.",
@@ -323,18 +316,38 @@ Public Class UserControl1
             Exit Sub
         End If
 
-        'Speed fix:
-        'Do one server status update, then rebuild only the active document's tree.
-        'The old code updated from SVN, switched trees, then called refreshAddIn(), which could do it again.
-        statusOfAllOpenModels = New SVNStatus
+        Try
+            System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.WaitCursor
 
-        If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False) Then
+            statusOfAllOpenModels = New SVNStatus
+
+            'Local-only refresh.
+            'Do NOT call updateStatusOfAllModelsVariable here because that can hit the SVN server/repo
+            'and rebuild trees. Server update belongs under Get Latest, not Refresh Tree.
+            Try
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+            Catch
+            End Try
+
             refreshCurrentTreeViewOnly()
-        End If
 
-        statusOfAllOpenModels.setReadWriteFromLockStatus()
-        setRefreshTreeButtonNormal()
+            Try
+                statusOfAllOpenModels.setReadWriteFromLockStatus()
+            Catch
+            End Try
+
+            Try
+                externalSetReadWriteFromLockStatus()
+            Catch
+            End Try
+
+            setRefreshTreeButtonNormal()
+
+        Finally
+            System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
+        End Try
     End Sub
+
     ' ### Clean Up
     Private Sub butCleanup_Click(sender As Object, e As EventArgs) Handles butCleanup.Click
         iSwApp.SendMsgToUser("This unfortunately can't be run with SolidWorks Files open. Close all open files, then in Windows Explorer, right click > TortoiseSVN > Cleanup")
