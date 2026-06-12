@@ -65,11 +65,12 @@ Public Class UserControl1
         If activeModDoc Is Nothing Then Return Nothing
 
         Try
-            If activeModDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then
-                Return Nothing
-            End If
+            If String.IsNullOrWhiteSpace(activeModDoc.GetPathName()) Then Return Nothing
 
-            Return getComponentsOfAssemblyOptionalUpdateTree(New ModelDoc2() {activeModDoc})
+            'Speed fix:
+            'Do not walk the whole assembly every 30 seconds.
+            'The timer/live check only needs the active document so SolidWorks stays snappy.
+            Return New ModelDoc2() {activeModDoc}
         Catch
             Return Nothing
         End Try
@@ -322,13 +323,17 @@ Public Class UserControl1
             Exit Sub
         End If
 
+        'Speed fix:
+        'Do one server status update, then rebuild only the active document's tree.
+        'The old code updated from SVN, switched trees, then called refreshAddIn(), which could do it again.
         statusOfAllOpenModels = New SVNStatus
-        statusOfAllOpenModels.updateFromSvnServer(bRefreshAllTreeViews:=True)
-        switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+
+        If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False) Then
+            refreshCurrentTreeViewOnly()
+        End If
 
         statusOfAllOpenModels.setReadWriteFromLockStatus()
-
-        refreshAddIn()
+        setRefreshTreeButtonNormal()
     End Sub
     ' ### Clean Up
     Private Sub butCleanup_Click(sender As Object, e As EventArgs) Handles butCleanup.Click
@@ -587,9 +592,21 @@ Public Class UserControl1
     End Function
     Sub refreshAllTreeViewsVariable()
         Dim modDocArray As ModelDoc2() = getAllOpenDocs(bMustBeVisible:=True)
+
+        If modDocArray Is Nothing Then
+            ReDim allTreeViews(0)
+            allTreeViews(0) = New TreeView
+            Exit Sub
+        End If
+
+        If modDocArray.Length = 0 Then
+            ReDim allTreeViews(0)
+            allTreeViews(0) = New TreeView
+            Exit Sub
+        End If
+
         Dim i As Integer
         ReDim allTreeViews(UBound(modDocArray))
-        'allTreeViews(UBound(modDocArray)) = New TreeView()
 
         For i = 0 To UBound(modDocArray)
             If modDocArray(i) Is Nothing Then Continue For
@@ -599,15 +616,292 @@ Public Class UserControl1
         Next
     End Sub
 
+    Public Sub refreshCurrentTreeViewOnly()
+        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+
+        If activeDoc Is Nothing Then Exit Sub
+
+        Dim activePath As String = ""
+
+        Try
+            activePath = activeDoc.GetPathName()
+        Catch
+            activePath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(activePath) Then Exit Sub
+
+        If allTreeViews Is Nothing OrElse allTreeViews.Length = 0 Then
+            ReDim allTreeViews(0)
+            allTreeViews(0) = New TreeView
+        End If
+
+        Dim treeIndex As Integer = -1
+        Dim activeFileName As String = System.IO.Path.GetFileName(activePath)
+
+        For i As Integer = 0 To UBound(allTreeViews)
+            If allTreeViews(i) Is Nothing Then Continue For
+            If allTreeViews(i).Nodes.Count = 0 Then Continue For
+
+            If Strings.InStr(allTreeViews(i).Nodes(0).Text, activeFileName, CompareMethod.Text) <> 0 Then
+                treeIndex = i
+                Exit For
+            End If
+        Next
+
+        If treeIndex < 0 Then
+            treeIndex = allTreeViews.Length
+            ReDim Preserve allTreeViews(treeIndex)
+            allTreeViews(treeIndex) = New TreeView
+        End If
+
+        If allTreeViews(treeIndex) Is Nothing Then
+            allTreeViews(treeIndex) = New TreeView
+        End If
+
+        allTreeViews(treeIndex).Visible = False
+        getComponentsOfAssemblyOptionalUpdateTree({activeDoc}, treeIndex)
+        switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+    End Sub
+
+    Private Function getSafeModelPath(ByVal modDoc As ModelDoc2) As String
+        If modDoc Is Nothing Then Return ""
+
+        Try
+            Return modDoc.GetPathName()
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Function getSafeComponentPath(ByVal comp As Component2) As String
+        If comp Is Nothing Then Return ""
+
+        Try
+            Return comp.GetPathName()
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Function getSafeComponentSuppression(ByVal comp As Component2) As Integer
+        If comp Is Nothing Then Return swComponentSuppressionState_e.swComponentResolved
+
+        Try
+            Return comp.GetSuppression2()
+        Catch
+            Return swComponentSuppressionState_e.swComponentResolved
+        End Try
+    End Function
+
+    Private Function isComponentSuppressedState(ByVal suppressionState As Integer) As Boolean
+        Return suppressionState = swComponentSuppressionState_e.swComponentSuppressed
+    End Function
+
+    Private Function isComponentLightweightState(ByVal suppressionState As Integer) As Boolean
+        Return suppressionState = swComponentSuppressionState_e.swComponentLightweight OrElse
+               suppressionState = swComponentSuppressionState_e.swComponentFullyLightweight
+    End Function
+
+    Private Function buildComponentNodeText(ByVal comp As Component2, ByVal modDoc As ModelDoc2) As String
+        Dim compPath As String = getSafeComponentPath(comp)
+        Dim nodeText As String = ""
+
+        If Not String.IsNullOrWhiteSpace(compPath) Then
+            nodeText = System.IO.Path.GetFileName(compPath)
+        ElseIf modDoc IsNot Nothing Then
+            Try
+                nodeText = modDoc.GetTitle()
+            Catch
+                nodeText = "<unknown component>"
+            End Try
+        Else
+            nodeText = "<unknown component>"
+        End If
+
+        Dim suppressionState As Integer = getSafeComponentSuppression(comp)
+
+        If isComponentSuppressedState(suppressionState) Then
+            nodeText &= " [Suppressed]"
+        ElseIf isComponentLightweightState(suppressionState) Then
+            nodeText &= " [Lightweight]"
+        End If
+
+        Return nodeText
+    End Function
+
+    Private Function modelDocListContainsPath(ByRef mdComponentList As List(Of ModelDoc2), ByVal filePath As String) As Boolean
+        If mdComponentList Is Nothing Then Return False
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        For Each existingDoc As ModelDoc2 In mdComponentList
+            If existingDoc Is Nothing Then Continue For
+
+            Dim existingPath As String = getSafeModelPath(existingDoc)
+
+            If String.IsNullOrWhiteSpace(existingPath) Then Continue For
+
+            Try
+                If String.Equals(System.IO.Path.GetFullPath(existingPath),
+                                 System.IO.Path.GetFullPath(filePath),
+                                 StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            Catch
+                If String.Equals(existingPath, filePath, StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            End Try
+        Next
+
+        Return False
+    End Function
+
+    Private Sub addModelDocIfMissing(ByRef mdComponentList As List(Of ModelDoc2), ByVal modDoc As ModelDoc2, Optional ByVal bUniqueOnly As Boolean = True)
+        If modDoc Is Nothing Then Exit Sub
+
+        Dim docPath As String = getSafeModelPath(modDoc)
+
+        If bUniqueOnly AndAlso modelDocListContainsPath(mdComponentList, docPath) Then Exit Sub
+
+        mdComponentList.Add(modDoc)
+    End Sub
+
+    Private Function nodePathMatches(ByVal node As TreeNode, ByVal filePath As String) As Boolean
+        If node Is Nothing Then Return False
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Dim nodePath As String = ""
+
+        Try
+            If TypeOf node.Tag Is Component2 Then
+                nodePath = CType(node.Tag, Component2).GetPathName()
+            ElseIf TypeOf node.Tag Is ModelDoc2 Then
+                nodePath = CType(node.Tag, ModelDoc2).GetPathName()
+            End If
+        Catch
+            nodePath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(nodePath) Then Return False
+
+        Try
+            Return String.Equals(System.IO.Path.GetFullPath(nodePath),
+                                 System.IO.Path.GetFullPath(filePath),
+                                 StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return String.Equals(nodePath, filePath, StringComparison.OrdinalIgnoreCase)
+        End Try
+    End Function
+
+    Private Function treeContainsPath(ByVal rootNode As TreeNode, ByVal filePath As String) As Boolean
+        If rootNode Is Nothing Then Return False
+
+        If nodePathMatches(rootNode, filePath) Then Return True
+
+        For Each child As TreeNode In rootNode.Nodes
+            If treeContainsPath(child, filePath) Then Return True
+        Next
+
+        Return False
+    End Function
+
+    Private Sub addMissingComponentsFromFlatAssemblyList(ByVal swAssy As AssemblyDoc,
+                                                         ByRef mdComponentList As List(Of ModelDoc2),
+                                                         ByRef rootNode As TreeNode,
+                                                         Optional ByVal bUniqueOnly As Boolean = True,
+                                                         Optional ByVal bResolveLightweight As Boolean = False)
+
+        If swAssy Is Nothing Then Exit Sub
+        If rootNode Is Nothing Then Exit Sub
+
+        Dim compObj As Object = Nothing
+
+        Try
+            compObj = swAssy.GetComponents(False)
+        Catch
+            compObj = Nothing
+        End Try
+
+        If compObj Is Nothing Then Exit Sub
+
+        Dim compArr As Object() = Nothing
+
+        Try
+            compArr = CType(compObj, Object())
+        Catch
+            Exit Sub
+        End Try
+
+        For Each obj As Object In compArr
+            Dim comp As Component2 = TryCast(obj, Component2)
+            If comp Is Nothing Then Continue For
+
+            Try
+                If comp.IsEnvelope Then Continue For
+            Catch
+            End Try
+
+            Dim compPath As String = getSafeComponentPath(comp)
+            If String.IsNullOrWhiteSpace(compPath) Then Continue For
+
+            If treeContainsPath(rootNode, compPath) Then Continue For
+
+            Dim suppressionState As Integer = getSafeComponentSuppression(comp)
+            Dim compDoc As ModelDoc2 = Nothing
+
+            If Not isComponentSuppressedState(suppressionState) Then
+                If bResolveLightweight AndAlso isComponentLightweightState(suppressionState) Then
+                    Try
+                        ensureResolvedComponent(comp)
+                    Catch
+                    End Try
+                End If
+
+                Try
+                    compDoc = TryCast(comp.GetModelDoc2(), ModelDoc2)
+                Catch
+                    compDoc = Nothing
+                End Try
+            End If
+
+            If compDoc IsNot Nothing Then
+                addModelDocIfMissing(mdComponentList, compDoc, bUniqueOnly)
+            End If
+
+            Dim missingNode As New TreeNode(buildComponentNodeText(comp, compDoc))
+            missingNode.Tag = comp
+            setNodeColorFromStatus(missingNode)
+            rootNode.Nodes.Add(missingNode)
+        Next
+    End Sub
+
     Public Function getComponentsOfAssemblyOptionalUpdateTree(
-                                    ByRef modDocArr() As ModelDoc2,
-                                    Optional ByVal allTreeViewsIndexToUpdate As Integer = Nothing,
+                                    ByRef modDoc As ModelDoc2,
+                                    Optional ByVal allTreeViewsIndexToUpdate As Integer = -1,
                                     Optional ByVal bUniqueOnly As Boolean = True,
                                     Optional ByVal bResolveLightweight As Boolean = False) As ModelDoc2()
 
-        ' Checkin and checkout needs the modDocArray. The others just want filepaths. 
+        If modDoc Is Nothing Then Return Nothing
 
-        Dim bUpdateTreeView As Boolean = If(IsNothing(allTreeViewsIndexToUpdate) And Not IsNothing(allTreeViews), False, True)
+        Dim modDocArr() As ModelDoc2 = {modDoc}
+
+        Return getComponentsOfAssemblyOptionalUpdateTree(modDocArr, allTreeViewsIndexToUpdate, bUniqueOnly, bResolveLightweight)
+    End Function
+
+    Public Function getComponentsOfAssemblyOptionalUpdateTree(
+                                    ByRef modDocArr() As ModelDoc2,
+                                    Optional ByVal allTreeViewsIndexToUpdate As Integer = -1,
+                                    Optional ByVal bUniqueOnly As Boolean = True,
+                                    Optional ByVal bResolveLightweight As Boolean = False) As ModelDoc2()
+
+        'Returns ModelDoc2() for normal/open/resolved files.
+        'The tree can also show suppressed/path-only components by using Component2.GetPathName().
+        'Important speed fix: when allTreeViewsIndexToUpdate is omitted, do NOT update the tree.
+
+        If modDocArr Is Nothing Then Return Nothing
+
+        Dim bUpdateTreeView As Boolean = (allTreeViewsIndexToUpdate >= 0 AndAlso Not IsNothing(allTreeViews))
         Dim sFileNameTemp As String
         Dim parentNode As TreeNode = Nothing
         Dim modelDocList As New List(Of ModelDoc2)()
@@ -619,7 +913,7 @@ Public Class UserControl1
         Dim i, j As Integer
         j = 0
 
-        If (UBound(modDocArr) > 0) And (Not IsNothing(allTreeViewsIndexToUpdate)) Then
+        If (UBound(modDocArr) > 0) AndAlso bUpdateTreeView Then
             iSwApp.SendMsgToUser("Error: getComponentsOfAssemblyOptionalUpdateTree wasn't written to update tree views on multiple assemblies")
             Return Nothing
         End If
@@ -627,72 +921,75 @@ Public Class UserControl1
         For i = 0 To UBound(modDocArr)
 
             If IsNothing(modDocArr(i)) Then Continue For
-            sFileNameTemp = System.IO.Path.GetFileName(modDocArr(i).GetPathName)
 
-            'If modDocArr(i).GetType <> swDocumentTypes_e.swDocASSEMBLY Then
-            '    'check if it's actually an assembly...
-            '    modelDocList.Add(modDocArr(i))
-            '    Continue For
-            'End If
+            Try
+                sFileNameTemp = System.IO.Path.GetFileName(modDocArr(i).GetPathName)
+            Catch
+                sFileNameTemp = modDocArr(i).GetTitle()
+            End Try
 
             If bUpdateTreeView Then
                 allTreeViews(allTreeViewsIndexToUpdate).Visible = False
-
-
-                'For k = 0 To (allTreeViews(allTreeViewsIndexToUpdate).Nodes.Count - 1)
-                '    allTreeViews(allTreeViewsIndexToUpdate).Nodes(0).Remove()
-                'Next
-                'allTreeViews(allTreeViewsIndexToUpdate).Nodes.Clear() ' <- HAS A BUG THAT FREEZES IN INTERNAL LOOP
                 allTreeViews(allTreeViewsIndexToUpdate) = Nothing
                 allTreeViews(allTreeViewsIndexToUpdate) = New TreeView
 
                 parentNode = New TreeNode(sFileNameTemp)
-                parentNode.Tag = modDocArr(0)
+                parentNode.Tag = modDocArr(i)
             End If
 
             If modDocArr(i).GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                If bResolveLightweight Then CType(modDocArr(i), AssemblyDoc).ResolveAllLightWeightComponents(WarnUser:=False)
+
+                'Do not resolve lightweight components during tree refresh.
+                'Only explicit "With Dependents" actions pass bResolveLightweight:=True.
+                If bResolveLightweight Then
+                    Try
+                        CType(modDocArr(i), AssemblyDoc).ResolveAllLightWeightComponents(WarnUser:=False)
+                    Catch
+                    End Try
+                End If
+
                 swConfMgr = modDocArr(i).ConfigurationManager
                 swConf = swConfMgr.ActiveConfiguration
                 swRootComp = swConf.GetRootComponent3(True)
 
-                TraverseComponent(swRootComp, modelDocList, 1, parentNode, bUniqueOnly)
+                TraverseComponent(swRootComp, modelDocList, 1, parentNode, bUniqueOnly, bResolveLightweight)
+
+                If bUpdateTreeView Then
+                    addMissingComponentsFromFlatAssemblyList(CType(modDocArr(i), AssemblyDoc), modelDocList, parentNode, bUniqueOnly, bResolveLightweight)
+                End If
+
                 j += 1
+
             ElseIf modDocArr(i).GetType = swDocumentTypes_e.swDocDRAWING Then
 
                 If bUpdateTreeView Then
                     setNodeColorFromStatus(parentNode)
-                    'allTreeViews(allTreeViewsIndexToUpdate).Nodes.Add(parentNode)
                 End If
 
-                modelDocList.Add(modDocArr(i)) 'Add drawing
+                addModelDocIfMissing(modelDocList, modDocArr(i), bUniqueOnly)
                 j += 1
-                'Try to find part/asy for drawing
 
                 modDocTemp = iSwApp.GetOpenDocumentByName(System.IO.Path.ChangeExtension(modDocArr(i).GetPathName(), ".sldprt"))
+
                 If Not (modDocTemp Is Nothing) Then
-                    modelDocList.Add(modDocTemp)
+                    addModelDocIfMissing(modelDocList, modDocTemp, bUniqueOnly)
                     j += 1
                 Else
-                    'couldn't find part. try again as assembly
                     modDocTemp = iSwApp.GetOpenDocumentByName(System.IO.Path.ChangeExtension(modDocArr(i).GetPathName(), ".sldasm"))
                     If Not (modDocTemp Is Nothing) Then
-                        modelDocList.Add(modDocTemp)
+                        addModelDocIfMissing(modelDocList, modDocTemp, bUniqueOnly)
                         j += 1
                     End If
                 End If
-            Else 'Part file
-                'Should be a part file... not sure what else there is
+
+            Else
                 If bUpdateTreeView Then
                     setNodeColorFromStatus(parentNode)
                     allTreeViews(allTreeViewsIndexToUpdate).Nodes.Add(parentNode)
                 End If
-                modelDocList.Add(modDocArr(i))
+
+                addModelDocIfMissing(modelDocList, modDocArr(i), bUniqueOnly)
                 j += 1
-                'iswApp.SendMsgToUser("Error: Model is not an assembly.")
-                'Throw New System.Exception("modDoc is not an Assembly")
-
-
             End If
         Next
 
@@ -702,9 +999,12 @@ Public Class UserControl1
         End If
 
         Dim mdComponentArr() As ModelDoc2 = modelDocList.ToArray
+
         If bUpdateTreeView Then
             allTreeViews(allTreeViewsIndexToUpdate).Sort()
-            allTreeViews(allTreeViewsIndexToUpdate).Nodes.Add(parentNode)   'Do we really need this??
+            If parentNode IsNot Nothing Then
+                allTreeViews(allTreeViewsIndexToUpdate).Nodes.Add(parentNode)
+            End If
         End If
 
         Return mdComponentArr
@@ -715,75 +1015,153 @@ Public Class UserControl1
                          ByRef mdComponentList As List(Of ModelDoc2),
                          ByVal nLevel As Long,
                          Optional ByRef rootNode As TreeNode = Nothing,
-                         Optional ByVal bUniqueOnly As Boolean = True)
+                         Optional ByVal bUniqueOnly As Boolean = True,
+                         Optional ByVal bResolveLightweight As Boolean = False)
 
-        'https://help.solidworks.com/2016/English/api/sldworksapi/Traverse_Assembly_at_Component_and_Feature_Levels_Using_Recursion_Example_VBNET.htm
+        'Keeps suppressed/lightweight components visible in the tree.
+        'Suppressed components are not unsuppressed automatically.
+        'If ModelDoc2 is unavailable, the tree still uses Component2.GetPathName().
+
         Dim bUC As Boolean = If(rootNode Is Nothing, False, True)
-        Dim vChildComp As Object
+        Dim vChildComp As Object = Nothing
         Dim swChildComp As Component2
-        Dim sPadStr As String = " "
         Dim i As Long
-        Dim modDocChild As ModelDoc2
-        Dim sChildFileName As String
+
+        Dim modDocParent As ModelDoc2 = Nothing
+        Dim modDocChild As ModelDoc2 = Nothing
+
         Dim parentNode As TreeNode = Nothing
         Dim childNode As TreeNode = Nothing
-        Dim modDocParent As ModelDoc2 = swComp.GetModelDoc2
-        Dim sParentFileName As String = System.IO.Path.GetFileName(modDocParent.GetPathName)
-        Dim tempStatus As SVNStatus = New SVNStatus()
-        Dim slComponentList As List(Of String) = New List(Of String)
 
-        mdComponentList.Add(modDocParent)
-        slComponentList.Add(modDocParent.GetTitle)
+        If swComp Is Nothing Then Exit Sub
+
+        Dim parentSuppression As Integer = getSafeComponentSuppression(swComp)
+
+        If Not isComponentSuppressedState(parentSuppression) Then
+            If bResolveLightweight AndAlso isComponentLightweightState(parentSuppression) Then
+                Try
+                    ensureResolvedComponent(swComp)
+                Catch
+                End Try
+            End If
+
+            Try
+                modDocParent = TryCast(swComp.GetModelDoc2(), ModelDoc2)
+            Catch
+                modDocParent = Nothing
+            End Try
+        End If
+
+        If modDocParent IsNot Nothing Then
+            addModelDocIfMissing(mdComponentList, modDocParent, bUniqueOnly)
+        End If
 
         If bUC Then
-            parentNode = New TreeNode(sParentFileName) '& " " & sGetDescription(modDocParent)
-            parentNode.Tag = swComp 'modDocParent
+            parentNode = New TreeNode(buildComponentNodeText(swComp, modDocParent))
+            parentNode.Tag = swComp
             setNodeColorFromStatus(parentNode)
         End If
 
-        Debug.Print(swComp.GetPathName())
+        Try
+            vChildComp = swComp.GetChildren()
+        Catch
+            vChildComp = Nothing
+        End Try
 
-        vChildComp = swComp.GetChildren
-        If vChildComp Is Nothing Then Exit Sub 'I dunno why this would happen, but gotta prevent errors. Maybe all the children are lightweight??
+        If vChildComp Is Nothing Then
+            If bUC Then
+                If nLevel = 1 Then
+                    rootNode = parentNode
+                ElseIf rootNode IsNot Nothing Then
+                    rootNode.Nodes.Add(parentNode)
+                End If
+            End If
+
+            Exit Sub
+        End If
+
         For i = 0 To UBound(vChildComp)
-            swChildComp = vChildComp(i)
-            Debug.Print(swChildComp.GetPathName())
-            If swChildComp.IsEnvelope Then Continue For 'Skip envelope components
-            modDocChild = swChildComp.GetModelDoc2
-            If IsNothing(modDocChild) Then Continue For
-            If modDocChild.GetType <> swDocumentTypes_e.swDocASSEMBLY Then
-                'Is part file
-                If mdComponentList.Contains(modDocChild) Then Continue For 'avoid duplicates <- I don't know if this actually works...
-                If slComponentList.Contains(modDocChild.GetTitle) And (bUniqueOnly) Then Continue For 'avoid duplicates
+
+            swChildComp = TryCast(vChildComp(i), Component2)
+            If swChildComp Is Nothing Then Continue For
+
+            Try
+                If swChildComp.IsEnvelope Then Continue For
+            Catch
+            End Try
+
+            Dim childPath As String = getSafeComponentPath(swChildComp)
+            Dim childSuppression As Integer = getSafeComponentSuppression(swChildComp)
+
+            modDocChild = Nothing
+
+            If Not isComponentSuppressedState(childSuppression) Then
+                If bResolveLightweight AndAlso isComponentLightweightState(childSuppression) Then
+                    Try
+                        ensureResolvedComponent(swChildComp)
+                    Catch
+                    End Try
+                End If
+
+                Try
+                    modDocChild = TryCast(swChildComp.GetModelDoc2(), ModelDoc2)
+                Catch
+                    modDocChild = Nothing
+                End Try
+            End If
+
+            If String.IsNullOrWhiteSpace(childPath) AndAlso modDocChild Is Nothing Then
+                Continue For
+            End If
+
+            Dim childIsAssembly As Boolean = False
+
+            If modDocChild IsNot Nothing Then
+                Try
+                    childIsAssembly = (modDocChild.GetType() = swDocumentTypes_e.swDocASSEMBLY)
+                Catch
+                    childIsAssembly = False
+                End Try
+            ElseIf Not String.IsNullOrWhiteSpace(childPath) Then
+                childIsAssembly = String.Equals(System.IO.Path.GetExtension(childPath), ".SLDASM", StringComparison.OrdinalIgnoreCase)
+            End If
+
+            If childIsAssembly AndAlso modDocChild IsNot Nothing Then
+
+                If bUniqueOnly AndAlso modelDocListContainsPath(mdComponentList, getSafeModelPath(modDocChild)) Then
+                    If bUC Then
+                        childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
+                        childNode.Tag = swChildComp
+                        setNodeColorFromStatus(childNode)
+                        parentNode.Nodes.Add(childNode)
+                    End If
+
+                    Continue For
+                End If
+
+                TraverseComponent(swChildComp, mdComponentList, nLevel + 1, parentNode, bUniqueOnly, bResolveLightweight)
+
+            Else
+
+                If modDocChild IsNot Nothing Then
+                    addModelDocIfMissing(mdComponentList, modDocChild, bUniqueOnly)
+                End If
 
                 If bUC Then
-                    sChildFileName = System.IO.Path.GetFileName(modDocChild.GetPathName)
-                    childNode = New TreeNode(sChildFileName) '& " " & sGetDescription(modDocChild)
-                    childNode.Tag = swChildComp 'modDocChild
+                    childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
+                    childNode.Tag = swChildComp
                     setNodeColorFromStatus(childNode)
                     parentNode.Nodes.Add(childNode)
                 End If
 
-                mdComponentList.Add(modDocChild)
-                slComponentList.Add(modDocChild.GetTitle)
-            ElseIf modDocChild.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                'Is assembly
-                If mdComponentList.Contains(modDocChild) Then Continue For 'avoid duplicates <- I don't know if this actually works...
-                If slComponentList.Contains(modDocChild.GetTitle) And (bUniqueOnly) Then Continue For 'avoid duplicates
-
-                TraverseComponent(swChildComp, mdComponentList, nLevel + 1, parentNode, bUniqueOnly)
-
-                mdComponentList.Add(modDocChild)
-                slComponentList.Add(modDocChild.GetTitle)
-            Else
-                Exit Sub
             End If
+
         Next i
 
         If bUC Then
             If nLevel = 1 Then
                 rootNode = parentNode
-            Else
+            ElseIf rootNode IsNot Nothing Then
                 rootNode.Nodes.Add(parentNode)
             End If
         End If
@@ -870,21 +1248,34 @@ Public Class UserControl1
     Function getModDocAttachedToNode(rootNode As TreeNode) As ModelDoc2
         Dim comp As Component2
 
-        If Not IsNothing(rootNode.Tag) Then
-            If TypeOf rootNode.Tag Is Component2 Then
-                comp = rootNode.Tag
-                If Not ensureResolvedComponent(comp) Then Return Nothing
-                getModDocAttachedToNode = comp.GetModelDoc2
-            ElseIf TypeOf rootNode.Tag Is ModelDoc2 Then
+        If rootNode Is Nothing Then Return Nothing
+        If rootNode.Tag Is Nothing Then Return Nothing
 
-                getModDocAttachedToNode = rootNode.Tag
-            Else
+        If TypeOf rootNode.Tag Is Component2 Then
+            comp = CType(rootNode.Tag, Component2)
+
+            Try
+                Dim suppressionState As Integer = comp.GetSuppression2()
+
+                'Do not unsuppress components just to color/build the tree.
+                'Suppressed nodes should stay suppressed and use path-only SVN status.
+                If suppressionState = swComponentSuppressionState_e.swComponentSuppressed Then
+                    Return Nothing
+                End If
+            Catch
+            End Try
+
+            Try
+                Return TryCast(comp.GetModelDoc2(), ModelDoc2)
+            Catch
                 Return Nothing
-            End If
-        Else
-            Return Nothing
+            End Try
+
+        ElseIf TypeOf rootNode.Tag Is ModelDoc2 Then
+            Return CType(rootNode.Tag, ModelDoc2)
         End If
-        Return getModDocAttachedToNode
+
+        Return Nothing
     End Function
 
     Private Function stripStatusSuffix(nodeText As String) As String
@@ -1535,7 +1926,7 @@ Public Class UserControl1
         openFileNameInWebpage("https://www.digikey.com/en/products/result?keywords=%s", modDocArr(0))
     End Sub
 
-    Private Sub Button1_Click(sender As Object, e As EventArgs) 
+    Private Sub Button1_Click(sender As Object, e As EventArgs)
 
     End Sub
 End Class

@@ -4,12 +4,150 @@ Imports System.Windows.Forms
 Imports SolidWorks.Interop.sldworks
 Imports SolidWorks.Interop.swconst
 
+
+'Global keyboard hook used to catch Ctrl+W before SOLIDWORKS processes it.
+'FileCloseNotify/DestroyNotify are too late for Ctrl+W because SOLIDWORKS has already started the close.
+Public Class SolidWorksCtrlWCloseGuardKeyboardHook
+    Private Delegate Function KeyboardHookProc(ByVal nCode As Integer, ByVal wParam As IntPtr, ByVal lParam As IntPtr) As IntPtr
+
+    Private Shared hookHandle As IntPtr = IntPtr.Zero
+    Private Shared hookCallback As KeyboardHookProc = AddressOf KeyboardProc
+
+    Private Const WH_KEYBOARD As Integer = 2
+    Private Const HC_ACTION As Integer = 0
+    Private Const VK_W As Integer = &H57
+    Private Const VK_CONTROL As Integer = &H11
+    Private Const VK_LCONTROL As Integer = &HA2
+    Private Const VK_RCONTROL As Integer = &HA3
+
+    <DllImport("user32.dll", SetLastError:=True)>
+    Private Shared Function SetWindowsHookEx(ByVal idHook As Integer,
+                                             ByVal lpfn As KeyboardHookProc,
+                                             ByVal hMod As IntPtr,
+                                             ByVal dwThreadId As UInteger) As IntPtr
+    End Function
+
+    <DllImport("user32.dll", SetLastError:=True)>
+    Private Shared Function CallNextHookEx(ByVal hhk As IntPtr,
+                                           ByVal nCode As Integer,
+                                           ByVal wParam As IntPtr,
+                                           ByVal lParam As IntPtr) As IntPtr
+    End Function
+
+    <DllImport("user32.dll")>
+    Private Shared Function GetKeyState(ByVal nVirtKey As Integer) As Short
+    End Function
+
+    <DllImport("kernel32.dll")>
+    Private Shared Function GetCurrentThreadId() As UInteger
+    End Function
+
+    Public Shared Sub Install()
+        If hookHandle <> IntPtr.Zero Then Exit Sub
+
+        Try
+            hookHandle = SetWindowsHookEx(
+                WH_KEYBOARD,
+                hookCallback,
+                IntPtr.Zero,
+                GetCurrentThreadId()
+            )
+        Catch
+            hookHandle = IntPtr.Zero
+        End Try
+    End Sub
+
+    Private Shared Function IsKeyCurrentlyDown(ByVal virtualKey As Integer) As Boolean
+        Try
+            Return (GetKeyState(virtualKey) And &H8000) <> 0
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Shared Function KeyboardProc(ByVal nCode As Integer, ByVal wParam As IntPtr, ByVal lParam As IntPtr) As IntPtr
+        Try
+            If nCode = HC_ACTION Then
+                Dim virtualKey As Integer = wParam.ToInt32()
+
+                If virtualKey = VK_W Then
+                    Dim lParamValue As Long = lParam.ToInt64()
+                    Dim isKeyRelease As Boolean = ((lParamValue And &H80000000L) <> 0)
+
+                    If Not isKeyRelease Then
+                        Dim ctrlDown As Boolean =
+                            IsKeyCurrentlyDown(VK_CONTROL) OrElse
+                            IsKeyCurrentlyDown(VK_LCONTROL) OrElse
+                            IsKeyCurrentlyDown(VK_RCONTROL)
+
+                        If ctrlDown Then
+                            If svnModule.blockCloseIfActiveDocUnsafe() Then
+                                Return New IntPtr(1) 'Eat Ctrl+W, preventing SOLIDWORKS from closing the document.
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+
+        Catch
+        End Try
+
+        Return CallNextHookEx(hookHandle, nCode, wParam, lParam)
+    End Function
+End Class
+
 'Base class for model event handlers
 Public Class DocumentEventHandler
     Protected openModelViews As New Hashtable()
     Protected userAddin As SwAddin
     Protected iDocument As ModelDoc2
     Protected iSwApp As SldWorks
+
+    Protected Function IsThisDocumentFile(ByVal fileName As String) As Boolean
+        If iDocument Is Nothing Then Return False
+
+        Dim docPath As String = ""
+        Dim docTitle As String = ""
+
+        Try
+            docPath = iDocument.GetPathName()
+        Catch
+            docPath = ""
+        End Try
+
+        Try
+            docTitle = iDocument.GetTitle()
+        Catch
+            docTitle = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(fileName) Then Return True
+
+        Try
+            If Not String.IsNullOrWhiteSpace(docPath) Then
+                If String.Equals(System.IO.Path.GetFullPath(docPath),
+                                 System.IO.Path.GetFullPath(fileName),
+                                 StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+
+                If String.Equals(System.IO.Path.GetFileName(docPath),
+                                 System.IO.Path.GetFileName(fileName),
+                                 StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            End If
+        Catch
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(docTitle) Then
+            If String.Equals(docTitle, fileName, StringComparison.OrdinalIgnoreCase) Then
+                Return True
+            End If
+        End If
+
+        Return False
+    End Function
 
     Overridable Function Init(ByVal sw As SldWorks, ByVal addin As SwAddin, ByVal model As ModelDoc2) As Boolean
     End Function
@@ -91,6 +229,7 @@ Public Class PartEventHandler
         'AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.PartDoc_ActiveModelDocChangeNotify
         'AddHandler iSwApp.FileOpenPostNotify, AddressOf Me.PartDoc_FileOpenPostNotify
 
+        SolidWorksCtrlWCloseGuardKeyboardHook.Install()
         ConnectModelViews()
     End Function
 
@@ -127,7 +266,11 @@ Public Class PartEventHandler
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
 
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+        If Not IsThisDocumentFile(FileName) Then
+            Return 0
+        End If
+
+        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
             Return 1 'Cancel close
         End If
 
@@ -136,7 +279,7 @@ Public Class PartEventHandler
 
     Function PartDoc_DestroyNotify() As Integer
 
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
             Return 1 'Cancel close
         End If
 
@@ -176,6 +319,7 @@ Public Class AssemblyEventHandler
         'AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.AssemblyDoc_ActiveModelDocChangeNotify
         'AddHandler iSwApp.FileCloseNotify, AddressOf Me.DSldWorksEvents_FileCloseNotifyEventHandler
 
+        SolidWorksCtrlWCloseGuardKeyboardHook.Install()
         ConnectModelViews()
     End Function
 
@@ -205,7 +349,8 @@ Public Class AssemblyEventHandler
     End Function
 
     Function AssemblyDoc_DestroyNotify() As Integer
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+
+        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
             Return 1 'Cancel close
         End If
 
@@ -218,7 +363,12 @@ Public Class AssemblyEventHandler
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+
+        If Not IsThisDocumentFile(FileName) Then
+            Return 0
+        End If
+
+        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
             Return 1 'Cancel close
         End If
 
@@ -321,6 +471,7 @@ Public Class DrawingEventHandler
         AddHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
+        SolidWorksCtrlWCloseGuardKeyboardHook.Install()
         ConnectModelViews()
     End Function
 
@@ -335,7 +486,8 @@ Public Class DrawingEventHandler
     End Function
 
     Function DrawingDoc_DestroyNotify() As Integer
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+
+        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
             Return 1 'Cancel close
         End If
 
@@ -348,7 +500,12 @@ Public Class DrawingEventHandler
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
+
+        If Not IsThisDocumentFile(FileName) Then
+            Return 0
+        End If
+
+        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
             Return 1 'Cancel close
         End If
 
@@ -366,7 +523,7 @@ Public Class DocView
 
     Function Init(ByVal addin As SwAddin, ByVal mView As ModelView, ByVal parent As DocumentEventHandler) As Boolean
         userAddin = addin
-        IModelView = mView
+        iModelView = mView
         parentDoc = parent
     End Function
 
@@ -435,6 +592,8 @@ Public Class DocView
 
         Private Const WM_CLOSE As Integer = &H10
         Private Const WM_SYSCOMMAND As Integer = &H112
+        Private Const WM_KEYDOWN As Integer = &H100
+        Private Const WM_SYSKEYDOWN As Integer = &H104
         Private Const SC_CLOSE As Integer = &HF060
 
         <DllImport("user32.dll", SetLastError:=True)>
@@ -462,8 +621,25 @@ Public Class DocView
         End Sub
 
         Protected Overrides Sub WndProc(ByRef m As Message)
+
+            'Catch Ctrl+W before SolidWorks processes it as a document close shortcut.
+            If m.Msg = WM_KEYDOWN OrElse m.Msg = WM_SYSKEYDOWN Then
+                Try
+                    Dim keyCode As Integer = m.WParam.ToInt32()
+
+                    If keyCode = CInt(Keys.W) AndAlso
+                       ((Control.ModifierKeys And Keys.Control) = Keys.Control) Then
+
+                        If svnModule.blockCloseIfActiveDocUnsafe() Then
+                            Return
+                        End If
+                    End If
+                Catch
+                End Try
+            End If
+
             If m.Msg = WM_CLOSE Then
-                If svnModule.blockCloseIfOpenDocsUnsafe() Then
+                If svnModule.blockCloseIfActiveDocUnsafe() Then
                     Return
                 End If
             End If
@@ -472,7 +648,7 @@ Public Class DocView
                 Dim command As Integer = m.WParam.ToInt32() And &HFFF0
 
                 If command = SC_CLOSE Then
-                    If svnModule.blockCloseIfOpenDocsUnsafe() Then
+                    If svnModule.blockCloseIfActiveDocUnsafe() Then
                         Return
                     End If
                 End If

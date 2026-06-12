@@ -24,6 +24,7 @@ Public Module svnModule
     Private pendingExternalRefSkipNameCheckPaths As New List(Of String)
     Private closeGuardMessageShowing As Boolean = False
     Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
+    Private unsafeForceCloseApprovedUntil As DateTime = DateTime.MinValue
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -118,6 +119,9 @@ Public Module svnModule
         If myUserControl Is Nothing Then Return False
         If Not myUserControl.onlineCheckBox.Checked Then Return False
 
+        'If the user just chose "No = close anyway", allow duplicate close events through briefly.
+        If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
+
         If closeGuardMessageShowing Then Return False
 
         Dim openPaths As New List(Of String)
@@ -171,8 +175,8 @@ Public Module svnModule
                 If Not isPathInsideLocalRepo(docPath) Then Continue For
 
                 openPaths.Add(docPath)
-
             Next
+
         Catch
             Return False
         End Try
@@ -187,47 +191,128 @@ Public Module svnModule
 
         Try
             closeGuardMessageShowing = True
-
-            Dim response As Integer = iSwApp.SendMsgToUser2(
-                "One or more open CAD files are not safe to close yet." & vbCrLf & vbCrLf &
-                unsafeMsg & vbCrLf &
-                "Choose an action:" & vbCrLf &
-                "Yes = I will Commit / push the changes now" & vbCrLf &
-                "No = I will Revert / discard the local changes now" & vbCrLf &
-                "Cancel = Stay open and do nothing",
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbYesNoCancel
-            )
-
-            If response = swMessageBoxResult_e.swMbHitYes Then
-                iSwApp.SendMsgToUser2(
-                    "Close cancelled." & vbCrLf & vbCrLf &
-                    "Click Commit in the SVN task pane, then close SolidWorks again.",
-                    swMessageBoxIcon_e.swMbInformation,
-                    swMessageBoxBtn_e.swMbOk
-                )
-
-                Return True 'Block close
-            End If
-
-            If response = swMessageBoxResult_e.swMbHitNo Then
-                iSwApp.SendMsgToUser2(
-                    "Close cancelled." & vbCrLf & vbCrLf &
-                    "Click Unlock && Revert in the SVN task pane, then close SolidWorks again.",
-                    swMessageBoxIcon_e.swMbInformation,
-                    swMessageBoxBtn_e.swMbOk
-                )
-
-                Return True 'Block close
-            End If
-
-            Return True 'Cancel = block close
+            Return showUnsafeClosePrompt(unsafeMsg)
 
         Finally
             closeGuardMessageShowing = False
         End Try
     End Function
 
+    Public Function blockCloseIfSingleDocUnsafe(ByVal closingDoc As ModelDoc2) As Boolean
+        If iSwApp Is Nothing Then Return False
+        If myUserControl Is Nothing Then Return False
+        If Not myUserControl.onlineCheckBox.Checked Then Return False
+
+        'If the user just chose "No = close anyway", allow duplicate close events through briefly.
+        If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
+
+        If closeGuardMessageShowing Then Return False
+        If closingDoc Is Nothing Then Return False
+
+        Dim openPaths As New List(Of String)
+
+        Try
+            Dim docPath As String = ""
+            Dim title As String = ""
+
+            Try
+                docPath = closingDoc.GetPathName()
+            Catch
+                docPath = ""
+            End Try
+
+            Try
+                title = closingDoc.GetTitle()
+            Catch
+                title = "<unknown document>"
+            End Try
+
+            Dim isDirty As Boolean = False
+
+            Try
+                isDirty = closingDoc.GetSaveFlag()
+            Catch
+                isDirty = False
+            End Try
+
+            If isDirty Then
+                openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
+
+            ElseIf String.IsNullOrWhiteSpace(docPath) Then
+                openPaths.Add("[UNSAVED_NEW_FILE] " & title)
+
+            ElseIf isCadFilePath(docPath) AndAlso isPathInsideLocalRepo(docPath) Then
+                openPaths.Add(docPath)
+            End If
+
+        Catch
+            Return False
+        End Try
+
+        If openPaths.Count = 0 Then Return False
+
+        Dim unsafeMsg As String = getUnsafeCloseStatusMessage(openPaths)
+
+        If String.IsNullOrWhiteSpace(unsafeMsg) Then
+            Return False
+        End If
+
+        Try
+            closeGuardMessageShowing = True
+            Return showUnsafeClosePrompt(unsafeMsg)
+
+        Finally
+            closeGuardMessageShowing = False
+        End Try
+    End Function
+
+    Public Function blockCloseIfActiveDocUnsafe() As Boolean
+        If iSwApp Is Nothing Then Return False
+
+        Dim activeDoc As ModelDoc2 = Nothing
+
+        Try
+            activeDoc = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Catch
+            activeDoc = Nothing
+        End Try
+
+        If activeDoc Is Nothing Then Return False
+
+        Return blockCloseIfSingleDocUnsafe(activeDoc)
+    End Function
+
+    Private Function showUnsafeClosePrompt(ByVal unsafeMsg As String) As Boolean
+        Dim response As Integer = iSwApp.SendMsgToUser2(
+            "One or more open CAD files are not safe to close yet." & vbCrLf & vbCrLf &
+            unsafeMsg & vbCrLf &
+            "Choose an action:" & vbCrLf &
+            "Yes = I want to go back to push/revert" & vbCrLf &
+            "No = I want to close SolidWorks anyway",
+            swMessageBoxIcon_e.swMbWarning,
+            swMessageBoxBtn_e.swMbYesNo
+        )
+
+        If response = swMessageBoxResult_e.swMbHitYes Then
+            iSwApp.SendMsgToUser2(
+                "Close cancelled." & vbCrLf & vbCrLf &
+                "Commit/push your files, or use Unlock && Revert to go back to the original version.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+
+            Return True 'Block close
+        End If
+
+        If response = swMessageBoxResult_e.swMbHitNo Then
+            'Allow duplicate close events through briefly.
+            'This prevents the same force-close choice from prompting multiple times.
+            unsafeForceCloseApprovedUntil = DateTime.Now.AddSeconds(10)
+            Return False 'Allow close anyway
+        End If
+
+        Return True 'Safety fallback: block close
+    End Function
 
 
     Private Function getUnsafeCloseStatusMessage(openPaths As List(Of String)) As String
@@ -589,7 +674,27 @@ Public Module svnModule
         'iSwApp.SendMsgToUser(sSVNPath)
         statusProcessOutput = runSvnProcess(sSVNPath, statusArguments)
         If bCheckServer Then
-            lockOwnersByPath = getSvnLockOwnersByPath(myUserControl.localRepoPath.Text.TrimEnd("\"c))
+            lockOwnersByPath = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+            'Speed fix:
+            'For targeted status checks, do not scan the whole repo just to get lock owners.
+            'Normal Get Locks usually passes one or a few files, so query only those paths.
+            If sModDocPathArr IsNot Nothing AndAlso sModDocPathArr.Length > 0 AndAlso sModDocPathArr.Length <= 50 Then
+                For Each lockPath As String In sModDocPathArr
+                    If String.IsNullOrWhiteSpace(lockPath) Then Continue For
+
+                    Try
+                        Dim ownersForPath As Dictionary(Of String, String) = getSvnLockOwnersByPath(lockPath)
+
+                        For Each kvp As KeyValuePair(Of String, String) In ownersForPath
+                            lockOwnersByPath(kvp.Key) = kvp.Value
+                        Next
+                    Catch
+                    End Try
+                Next
+            Else
+                lockOwnersByPath = getSvnLockOwnersByPath(myUserControl.localRepoPath.Text.TrimEnd("\"c))
+            End If
         Else
             lockOwnersByPath = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
         End If
@@ -2498,44 +2603,21 @@ Public Module svnModule
             Exit Sub
         End If
 
-        'Dim sw As New Stopwatch
-        'sw.Start()
-
         Dim sDocPathsToCheckout() As String = Nothing
         Dim sPathsOfReleased() As String
         Dim status As SVNStatus
-        Dim statusForLatestCheck As SVNStatus
-        Dim statusForLocking As SVNStatus
         Dim bSuccess As Boolean = False
         Dim sCatMessage As String = ""
         Dim sFilter As String
         Dim bEachSuccess() As Boolean
 
-        Dim modDocArrToCheckForLatest As ModelDoc2() = modDocArr
+        'Speed fix:
+        'Normal Get Locks only checks/locks the files passed in.
+        'Get Locks With Dependents already passes dependents in modDocArr, so no extra dependency walk is needed here.
+        status = getFileSVNStatus(bCheckServer:=True, modDocArr:=modDocArr)
+        If IsNothing(status) Then Exit Sub
 
-        Try
-            For Each docToCheck As ModelDoc2 In modDocArr
-                If docToCheck Is Nothing Then Continue For
-
-                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    modDocArrToCheckForLatest = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                modDocArr,
-                bResolveLightweight:=True
-            )
-                    Exit For
-                End If
-            Next
-        Catch
-            modDocArrToCheckForLatest = modDocArr
-        End Try
-
-        If modDocArrToCheckForLatest Is Nothing Then modDocArrToCheckForLatest = modDocArr
-
-        'This status is ONLY for checking/updating latest geometry.
-        statusForLatestCheck = getFileSVNStatus(bCheckServer:=True, modDocArrToCheckForLatest)
-        If IsNothing(statusForLatestCheck) Then Exit Sub
-
-        Dim outOfDateBeforeLock As String() = statusForLatestCheck.sFilterUpToDate9("*")
+        Dim outOfDateBeforeLock As String() = status.sFilterUpToDate9("*")
 
         If outOfDateBeforeLock IsNot Nothing Then
             Dim msg As String =
@@ -2552,12 +2634,12 @@ Public Module svnModule
     )
 
             If result = swMessageBoxResult_e.swMbHitYes Then
-                myGetLatestOrRevert(modDocArrToCheckForLatest, getLatestType.update, bVerbose:=True)
+                myGetLatestOrRevert(modDocArr, getLatestType.update, bVerbose:=True)
 
-                statusForLatestCheck = getFileSVNStatus(bCheckServer:=True, modDocArrToCheckForLatest)
-                If IsNothing(statusForLatestCheck) Then Exit Sub
+                status = getFileSVNStatus(bCheckServer:=True, modDocArr:=modDocArr)
+                If IsNothing(status) Then Exit Sub
 
-                outOfDateBeforeLock = statusForLatestCheck.sFilterUpToDate9("*")
+                outOfDateBeforeLock = status.sFilterUpToDate9("*")
                 If outOfDateBeforeLock IsNot Nothing Then
                     iSwApp.SendMsgToUser2(
                 "The selected files are still out of date after update. Lock cancelled.",
@@ -2575,14 +2657,6 @@ Public Module svnModule
                 Exit Sub
             End If
         End If
-
-        'This status is ONLY for deciding what to lock.
-        'Normal Get Locks locks only the original modDocArr.
-        'Get Locks With Dependents already passes dependents in modDocArr, so it still locks dependents.
-        statusForLocking = getFileSVNStatus(bCheckServer:=True, modDocArr)
-        If IsNothing(statusForLocking) Then Exit Sub
-
-        status = statusForLocking
 
         If bBreakLocks Then
             sFilter = "*K"
@@ -2634,14 +2708,19 @@ Public Module svnModule
             svnPropset(boolFilter(sDocPathsToCheckout, bEachSuccess), "addin:release_state", "||EDIT||")
         End If
 
-        bSuccess = updateLockStatusPublic(bRefreshAllTreeViews:=True)
+        'Speed fix:
+        'Do not rebuild every open tree after a lock. Rebuild only the active tree.
+        bSuccess = updateLockStatusPublic(bRefreshAllTreeViews:=False)
         If Not bSuccess Then Exit Sub
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+
+        Try
+            myUserControl.refreshCurrentTreeViewOnly()
+        Catch
+            myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+        End Try
+
         statusOfAllOpenModels.setReadWriteFromLockStatus()
         keepNewUncommittedCadFilesWritable()
-
-        'sw.Stop()
-        'Debug.WriteLine("getLocksOfDocs Time Taken: " + sw.Elapsed.TotalMilliseconds.ToString("#,##0.00 'milliseconds'"))
 
     End Sub
     Function svnlock(sModDocPathArr() As String, Optional sMessage As String = "", Optional bBreakLocks As Boolean = False) As Boolean()
@@ -3049,14 +3128,19 @@ Public Module svnModule
     Public Function ensureResolvedComponent(ByRef swcomp As Component2) As Boolean
         Dim suppChangeError As swSuppressionError_e
         Dim lightSuppressState As swComponentSuppressionState_e
-        'Dim outputState As swComponentSuppressionState_e
 
         If swcomp Is Nothing Then Return False
 
         lightSuppressState = swcomp.GetSuppression2
 
-        If lightSuppressState = swComponentSuppressionState_e.swComponentSuppressed Or
-            lightSuppressState = swComponentSuppressionState_e.swComponentLightweight Or
+        'Do NOT automatically unsuppress suppressed components.
+        'Users may suppress components for performance or visibility.
+        If lightSuppressState = swComponentSuppressionState_e.swComponentSuppressed Then
+            Return False
+        End If
+
+        'Only resolve lightweight / fully-lightweight components when an explicit action asks for it.
+        If lightSuppressState = swComponentSuppressionState_e.swComponentLightweight OrElse
             lightSuppressState = swComponentSuppressionState_e.swComponentFullyLightweight Then
 
             suppChangeError = swcomp.SetSuppression2(swComponentSuppressionState_e.swComponentResolved)
@@ -3066,10 +3150,9 @@ Public Module svnModule
             Else
                 Return False
             End If
-        Else
-            Return True
         End If
 
+        Return True
     End Function
     Public Function sGetDescription(modDoc As ModelDoc2) As String
         'https://help.solidworks.com/2023/english/api/sldworksapi/Get_Custom_Properties_of_Referenced_Part_Example_VBNET.htm
