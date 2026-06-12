@@ -709,8 +709,10 @@ Public Module svnModule
             sFilePathTemp = sOutputLines(i).Substring(sFileStartIndex, sOutputLines(i).Length - sFileStartIndex)
 
             modDocTemp = iSwApp.GetOpenDocumentByName(sFilePathTemp)
-            If modDocTemp Is Nothing Then Continue For
 
+            'Important:
+            'Do NOT skip files just because SolidWorks does not have a ModelDoc2 for them.
+            'Suppressed/lightweight/path-only components can still have valid SVN paths.
             entireSVNStatus.addOutputLineToSVNStatus(sOutputLines(i), m, sFilePathTemp, modDocTemp, bCheckServer, vLookup(sFilePathTemp.Replace("\", "/"), sPropArr, 1))
 
             Dim lockOwnerTemp As String = ""
@@ -2455,7 +2457,31 @@ Public Module svnModule
 
     End Sub
 
-    Public Sub getLocksOfDocs(ByRef modDocArr() As ModelDoc2, Optional bBreakLocks As Boolean = False, Optional bUseTortoise As Boolean = True, Optional sMessage As String = "")
+    Private Function filterExistingCadFilePathsOnly(ByVal inputPaths() As String) As String()
+        If inputPaths Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)
+
+        For Each p As String In inputPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+
+            Try
+                If Not File.Exists(p) Then Continue For
+
+                Dim ext As String = Path.GetExtension(p).ToUpperInvariant()
+
+                If ext = ".SLDPRT" OrElse ext = ".SLDASM" OrElse ext = ".SLDDRW" Then
+                    output.Add(p)
+                End If
+            Catch
+            End Try
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Public Sub getLocksOfDocs(ByRef modDocArr() As ModelDoc2, Optional bBreakLocks As Boolean = False, Optional bUseTortoise As Boolean = False, Optional sMessage As String = "")
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc()
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Active Document not found") : Exit Sub
 
@@ -2475,18 +2501,13 @@ Public Module svnModule
         'Dim sw As New Stopwatch
         'sw.Start()
 
-        'Dim modDocArr() As ModelDoc2 = {modDoc}
-
-
-        'Dim sActiveDocPath() As String = getFilePathsFromModDocArr(modDocArr)
-        Dim sDocPathsToCheckout(modDocArr.Length - 1) As String
+        Dim sDocPathsToCheckout() As String = Nothing
         Dim sPathsOfReleased() As String
         Dim status As SVNStatus
         Dim statusForLatestCheck As SVNStatus
         Dim statusForLocking As SVNStatus
         Dim bSuccess As Boolean = False
         Dim sCatMessage As String = ""
-        Dim sCatMessageLocked As String = ""
         Dim sFilter As String
         Dim bEachSuccess() As Boolean
 
@@ -2562,15 +2583,6 @@ Public Module svnModule
         If IsNothing(statusForLocking) Then Exit Sub
 
         status = statusForLocking
-        'If Not IsNothing(status.statError(0).sMessage) Then
-        '    'If status.statError(0).sMessage <> "" Then
-        '    '    iSwApp.SendMsgToUser(status.statError(0).sMessage)
-        '    'Else
-        '    '    iSwApp.SendMsgToUser("Error Contacting SVN Server")
-        '    'End If
-        '    'Exit Sub
-
-        'End If
 
         If bBreakLocks Then
             sFilter = "*K"
@@ -2584,31 +2596,41 @@ Public Module svnModule
             If sMessage <> "#UP REV EDIT#" Then
                 iSwApp.SendMsgToUser("Unable to lock the following files, since they are in 'RELEASED' state. Use 'EDIT New Revision' command to get edit access " & vbCrLf & String.Join(vbCrLf, sPathsOfReleased))
                 status = status.statusFilter(sFiltReleasedRemoved:="||RELEASED||") ' removes released files.
-
             End If
         End If
 
         If status Is Nothing Then Exit Sub
+
         sDocPathsToCheckout = status.sFilterUpToDate9(sFilter, bFilterNot:=True)
+        sDocPathsToCheckout = filterExistingCadFilePathsOnly(sDocPathsToCheckout)
 
         sCatMessage = catWithNewLine(status.sFilterUpToDate9(sFilter))
 
         If sCatMessage <> "" Then
             iSwApp.SendMsgToUser("Local copy is out of date. Update from Vault and try again." & vbCrLf & sCatMessage)
-            'TODO add window. Ask user if they want to update
-            If sDocPathsToCheckout(0) Is Nothing Then Exit Sub
+
+            If sDocPathsToCheckout Is Nothing OrElse sDocPathsToCheckout.Length = 0 Then
+                Exit Sub
+            End If
         End If
-        If sDocPathsToCheckout(0) Is Nothing Then
-            iSwApp.SendMsgToUser("No Files available to be locked.")
+
+        If sDocPathsToCheckout Is Nothing OrElse sDocPathsToCheckout.Length = 0 Then
+            iSwApp.SendMsgToUser("No CAD files available to be locked.")
             Exit Sub
         End If
+
         If bUseTortoise Then
             bSuccess = runTortoiseProcexeWithMonitor("/command:lock /path:" & formatFilePathArrForProc(sDocPathsToCheckout) & " /closeonend:3")
             If Not bSuccess Then iSwApp.SendMsgToUser("Locking Failed.") : Exit Sub
             svnPropset(sDocPathsToCheckout, "addin:release_state", "||EDIT||")
-            'status = getFileSVNStatus(bCheckServer:=False, modDocArr)
         Else
-            bEachSuccess = svnlock(getFilePathsFromModDocArr(modDocArr), sMessage)
+            bEachSuccess = svnlock(sDocPathsToCheckout, sMessage, bBreakLocks)
+
+            If bEachSuccess Is Nothing OrElse Not bEachSuccess.Any(Function(x) x) Then
+                iSwApp.SendMsgToUser("Locking Failed.")
+                Exit Sub
+            End If
+
             svnPropset(boolFilter(sDocPathsToCheckout, bEachSuccess), "addin:release_state", "||EDIT||")
         End If
 
@@ -2622,49 +2644,59 @@ Public Module svnModule
         'Debug.WriteLine("getLocksOfDocs Time Taken: " + sw.Elapsed.TotalMilliseconds.ToString("#,##0.00 'milliseconds'"))
 
     End Sub
-    Function svnlock(sModDocPathArr() As String, Optional sMessage As String = "") As Boolean()
-        Dim sOutputLines() As String
-        Dim sOutputErrorLines() As String
-        Dim processOutputArr(0) As rawProcessReturn
+    Function svnlock(sModDocPathArr() As String, Optional sMessage As String = "", Optional bBreakLocks As Boolean = False) As Boolean()
+        If sModDocPathArr Is Nothing Then Return Nothing
+
+        sModDocPathArr = filterExistingCadFilePathsOnly(sModDocPathArr)
+
+        If sModDocPathArr Is Nothing OrElse sModDocPathArr.Length = 0 Then
+            iSwApp.SendMsgToUser("Error: No valid CAD file paths were passed to SVN lock.")
+            Return Nothing
+        End If
+
         Dim bSuccess(UBound(sModDocPathArr)) As Boolean
-        Dim i As Integer = 0
-        Dim iErr As Integer = 0
-        Dim sCumulativeErrorLines As New List(Of String)
+        Dim processOutputArr() As rawProcessReturn
+        Dim sOutputError As String = ""
 
-        processOutputArr = runSvnByArgs(sModDocPathArr, "lock", "-m", """" & sMessage & """", bEach:=False)
+        Try
+            Dim lockArgs As String = "lock "
 
-        For Each processOutput In processOutputArr
-            sOutputLines = processOutput.output.Split(ControlChars.CrLf.ToCharArray(), StringSplitOptions.RemoveEmptyEntries)
-            sOutputErrorLines = processOutput.outputError.Split(ControlChars.CrLf.ToCharArray(), StringSplitOptions.RemoveEmptyEntries)
-            'Error Checking
-            '            If iErr > 10 Then Return Nothing 'Prevents user getting stuck with too many error messages
-            If (sOutputErrorLines Is Nothing) Or (sOutputLines Is Nothing) Then
-                sCumulativeErrorLines.Add("Error: SVN commit output is nothing!")
-                bSuccess(i) = False
-                iErr += 1
-            ElseIf sOutputErrorLines.Length <> 0 Then
-                'We got some errors if length > 0
-                'For i = 0 To UBound(sOutputErrorLines)
-                '    If sOutputErrorLines(i).Contains("E215004") Then
-                '        'Log in Failed!
-                '    End If
-                'Next
-
-                sCumulativeErrorLines.Add(String.Join(vbCrLf, sOutputErrorLines))
-
-                bSuccess(i) = False
-                iErr += 1
-            Else
-                bSuccess(i) = True
+            If bBreakLocks Then
+                lockArgs &= "--force "
             End If
-            i += 1
-        Next
 
-        If iErr > 0 Then iSwApp.SendMsgToUser("Error: " & String.Join(vbCrLf, sCumulativeErrorLines.ToArray))
+            processOutputArr = runSvnByArgs(
+                sModDocPathArr,
+                lockArgs,
+                "-m",
+                """" & sMessage & """",
+                bEach:=False
+            )
 
-        Return bSuccess
+            If processOutputArr Is Nothing OrElse processOutputArr.Length = 0 Then
+                iSwApp.SendMsgToUser("Error: SVN lock returned no process output.")
+                Return bSuccess
+            End If
 
+            If processOutputArr(0).outputError IsNot Nothing Then
+                sOutputError = processOutputArr(0).outputError.Trim()
+            End If
 
+            If sOutputError <> "" Then
+                iSwApp.SendMsgToUser("Error: " & sOutputError)
+                Return bSuccess
+            End If
+
+            For i As Integer = 0 To UBound(bSuccess)
+                bSuccess(i) = True
+            Next
+
+            Return bSuccess
+
+        Catch ex As Exception
+            iSwApp.SendMsgToUser("Error running SVN lock: " & ex.Message)
+            Return bSuccess
+        End Try
     End Function
     Function verifyLocalRepoPath(Optional bInteractive As Boolean = True, Optional bCheckLocalFolder As Boolean = True, Optional bCheckServer As Boolean = True) As Boolean
 
