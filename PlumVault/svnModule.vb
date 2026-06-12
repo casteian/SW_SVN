@@ -1847,12 +1847,73 @@ Public Module svnModule
         End Using
     End Function
 
+    Private Function getExistingVendorPathForFileName(fileName As String) As String
+        If String.IsNullOrWhiteSpace(fileName) Then Return ""
+
+        Dim vendorRoot As String = getVendorPartsRootPath()
+
+        Try
+            If Not Directory.Exists(vendorRoot) Then Return ""
+
+            Dim matches() As String = Directory.GetFiles(vendorRoot, fileName, SearchOption.AllDirectories)
+
+            If matches Is Nothing Then Return ""
+            If matches.Length = 0 Then Return ""
+
+            Return matches(0)
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Function pathsAreSame(pathA As String, pathB As String) As Boolean
+        If String.IsNullOrWhiteSpace(pathA) Then Return False
+        If String.IsNullOrWhiteSpace(pathB) Then Return False
+
+        Try
+            Return String.Equals(
+                Path.GetFullPath(pathA),
+                Path.GetFullPath(pathB),
+                StringComparison.OrdinalIgnoreCase
+            )
+        Catch
+            Return String.Equals(pathA, pathB, StringComparison.OrdinalIgnoreCase)
+        End Try
+    End Function
+
+    Private Function filterCommitPathsInsideRepoOnly(ByVal inputPaths() As String) As String()
+        If inputPaths Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)
+
+        For Each p As String In inputPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+
+            Try
+                If Not File.Exists(p) Then Continue For
+                If Not isPathInsideLocalRepo(p) Then Continue For
+
+                Dim alreadyIncluded As Boolean = output.Any(Function(existingPath) pathsAreSame(existingPath, p))
+
+                If Not alreadyIncluded Then
+                    output.Add(p)
+                End If
+            Catch
+            End Try
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
     Private Function copyExternalRefsToVault(ByRef externalRefs As List(Of ExternalReferenceInfo), destinationFolder As String, Optional isVendorFlow As Boolean = False) As Boolean
         If externalRefs Is Nothing Then Return True
         If externalRefs.Count = 0 Then Return True
         If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
 
         For Each refInfo As ExternalReferenceInfo In externalRefs
+            If refInfo Is Nothing Then Continue For
+
             Dim finalFileName As String = refInfo.fileName
 
             If Not isVendorFlow Then
@@ -1863,9 +1924,25 @@ Public Module svnModule
                 End If
             End If
 
+            'Vendor/standard parts are allowed to reuse an existing committed vendor file.
+            'This prevents the second commit from copying/re-adding the same vendor part again.
+            If isVendorFlow Then
+                Dim existingVendorPath As String = getExistingVendorPathForFileName(finalFileName)
+
+                If Not String.IsNullOrWhiteSpace(existingVendorPath) AndAlso File.Exists(existingVendorPath) Then
+                    refInfo.newPath = existingVendorPath
+                    Continue For
+                End If
+            End If
+
             Dim destPath As String = Path.Combine(destinationFolder, finalFileName)
 
             If File.Exists(destPath) Then
+                If isVendorFlow Then
+                    refInfo.newPath = destPath
+                    Continue For
+                End If
+
                 iSwApp.SendMsgToUser2(
                 "A file with this name already exists in the selected SVN folder:" & vbCrLf & vbCrLf &
                 destPath & vbCrLf & vbCrLf &
@@ -1908,6 +1985,13 @@ Public Module svnModule
 
         Dim assy As AssemblyDoc = CType(activeDoc, AssemblyDoc)
         Dim okAll As Boolean = True
+        Dim activeAssemblyPath As String = ""
+
+        Try
+            activeAssemblyPath = activeDoc.GetPathName()
+        Catch
+            activeAssemblyPath = ""
+        End Try
 
         For Each refInfo As ExternalReferenceInfo In externalRefs
             If refInfo Is Nothing Then Continue For
@@ -1917,41 +2001,50 @@ Public Module svnModule
             Dim replacedThisRef As Boolean = False
 
             Try
-                Dim compsObj As Object = assy.GetComponents(False)
-
-                If compsObj Is Nothing Then
-                    okAll = False
-                    Continue For
-                End If
-
-                Dim comps As Object() = CType(compsObj, Object())
-
-                For Each compObj As Object In comps
-                    Dim comp As Component2 = TryCast(compObj, Component2)
-                    If comp Is Nothing Then Continue For
-
-                    Dim compPath As String = ""
-
+                'First try the document-level replacement. This catches references that SolidWorks
+                'does not expose cleanly through Component2, and helps make the fix persist on save.
+                If Not String.IsNullOrWhiteSpace(activeAssemblyPath) Then
                     Try
-                        compPath = comp.GetPathName()
-                    Catch
-                        Continue For
-                    End Try
+                        Dim replaceDocOk As Boolean = iSwApp.ReplaceReferencedDocument(activeAssemblyPath, refInfo.oldPath, refInfo.newPath)
 
-                    If String.IsNullOrWhiteSpace(compPath) Then Continue For
-
-                    If String.Equals(
-                    Path.GetFullPath(compPath),
-                    Path.GetFullPath(refInfo.oldPath),
-                    StringComparison.OrdinalIgnoreCase
-                ) Then
-                        Dim replaceOk As Boolean = comp.ReplaceReference(refInfo.newPath)
-
-                        If replaceOk Then
+                        If replaceDocOk Then
                             replacedThisRef = True
                         End If
-                    End If
-                Next
+                    Catch
+                    End Try
+                End If
+
+                Dim compsObj As Object = assy.GetComponents(False)
+
+                If compsObj IsNot Nothing Then
+                    Dim comps As Object() = CType(compsObj, Object())
+
+                    For Each compObj As Object In comps
+                        Dim comp As Component2 = TryCast(compObj, Component2)
+                        If comp Is Nothing Then Continue For
+
+                        Dim compPath As String = ""
+
+                        Try
+                            compPath = comp.GetPathName()
+                        Catch
+                            Continue For
+                        End Try
+
+                        If String.IsNullOrWhiteSpace(compPath) Then Continue For
+
+                        If pathsAreSame(compPath, refInfo.oldPath) Then
+                            Try
+                                Dim replaceOk As Boolean = comp.ReplaceReference(refInfo.newPath)
+
+                                If replaceOk Then
+                                    replacedThisRef = True
+                                End If
+                            Catch
+                            End Try
+                        End If
+                    Next
+                End If
 
                 If Not replacedThisRef Then
                     okAll = False
@@ -2098,6 +2191,56 @@ Public Module svnModule
             Return False
         End If
 
+        'Second-time vendor behavior:
+        'If the assembly still points to Downloads, but a file with the same name already exists
+        'under Vendor Parts, silently relink to that existing vendor file instead of asking again.
+        Dim refsAlreadyInVendor As New List(Of ExternalReferenceInfo)
+        Dim refsStillExternal As New List(Of ExternalReferenceInfo)
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If refInfo Is Nothing Then Continue For
+
+            Dim existingVendorPath As String = getExistingVendorPathForFileName(refInfo.fileName)
+
+            If Not String.IsNullOrWhiteSpace(existingVendorPath) AndAlso File.Exists(existingVendorPath) Then
+                refInfo.newPath = existingVendorPath
+                refsAlreadyInVendor.Add(refInfo)
+            Else
+                refsStillExternal.Add(refInfo)
+            End If
+        Next
+
+        If refsAlreadyInVendor.Count > 0 Then
+            If Not relinkExternalRefsToVaultCopies(refsAlreadyInVendor) Then Return False
+
+            For Each refInfo As ExternalReferenceInfo In refsAlreadyInVendor
+                If refInfo Is Nothing Then Continue For
+
+                If Not String.IsNullOrWhiteSpace(refInfo.oldPath) Then
+                    pendingExternalRefSkipNameCheckPaths.Add(refInfo.oldPath)
+                End If
+
+                If Not String.IsNullOrWhiteSpace(refInfo.newPath) Then
+                    pendingExternalRefSkipNameCheckPaths.Add(refInfo.newPath)
+                End If
+            Next
+        End If
+
+        externalRefs = refsStillExternal
+
+        If externalRefs.Count = 0 Then
+            Dim activeDocExistingVendor As ModelDoc2 = iSwApp.ActiveDoc
+            If activeDocExistingVendor IsNot Nothing Then
+                Try
+                    activeDocExistingVendor.ForceRebuild3(False)
+                    activeDocExistingVendor.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
+                Catch
+                End Try
+            End If
+
+            Return True
+        End If
+
         Dim msg As String =
         "This assembly references CAD outside the SVN working copy." & vbCrLf & vbCrLf &
         "External files:" & vbCrLf
@@ -2210,6 +2353,10 @@ Public Module svnModule
 
         If copiedPaths.Count > 0 Then
             For Each copiedPath As String In copiedPaths
+                If String.IsNullOrWhiteSpace(copiedPath) Then Continue For
+                If Not File.Exists(copiedPath) Then Continue For
+                If Not isPathInsideLocalRepo(copiedPath) Then Continue For
+
                 runSvnProcess(sSVNPath, "add --parents """ & copiedPath & """")
                 pendingExternalRefCommitPaths.Add(copiedPath)
             Next
@@ -2424,7 +2571,7 @@ Public Module svnModule
                                  "If you believe you have the file locked, you can try File > Reload")
             Exit Sub 'All Files were removed
         End If
-        sModDocPathArr = getFilePathsFromModDocArr(modDocArr)
+        sModDocPathArr = filterCommitPathsInsideRepoOnly(getFilePathsFromModDocArr(modDocArr))
 
         If pendingExternalRefCommitPaths IsNot Nothing AndAlso pendingExternalRefCommitPaths.Count > 0 Then
             Dim mergedCommitPaths As New List(Of String)
@@ -2436,6 +2583,7 @@ Public Module svnModule
             For Each pendingPath As String In pendingExternalRefCommitPaths
                 If String.IsNullOrWhiteSpace(pendingPath) Then Continue For
                 If Not File.Exists(pendingPath) Then Continue For
+                If Not isPathInsideLocalRepo(pendingPath) Then Continue For
 
                 Dim alreadyIncluded As Boolean = mergedCommitPaths.Any(
             Function(existingPath)
@@ -2453,7 +2601,18 @@ Public Module svnModule
                 End If
             Next
 
-            sModDocPathArr = mergedCommitPaths.ToArray()
+            sModDocPathArr = filterCommitPathsInsideRepoOnly(mergedCommitPaths.ToArray())
+        End If
+
+        If sModDocPathArr Is Nothing OrElse sModDocPathArr.Length = 0 Then
+            iSwApp.SendMsgToUser2(
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "No valid SVN working-copy CAD paths were available to commit." & vbCrLf & vbCrLf &
+                "This usually means SolidWorks is still pointing to a file outside the SVN folder.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Exit Sub
         End If
 
         runSvnByArgs(sModDocPathArr, "add", bEach:=True)  'adds any not added. 
