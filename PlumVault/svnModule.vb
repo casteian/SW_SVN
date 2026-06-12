@@ -2200,7 +2200,13 @@ Public Module svnModule
         Next
 
         pendingExternalRefCommitPaths.Clear()
-        pendingExternalRefSkipNameCheckPaths.Clear()
+
+        'Do NOT clear pendingExternalRefSkipNameCheckPaths here.
+        'For vendor parts, SolidWorks may still report the old external file path
+        'until the assembly/dependency list fully refreshes.
+        'validateCadNamesBeforeCommit needs this list so vendor files are not
+        'forced through normal GRC27 naming after they were already copied
+        'into Vendor Parts and relinked.
 
         If copiedPaths.Count > 0 Then
             For Each copiedPath As String In copiedPaths
