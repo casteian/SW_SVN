@@ -35,6 +35,8 @@ Public Class UserControl1
     'Public allTreeViews As New List(Of TreeView())
 
     Private WithEvents liveChangeCheckTimer As System.Windows.Forms.Timer
+    Private WithEvents solidWorksSelectionMirrorTimer As System.Windows.Forms.Timer
+    Private WithEvents autoPreSyncLevel1Timer As System.Windows.Forms.Timer
     Private WithEvents butSyncStatus As Button
     Private WithEvents chkDebugIgnoreNaming As CheckBox
     Private syncProgressBar As ProgressBar
@@ -42,9 +44,25 @@ Public Class UserControl1
     Private syncStatusContextMenu As ContextMenuStrip
     Private Const LAZY_LOAD_PLACEHOLDER_TEXT As String = "<load children>"
     Private syncStatusInProgress As Boolean = False
+    Private pendingAutoPreSyncAssemblyPath As String = ""
+    Private lastAutoPreSyncAssemblyPath As String = ""
+    Private lastAutoPreSyncStartedAt As DateTime = DateTime.MinValue
+    Private Const AUTO_PRESYNC_MIN_SECONDS_BETWEEN_RUNS As Integer = 120
     Private refreshTreeNeedsUpdate As Boolean = False
     Private normalRefreshTreeBackColor As Color
     Private lastLiveCheckedActivePath As String = ""
+
+    'Bidirectional selection mirror:
+    'Tree click -> selects/highlights the SOLIDWORKS component.
+    'SOLIDWORKS selection -> highlights the matching loaded plugin-tree node.
+    Private treeToSolidWorksSelectionInProgress As Boolean = False
+    Private solidWorksToTreeSelectionInProgress As Boolean = False
+    Private lastMirroredSolidWorksSelectionKey As String = ""
+
+    'Darker selection highlight for the plugin tree.
+    'The normal WinForms inactive TreeView selection is very faint grey when SOLIDWORKS has focus.
+    Private ReadOnly pluginTreeSelectedBackColor As Color = Color.FromArgb(0, 95, 160)
+    Private ReadOnly pluginTreeSelectedForeColor As Color = Color.White
 
     'Tracks whether the TreeView selection came from an actual user click.
     'WinForms/SolidWorks can leave the root node selected even when the user thinks
@@ -320,6 +338,74 @@ Public Class UserControl1
         End Try
     End Function
 
+
+    Private Sub configurePluginTreeSelectionHighlight()
+        If TreeView1 Is Nothing Then Exit Sub
+
+        Try
+            'Keep selection visible when SOLIDWORKS takes focus.
+            TreeView1.HideSelection = False
+
+            'OwnerDrawText lets us replace the default inactive grey selection with a darker highlight.
+            'Only the text area is owner-drawn; node icons/expanders remain standard TreeView behavior.
+            TreeView1.DrawMode = TreeViewDrawMode.OwnerDrawText
+        Catch
+        End Try
+    End Sub
+
+    Private Sub TreeView1_DrawNode(sender As Object, e As DrawTreeNodeEventArgs) Handles TreeView1.DrawNode
+        If e Is Nothing OrElse e.Node Is Nothing Then Exit Sub
+
+        Try
+            Dim isSelected As Boolean = ((e.State And TreeNodeStates.Selected) = TreeNodeStates.Selected)
+
+            Dim backColorToUse As Color
+            Dim foreColorToUse As Color
+
+            If isSelected Then
+                backColorToUse = pluginTreeSelectedBackColor
+                foreColorToUse = pluginTreeSelectedForeColor
+            Else
+                backColorToUse = e.Node.BackColor
+                If backColorToUse = Color.Empty Then backColorToUse = TreeView1.BackColor
+
+                foreColorToUse = e.Node.ForeColor
+                If foreColorToUse = Color.Empty Then foreColorToUse = TreeView1.ForeColor
+            End If
+
+            Using backBrush As New SolidBrush(backColorToUse)
+                e.Graphics.FillRectangle(backBrush, e.Bounds)
+            End Using
+
+            TextRenderer.DrawText(
+                e.Graphics,
+                e.Node.Text,
+                TreeView1.Font,
+                e.Bounds,
+                foreColorToUse,
+                TextFormatFlags.GlyphOverhangPadding Or TextFormatFlags.VerticalCenter
+            )
+
+            If isSelected Then
+                Try
+                    ControlPaint.DrawFocusRectangle(e.Graphics, e.Bounds, pluginTreeSelectedForeColor, backColorToUse)
+                Catch
+                End Try
+            End If
+
+        Catch
+            'Fallback to default drawing if anything unexpected happens.
+            e.DrawDefault = True
+        End Try
+    End Sub
+
+    Private Sub TreeView1_AfterSelect(sender As Object, e As TreeViewEventArgs) Handles TreeView1.AfterSelect
+        Try
+            TreeView1.Invalidate()
+        Catch
+        End Try
+    End Sub
+
     Private Sub UserControl1_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
 
         Dim docMenu As ContextMenuStrip
@@ -338,9 +424,18 @@ Public Class UserControl1
         setRefreshTreeButtonNormal()
         ensureSyncStatusButton()
 
+        configurePluginTreeSelectionHighlight()
+
+        solidWorksSelectionMirrorTimer = New System.Windows.Forms.Timer()
+        solidWorksSelectionMirrorTimer.Interval = 450
+        solidWorksSelectionMirrorTimer.Start()
+
         liveChangeCheckTimer = New System.Windows.Forms.Timer()
         liveChangeCheckTimer.Interval = 30000 '30 seconds
         liveChangeCheckTimer.Start()
+
+        'Auto Level 1 pre-sync timer intentionally not created.
+        'Use manual Sync for fresh server status; persistent cache is applied instantly on tree build.
 
 
     End Sub
@@ -363,7 +458,94 @@ Public Class UserControl1
         If Not String.Equals(activePath, lastLiveCheckedActivePath, StringComparison.OrdinalIgnoreCase) Then
             lastLiveCheckedActivePath = activePath
             setRefreshTreeButtonNormal()
+            'Auto Level 1 pre-sync intentionally disabled.
+            'Persistent cache now provides immediate last-known status without starting SVN during open.
         End If
+    End Sub
+
+    Private Sub autoPreSyncLevel1Timer_Tick(sender As Object, e As EventArgs) Handles autoPreSyncLevel1Timer.Tick
+        Try
+            autoPreSyncLevel1Timer.Stop()
+        Catch
+        End Try
+
+        startAutoPreSyncLevel1IfReady()
+    End Sub
+
+    Private Sub scheduleAutoPreSyncLevel1ForActiveAssembly(Optional ByVal reason As String = "")
+        Try
+            If iSwApp Is Nothing Then Exit Sub
+            If Not onlineCheckBox.Checked Then Exit Sub
+            If syncStatusInProgress Then Exit Sub
+
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc Is Nothing Then Exit Sub
+            If activeDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then Exit Sub
+
+            Dim activePath As String = ""
+            Try
+                activePath = activeDoc.GetPathName()
+            Catch
+                activePath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(activePath) Then Exit Sub
+
+            If String.Equals(activePath, lastAutoPreSyncAssemblyPath, StringComparison.OrdinalIgnoreCase) AndAlso
+               (DateTime.Now - lastAutoPreSyncStartedAt).TotalSeconds < AUTO_PRESYNC_MIN_SECONDS_BETWEEN_RUNS Then
+                Exit Sub
+            End If
+
+            pendingAutoPreSyncAssemblyPath = activePath
+
+            If autoPreSyncLevel1Timer IsNot Nothing Then
+                autoPreSyncLevel1Timer.Stop()
+                autoPreSyncLevel1Timer.Start()
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub startAutoPreSyncLevel1IfReady()
+        Try
+            If iSwApp Is Nothing Then Exit Sub
+            If Not onlineCheckBox.Checked Then Exit Sub
+            If syncStatusInProgress Then Exit Sub
+
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc Is Nothing Then Exit Sub
+            If activeDoc.GetType <> swDocumentTypes_e.swDocASSEMBLY Then Exit Sub
+
+            Dim activePath As String = ""
+            Try
+                activePath = activeDoc.GetPathName()
+            Catch
+                activePath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(activePath) Then Exit Sub
+            If String.IsNullOrWhiteSpace(pendingAutoPreSyncAssemblyPath) Then Exit Sub
+            If Not String.Equals(activePath, pendingAutoPreSyncAssemblyPath, StringComparison.OrdinalIgnoreCase) Then Exit Sub
+
+            If String.Equals(activePath, lastAutoPreSyncAssemblyPath, StringComparison.OrdinalIgnoreCase) AndAlso
+               (DateTime.Now - lastAutoPreSyncStartedAt).TotalSeconds < AUTO_PRESYNC_MIN_SECONDS_BETWEEN_RUNS Then
+                Exit Sub
+            End If
+
+            Dim rootNode As TreeNode = getRootTreeNodeForSync()
+            If rootNode Is Nothing Then Exit Sub
+
+            loadImmediateChildrenForNode(rootNode)
+
+            Dim level1Paths() As String = collectImmediateChildCadPathsForSync(rootNode)
+            If level1Paths Is Nothing OrElse level1Paths.Length = 0 Then Exit Sub
+
+            lastAutoPreSyncAssemblyPath = activePath
+            lastAutoPreSyncStartedAt = DateTime.Now
+
+            startAsyncSyncStatus(level1Paths, "Pre-syncing Level 1...", True)
+        Catch
+        End Try
     End Sub
 
     Friend Sub myInitialize(ByRef swAppin As SldWorks)
@@ -684,13 +866,17 @@ Public Class UserControl1
         startAsyncSyncStatus(syncPaths, "Syncing whole car...")
     End Sub
 
-    Private Sub startAsyncSyncStatus(ByVal syncPaths() As String, Optional ByVal pendingText As String = "Syncing...")
+    Private Sub startAsyncSyncStatus(ByVal syncPaths() As String,
+                                     Optional ByVal pendingText As String = "Syncing...",
+                                     Optional ByVal isAutoPreSync As Boolean = False)
         If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then Exit Sub
 
         If syncStatusInProgress Then
-            iSwApp.SendMsgToUser2("A Sync Status operation is already running in the background.",
-                swMessageBoxIcon_e.swMbInformation,
-                swMessageBoxBtn_e.swMbOk)
+            If Not isAutoPreSync Then
+                iSwApp.SendMsgToUser2("A Sync Status operation is already running in the background.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk)
+            End If
             Exit Sub
         End If
 
@@ -715,7 +901,7 @@ Public Class UserControl1
 
                                             Try
                                                 If Me.IsHandleCreated Then
-                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage, timingLog, uiStartTimestamp)))
+                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage, timingLog, uiStartTimestamp, isAutoPreSync, pendingText)))
                                                 Else
                                                     syncStatusInProgress = False
                                                 End If
@@ -729,7 +915,9 @@ Public Class UserControl1
                                       ByVal serverStatus As SVNStatus,
                                       ByVal errorMessage As String,
                                       ByVal timingLog As String,
-                                      ByVal uiStartTimestamp As DateTime)
+                                      ByVal uiStartTimestamp As DateTime,
+                                      Optional ByVal isAutoPreSync As Boolean = False,
+                                      Optional ByVal syncLabel As String = "Syncing...")
         Dim finishSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
         Dim finishLines As New List(Of String)()
 
@@ -746,20 +934,28 @@ Public Class UserControl1
         syncStatusInProgress = False
 
         If Not String.IsNullOrWhiteSpace(errorMessage) Then
-            appendSyncTimingLog(timingLog & vbCrLf & "UI finish: failed before cache/tree update")
+            Dim failedLog As String = buildSyncTimingLogWithContext(timingLog, isAutoPreSync, syncLabel) &
+                                      vbCrLf & "UI finish: failed before cache/tree update"
+            appendSyncTimingLog(failedLog)
 
-            iSwApp.SendMsgToUser2("Sync Status failed." & vbCrLf & vbCrLf & errorMessage,
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbOk)
+            If (Not isAutoPreSync) OrElse debugIgnoreNamingConventionEnabled() Then
+                iSwApp.SendMsgToUser2("Sync Status failed." & vbCrLf & vbCrLf & errorMessage,
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk)
+            End If
             Exit Sub
         End If
 
         If serverStatus Is Nothing Then
-            appendSyncTimingLog(timingLog & vbCrLf & "UI finish: failed because no SVN status was returned")
+            Dim failedLog As String = buildSyncTimingLogWithContext(timingLog, isAutoPreSync, syncLabel) &
+                                      vbCrLf & "UI finish: failed because no SVN status was returned"
+            appendSyncTimingLog(failedLog)
 
-            iSwApp.SendMsgToUser2("Sync Status failed. No SVN status was returned.",
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbOk)
+            If (Not isAutoPreSync) OrElse debugIgnoreNamingConventionEnabled() Then
+                iSwApp.SendMsgToUser2("Sync Status failed. No SVN status was returned.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk)
+            End If
             Exit Sub
         End If
 
@@ -770,6 +966,14 @@ Public Class UserControl1
         End Try
         applySw.Stop()
         finishLines.Add("UI apply cache: " & applySw.ElapsedMilliseconds.ToString() & " ms")
+
+        Dim persistentSaveSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        Try
+            svnModule.savePersistentStatusCachePublic(serverStatus)
+        Catch
+        End Try
+        persistentSaveSw.Stop()
+        finishLines.Add("UI save persistent cache: " & persistentSaveSw.ElapsedMilliseconds.ToString() & " ms")
 
         Dim recolorSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
         Try
@@ -792,7 +996,7 @@ Public Class UserControl1
         finishLines.Add("UI finish total: " & finishSw.ElapsedMilliseconds.ToString() & " ms")
         finishLines.Add("End-to-end visible sync time: " & CLng((DateTime.Now - uiStartTimestamp).TotalMilliseconds).ToString() & " ms")
 
-        Dim fullTimingLog As String = timingLog
+        Dim fullTimingLog As String = buildSyncTimingLogWithContext(timingLog, isAutoPreSync, syncLabel)
         If Not String.IsNullOrWhiteSpace(fullTimingLog) Then fullTimingLog &= vbCrLf
         fullTimingLog &= String.Join(vbCrLf, finishLines.ToArray())
 
@@ -804,11 +1008,117 @@ Public Class UserControl1
                 displayTiming = displayTiming.Substring(0, 3000) & vbCrLf & "... timing log truncated. Full log is in %TEMP%\PlumVault_SyncTiming.log"
             End If
 
-            iSwApp.SendMsgToUser2("Sync Timing Log" & vbCrLf & vbCrLf & displayTiming,
+            Dim popupTitle As String = If(isAutoPreSync, "Auto Level 1 Pre-Sync Timing Log", "Sync Timing Log")
+            iSwApp.SendMsgToUser2(popupTitle & vbCrLf & vbCrLf & displayTiming,
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk)
         End If
     End Sub
+
+    Private Function buildSyncTimingLogWithContext(ByVal timingLog As String,
+                                                   ByVal isAutoPreSync As Boolean,
+                                                   ByVal syncLabel As String) As String
+        Dim contextLines As New List(Of String)()
+
+        If isAutoPreSync Then
+            contextLines.Add("Sync source: AUTO Level 1 Pre-Sync")
+        Else
+            contextLines.Add("Sync source: Manual Sync")
+        End If
+
+        If Not String.IsNullOrWhiteSpace(syncLabel) Then
+            contextLines.Add("Sync label: " & syncLabel)
+        End If
+
+        If Not String.IsNullOrWhiteSpace(pendingAutoPreSyncAssemblyPath) AndAlso isAutoPreSync Then
+            contextLines.Add("Auto pre-sync assembly: " & pendingAutoPreSyncAssemblyPath)
+        End If
+
+        Dim contextText As String = String.Join(vbCrLf, contextLines.ToArray())
+
+        If String.IsNullOrWhiteSpace(timingLog) Then Return contextText
+        Return contextText & vbCrLf & timingLog
+    End Function
+
+    Private Sub applyPersistentStatusCacheForVisibleTree(Optional ByVal sourceLabel As String = "")
+        Try
+            If TreeView1 Is Nothing Then Exit Sub
+            If TreeView1.Nodes Is Nothing OrElse TreeView1.Nodes.Count = 0 Then Exit Sub
+
+            Dim cachePaths() As String = collectCurrentTreeCadPaths()
+            If cachePaths Is Nothing OrElse cachePaths.Length = 0 Then Exit Sub
+
+            Dim loadedCount As Integer = 0
+            Dim newestAgeSeconds As Long = -1
+
+            If svnModule.applyPersistentStatusCacheForFilePathsPublic(cachePaths, loadedCount, newestAgeSeconds) Then
+                Try
+                    recolorTreeNodesForFilePathsPublic(cachePaths)
+                Catch
+                    Try
+                        recolorCurrentTreeFromStatus()
+                    Catch
+                    End Try
+                End Try
+
+                showPersistentCacheStatusLabel(loadedCount, newestAgeSeconds)
+
+                Try
+                    appendSyncTimingLog("Persistent cache applied" & vbCrLf &
+                                        "Source: " & sourceLabel & vbCrLf &
+                                        "Input paths: " & cachePaths.Length.ToString() & vbCrLf &
+                                        "Cached entries applied: " & loadedCount.ToString() & vbCrLf &
+                                        "Newest cache age seconds: " & newestAgeSeconds.ToString())
+                Catch
+                End Try
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub showPersistentCacheStatusLabel(ByVal loadedCount As Integer, ByVal newestAgeSeconds As Long)
+        Try
+            If loadedCount <= 0 Then Exit Sub
+            If syncProgressLabel Is Nothing Then Exit Sub
+
+            Dim ageText As String = formatCacheAgeForDisplay(newestAgeSeconds)
+            syncProgressLabel.Text = "Cached status shown (" & loadedCount.ToString() & " files" & ageText & ")"
+            syncProgressLabel.Visible = True
+
+            If syncProgressBar IsNot Nothing Then
+                syncProgressBar.MarqueeAnimationSpeed = 0
+                syncProgressBar.Visible = False
+            End If
+
+            syncProgressLabel.BringToFront()
+        Catch
+        End Try
+    End Sub
+
+    Private Function formatCacheAgeForDisplay(ByVal newestAgeSeconds As Long) As String
+        If newestAgeSeconds < 0 Then Return ""
+
+        Try
+            If newestAgeSeconds < 60 Then
+                Return ", " & newestAgeSeconds.ToString() & " sec old"
+            End If
+
+            Dim minutes As Long = newestAgeSeconds \ 60
+            If minutes < 60 Then
+                Return ", " & minutes.ToString() & " min old"
+            End If
+
+            Dim hours As Long = minutes \ 60
+            If hours < 48 Then
+                Return ", " & hours.ToString() & " hr old"
+            End If
+
+            Dim days As Long = hours \ 24
+            Return ", " & days.ToString() & " days old"
+        Catch
+            Return ""
+        End Try
+    End Function
 
     Private Sub appendSyncTimingLog(ByVal timingLog As String)
         If String.IsNullOrWhiteSpace(timingLog) Then Exit Sub
@@ -1245,31 +1555,486 @@ Public Class UserControl1
             If e IsNot Nothing AndAlso e.Node IsNot Nothing Then
                 TreeView1.SelectedNode = e.Node
                 lastUserClickedTreeNodeForSync = e.Node
+                selectSolidWorksObjectForTreeNode(e.Node)
             End If
         Catch
         End Try
 
-        'Dim sText As String = e.Node.Text
-        'Dim modDoc As ModelDoc2
-        Dim comp As Component2
-        Dim activeModel As ModelDoc2 = iSwApp.ActiveDoc
-        'Dim sText As String = localRepoPath.Text & "\" & e.Node.Text
-        If activeModel Is Nothing Then Exit Sub
-
-        If activeModel.GetType <> swDocumentTypes_e.swDocASSEMBLY Then Exit Sub
-
-        'Debug.Assert(False, sText)
-        'modDoc = activeModel.GetComponentByName(e.Node.Text)
-
-
-        'Debug.Print(TypeOf e.Node.Tag)
-        If TypeOf e.Node.Tag Is Component2 Then
-            'If e.Node.Tag.GetType.ToString = "Component2" Then
-            comp = e.Node.Tag
-            comp.Select(False)
-        End If
-
     End Sub
+
+    Private Sub solidWorksSelectionMirrorTimer_Tick(sender As Object, e As EventArgs) Handles solidWorksSelectionMirrorTimer.Tick
+        mirrorSolidWorksSelectionToTree()
+    End Sub
+
+    Private Sub selectSolidWorksObjectForTreeNode(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+        If iSwApp Is Nothing Then Exit Sub
+        If treeToSolidWorksSelectionInProgress Then Exit Sub
+        If solidWorksToTreeSelectionInProgress Then Exit Sub
+
+        Try
+            treeToSolidWorksSelectionInProgress = True
+
+            Dim activeModel As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeModel Is Nothing Then Exit Sub
+
+            If TypeOf node.Tag Is Component2 Then
+                Dim comp As Component2 = CType(node.Tag, Component2)
+
+                Try
+                    activeModel.ClearSelection2(True)
+                Catch
+                End Try
+
+                Try
+                    comp.Select(False)
+                Catch
+                    Try
+                        comp.Select4(False, Nothing, False)
+                    Catch
+                    End Try
+                End Try
+
+                lastMirroredSolidWorksSelectionKey = buildComponentSelectionKey(comp)
+                Exit Sub
+            End If
+
+            If TypeOf node.Tag Is ModelDoc2 Then
+                Dim nodeDoc As ModelDoc2 = CType(node.Tag, ModelDoc2)
+                Dim nodePath As String = ""
+
+                Try
+                    nodePath = nodeDoc.GetPathName()
+                Catch
+                    nodePath = ""
+                End Try
+
+                'The top-level assembly document itself is not a Component2 instance, so there is
+                'nothing useful to select in graphics. Clear the graphics selection but keep the
+                'plugin tree node highlighted.
+                Try
+                    If Not String.IsNullOrWhiteSpace(nodePath) AndAlso
+                       String.Equals(Path.GetFullPath(nodePath), Path.GetFullPath(activeModel.GetPathName()), StringComparison.OrdinalIgnoreCase) Then
+                        activeModel.ClearSelection2(True)
+                    End If
+                Catch
+                End Try
+
+                lastMirroredSolidWorksSelectionKey = normalizePathForNodeMatch(nodePath)
+            End If
+
+        Catch
+        Finally
+            treeToSolidWorksSelectionInProgress = False
+        End Try
+    End Sub
+
+    Private Sub mirrorSolidWorksSelectionToTree()
+        If iSwApp Is Nothing Then Exit Sub
+        If TreeView1 Is Nothing Then Exit Sub
+        If treeToSolidWorksSelectionInProgress Then Exit Sub
+        If solidWorksToTreeSelectionInProgress Then Exit Sub
+
+        Try
+            Dim selectedComp As Component2 = Nothing
+            Dim selectedPath As String = ""
+            Dim selectionKey As String = ""
+
+            If Not tryGetPrimarySolidWorksSelectedComponent(selectedComp, selectedPath, selectionKey) Then Exit Sub
+            If String.IsNullOrWhiteSpace(selectionKey) Then Exit Sub
+
+            If String.Equals(selectionKey, lastMirroredSolidWorksSelectionKey, StringComparison.OrdinalIgnoreCase) Then
+                Exit Sub
+            End If
+
+            Dim matchedNode As TreeNode = findTreeNodeForSolidWorksSelection(selectedComp, selectedPath)
+
+            'If the selected component lives inside a lazy/unexpanded branch, load only
+            'that parent chain and try again. This keeps deep children selectable from
+            'the SOLIDWORKS graphics area or FeatureManager tree without expanding the
+            'whole car.
+            If matchedNode Is Nothing AndAlso selectedComp IsNot Nothing Then
+                Try
+                    If tryLoadLazyBranchForSolidWorksComponent(selectedComp) Then
+                        matchedNode = findTreeNodeForSolidWorksSelection(selectedComp, selectedPath)
+                    End If
+                Catch
+                End Try
+            End If
+
+            If matchedNode Is Nothing Then Exit Sub
+
+            solidWorksToTreeSelectionInProgress = True
+
+            Try
+                TreeView1.SelectedNode = matchedNode
+                matchedNode.EnsureVisible()
+                lastUserClickedTreeNodeForSync = matchedNode
+                lastMirroredSolidWorksSelectionKey = selectionKey
+            Finally
+                solidWorksToTreeSelectionInProgress = False
+            End Try
+
+        Catch
+            solidWorksToTreeSelectionInProgress = False
+        End Try
+    End Sub
+
+    Private Function tryGetPrimarySolidWorksSelectedComponent(ByRef selectedComp As Component2,
+                                                             ByRef selectedPath As String,
+                                                             ByRef selectionKey As String) As Boolean
+        selectedComp = Nothing
+        selectedPath = ""
+        selectionKey = ""
+
+        Try
+            Dim activeModel As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeModel Is Nothing Then Return False
+
+            If Not ((activeModel.GetType() = swDocumentTypes_e.swDocPART) OrElse
+                    (activeModel.GetType() = swDocumentTypes_e.swDocASSEMBLY)) Then
+                Return False
+            End If
+
+            Dim swSelMgr As SelectionMgr = activeModel.SelectionManager
+            If swSelMgr Is Nothing Then Return False
+
+            Dim nSelCount As Integer = 0
+
+            Try
+                nSelCount = swSelMgr.GetSelectedObjectCount2(-1)
+            Catch
+                nSelCount = 0
+            End Try
+
+            If nSelCount <= 0 Then Return False
+
+            For i As Integer = 1 To nSelCount
+                Dim comp As Component2 = Nothing
+
+                Try
+                    comp = swSelMgr.GetSelectedObjectsComponent4(i, -1)
+                Catch
+                    comp = Nothing
+                End Try
+
+                If comp IsNot Nothing Then
+                    selectedComp = comp
+                    selectedPath = getSafeComponentPath(comp)
+                    selectionKey = buildComponentSelectionKey(comp)
+
+                    If String.IsNullOrWhiteSpace(selectionKey) Then
+                        selectionKey = normalizePathForNodeMatch(selectedPath)
+                    End If
+
+                    Return Not String.IsNullOrWhiteSpace(selectionKey)
+                End If
+            Next
+
+            'If a part document is open by itself, selecting a face/sketch/body will not have a Component2.
+            'In that case, mirror the selection to the root node for that part file if it is loaded in the plugin tree.
+            If activeModel.GetType() = swDocumentTypes_e.swDocPART Then
+                Try
+                    selectedPath = activeModel.GetPathName()
+                    selectionKey = normalizePathForNodeMatch(selectedPath)
+                    Return Not String.IsNullOrWhiteSpace(selectionKey)
+                Catch
+                End Try
+            End If
+
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Private Function buildComponentSelectionKey(ByVal comp As Component2) As String
+        If comp Is Nothing Then Return ""
+
+        Try
+            Dim compName As String = comp.Name2
+            Dim compPath As String = normalizePathForNodeMatch(getSafeComponentPath(comp))
+
+            If Not String.IsNullOrWhiteSpace(compName) Then
+                Return compName & "|" & compPath
+            End If
+
+            Return compPath
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Function findTreeNodeForSolidWorksSelection(ByVal selectedComp As Component2,
+                                                       ByVal selectedPath As String) As TreeNode
+        Try
+            If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing Then Return Nothing
+
+            For Each rootNode As TreeNode In TreeView1.Nodes
+                Dim exactCompNode As TreeNode = findTreeNodeByComponentInstance(rootNode, selectedComp)
+                If exactCompNode IsNot Nothing Then Return exactCompNode
+            Next
+
+            For Each rootNode As TreeNode In TreeView1.Nodes
+                Dim pathNode As TreeNode = findTreeNodeByCadPath(rootNode, selectedPath)
+                If pathNode IsNot Nothing Then Return pathNode
+            Next
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function tryLoadLazyBranchForSolidWorksComponent(ByVal selectedComp As Component2) As Boolean
+        If selectedComp Is Nothing Then Return False
+        If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing OrElse TreeView1.Nodes.Count = 0 Then Return False
+
+        Try
+            Dim componentChain As List(Of Component2) = getComponentParentChain(selectedComp)
+            If componentChain Is Nothing OrElse componentChain.Count = 0 Then Return False
+
+            'Try to anchor the chain on an already-loaded plugin node.
+            'This may be a Level-1 assembly, a loaded subassembly, or the selected part itself.
+            For chainIndex As Integer = 0 To componentChain.Count - 1
+                Dim anchorComp As Component2 = componentChain(chainIndex)
+                Dim anchorNode As TreeNode = Nothing
+
+                For Each rootNode As TreeNode In TreeView1.Nodes
+                    anchorNode = findTreeNodeByComponentInstance(rootNode, anchorComp)
+                    If anchorNode IsNot Nothing Then Exit For
+                Next
+
+                If anchorNode IsNot Nothing Then
+                    Return loadRemainingComponentChainFromNode(anchorNode, componentChain, chainIndex + 1)
+                End If
+            Next
+
+            'If the first chain item is the invisible SOLIDWORKS root component, anchor on
+            'the plugin root node and walk downward from there.
+            Dim pluginRoot As TreeNode = getPluginTreeRootNodeForActiveDocument()
+            If pluginRoot IsNot Nothing Then
+                loadImmediateChildrenForNode(pluginRoot)
+                pluginRoot.Expand()
+
+                For chainIndex As Integer = 0 To componentChain.Count - 1
+                    Dim firstVisibleNode As TreeNode = findDirectChildNodeForComponent(pluginRoot, componentChain(chainIndex))
+                    If firstVisibleNode IsNot Nothing Then
+                        Return loadRemainingComponentChainFromNode(firstVisibleNode, componentChain, chainIndex + 1)
+                    End If
+                Next
+            End If
+
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Private Function getComponentParentChain(ByVal leafComp As Component2) As List(Of Component2)
+        Dim chain As New List(Of Component2)()
+        If leafComp Is Nothing Then Return chain
+
+        Dim currentComp As Component2 = leafComp
+        Dim safetyCounter As Integer = 0
+
+        Do While currentComp IsNot Nothing AndAlso safetyCounter < 50
+            chain.Insert(0, currentComp)
+            safetyCounter += 1
+
+            Try
+                currentComp = TryCast(currentComp.GetParent(), Component2)
+            Catch
+                currentComp = Nothing
+            End Try
+        Loop
+
+        Return chain
+    End Function
+
+    Private Function loadRemainingComponentChainFromNode(ByVal anchorNode As TreeNode,
+                                                        ByVal componentChain As List(Of Component2),
+                                                        ByVal nextChainIndex As Integer) As Boolean
+        If anchorNode Is Nothing Then Return False
+        If componentChain Is Nothing Then Return False
+
+        Try
+            Dim currentNode As TreeNode = anchorNode
+
+            For i As Integer = nextChainIndex To componentChain.Count - 1
+                If currentNode Is Nothing Then Return False
+
+                loadImmediateChildrenForNode(currentNode)
+                currentNode.Expand()
+
+                Dim nextNode As TreeNode = findDirectChildNodeForComponent(currentNode, componentChain(i))
+
+                If nextNode Is Nothing Then
+                    'Fallback: search below the current loaded branch. This still only uses
+                    'loaded nodes and does not force a whole-car load.
+                    nextNode = findTreeNodeByComponentInstance(currentNode, componentChain(i))
+                End If
+
+                If nextNode Is Nothing Then Return False
+
+                currentNode = nextNode
+            Next
+
+            Return True
+
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function getPluginTreeRootNodeForActiveDocument() As TreeNode
+        Try
+            If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing OrElse TreeView1.Nodes.Count = 0 Then Return Nothing
+
+            Dim activeModel As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeModel Is Nothing Then Return TreeView1.Nodes(0)
+
+            Dim activePath As String = normalizePathForNodeMatch(activeModel.GetPathName())
+
+            For Each rootNode As TreeNode In TreeView1.Nodes
+                Dim rootPath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(rootNode))
+
+                If activePath <> "" AndAlso rootPath <> "" AndAlso
+                   String.Equals(activePath, rootPath, StringComparison.OrdinalIgnoreCase) Then
+                    Return rootNode
+                End If
+            Next
+
+            Return TreeView1.Nodes(0)
+        Catch
+            Return Nothing
+        End Try
+    End Function
+
+    Private Function findDirectChildNodeForComponent(ByVal parentNode As TreeNode, ByVal targetComp As Component2) As TreeNode
+        If parentNode Is Nothing OrElse targetComp Is Nothing Then Return Nothing
+
+        Try
+            For Each childNode As TreeNode In parentNode.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+
+                If treeNodeMatchesComponent(childNode, targetComp) Then
+                    Return childNode
+                End If
+            Next
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function treeNodeMatchesComponent(ByVal node As TreeNode, ByVal targetComp As Component2) As Boolean
+        If node Is Nothing OrElse targetComp Is Nothing Then Return False
+
+        Try
+            If Not TypeOf node.Tag Is Component2 Then Return False
+
+            Dim nodeComp As Component2 = CType(node.Tag, Component2)
+
+            Try
+                If Object.ReferenceEquals(nodeComp, targetComp) Then Return True
+            Catch
+            End Try
+
+            Dim nodeName As String = ""
+            Dim targetName As String = ""
+
+            Try
+                nodeName = nodeComp.Name2
+            Catch
+                nodeName = ""
+            End Try
+
+            Try
+                targetName = targetComp.Name2
+            Catch
+                targetName = ""
+            End Try
+
+            If Not String.IsNullOrWhiteSpace(nodeName) AndAlso
+               String.Equals(nodeName, targetName, StringComparison.OrdinalIgnoreCase) Then
+                Return True
+            End If
+
+            Dim nodePath As String = normalizePathForNodeMatch(getSafeComponentPath(nodeComp))
+            Dim targetPath As String = normalizePathForNodeMatch(getSafeComponentPath(targetComp))
+
+            If nodePath <> "" AndAlso targetPath <> "" AndAlso
+               String.Equals(nodePath, targetPath, StringComparison.OrdinalIgnoreCase) Then
+                Return True
+            End If
+
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Private Function findTreeNodeByComponentInstance(ByVal node As TreeNode, ByVal selectedComp As Component2) As TreeNode
+        If node Is Nothing OrElse selectedComp Is Nothing Then Return Nothing
+
+        Try
+            If TypeOf node.Tag Is Component2 Then
+                Dim nodeComp As Component2 = CType(node.Tag, Component2)
+
+                Try
+                    If Object.ReferenceEquals(nodeComp, selectedComp) Then Return node
+                Catch
+                End Try
+
+                Try
+                    Dim nodeName As String = nodeComp.Name2
+                    Dim selectedName As String = selectedComp.Name2
+
+                    If Not String.IsNullOrWhiteSpace(nodeName) AndAlso
+                       String.Equals(nodeName, selectedName, StringComparison.OrdinalIgnoreCase) Then
+                        Return node
+                    End If
+                Catch
+                End Try
+            End If
+
+            For Each childNode As TreeNode In node.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+
+                Dim matchedChild As TreeNode = findTreeNodeByComponentInstance(childNode, selectedComp)
+                If matchedChild IsNot Nothing Then Return matchedChild
+            Next
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function findTreeNodeByCadPath(ByVal node As TreeNode, ByVal selectedPath As String) As TreeNode
+        If node Is Nothing Then Return Nothing
+
+        Dim normalizedSelectedPath As String = normalizePathForNodeMatch(selectedPath)
+        If String.IsNullOrWhiteSpace(normalizedSelectedPath) Then Return Nothing
+
+        Try
+            Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+
+            If nodePath <> "" AndAlso
+               String.Equals(nodePath, normalizedSelectedPath, StringComparison.OrdinalIgnoreCase) Then
+                Return node
+            End If
+
+            For Each childNode As TreeNode In node.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+
+                Dim matchedChild As TreeNode = findTreeNodeByCadPath(childNode, selectedPath)
+                If matchedChild IsNot Nothing Then Return matchedChild
+            Next
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
 
     Private Sub TreeView1_BeforeExpand(sender As Object, e As TreeViewCancelEventArgs) Handles TreeView1.BeforeExpand
         Try
@@ -1466,6 +2231,11 @@ Public Class UserControl1
         allTreeViews(treeIndex).Visible = False
         getComponentsOfAssemblyOptionalUpdateTree({activeDoc}, treeIndex, iTreeDepthLimit:=1)
         switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+
+        'Persistent metadata cache:
+        'Show last-known status immediately after the shallow tree is built.
+        'This does not contact SVN, does not download geometry, and does not resolve the full assembly.
+        applyPersistentStatusCacheForVisibleTree("refreshCurrentTreeViewOnly")
     End Sub
 
     Private Function getSafeModelPath(ByVal modDoc As ModelDoc2) As String
@@ -2127,6 +2897,12 @@ Public Class UserControl1
 
         Try
             node.TreeView.Sort()
+        Catch
+        End Try
+
+        'When a lazy branch is expanded, apply cached status to the newly visible children instantly.
+        Try
+            applyPersistentStatusCacheForVisibleTree("loadImmediateChildrenForNode")
         Catch
         End Try
     End Sub
