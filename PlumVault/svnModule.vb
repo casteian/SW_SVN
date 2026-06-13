@@ -1161,79 +1161,181 @@ Public Module svnModule
 
     Public Function getServerStatusForFilePathsBackgroundPublic(ByVal sFilePathArr() As String,
                                                                ByVal savedPathForBackground As String,
-                                                               ByRef errorMessage As String) As SVNStatus
+                                                               ByRef errorMessage As String,
+                                                               ByRef timingLog As String) As SVNStatus
         errorMessage = ""
+        timingLog = ""
+
+        Dim overallSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        Dim timingLines As New List(Of String)()
+        timingLines.Add("Sync background start: " & DateTime.Now.ToString("HH:mm:ss.fff"))
+        timingLines.Add("Input paths: " & If(sFilePathArr Is Nothing, 0, sFilePathArr.Length).ToString())
+        timingLines.Add("Sync optimization: text status first, release propget in parallel, lock-owner XML only when locks are detected")
 
         If sFilePathArr Is Nothing OrElse sFilePathArr.Length = 0 Then
             errorMessage = "No file paths were supplied for Sync Status."
+            overallSw.Stop()
+            timingLines.Add("FAILED: no input paths")
+            timingLines.Add("Background total: " & overallSw.ElapsedMilliseconds.ToString() & " ms")
+            timingLog = String.Join(vbCrLf, timingLines.ToArray())
             Return Nothing
         End If
 
+        Dim filterSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
         Dim filteredPaths() As String = filterExistingCadFilePathsOnly(sFilePathArr)
+        filterSw.Stop()
+        timingLines.Add("Filter valid CAD paths: " & filterSw.ElapsedMilliseconds.ToString() & " ms")
+        timingLines.Add("Filtered paths: " & If(filteredPaths Is Nothing, 0, filteredPaths.Length).ToString())
 
         If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
             errorMessage = "No valid CAD file paths were supplied for Sync Status."
+            overallSw.Stop()
+            timingLines.Add("FAILED: no valid CAD paths")
+            timingLines.Add("Background total: " & overallSw.ElapsedMilliseconds.ToString() & " ms")
+            timingLog = String.Join(vbCrLf, timingLines.ToArray())
             Return Nothing
         End If
 
         Try
             Dim allEntries As New List(Of SVNStatus.filePpty)()
+            Dim chunks As List(Of String()) = chunkFilePathsForBackground(filteredPaths, 50)
+            timingLines.Add("Chunks: " & chunks.Count.ToString() & " at max 50 paths/chunk")
 
-            For Each chunk As String() In chunkFilePathsForBackground(filteredPaths, 50)
-                Dim ownersByPath As Dictionary(Of String, String) = getSvnLockOwnersForPathsBackground(chunk, savedPathForBackground)
-                Dim releaseByPath As Dictionary(Of String, String) = getReleasePropertiesForPathsBackground(chunk, savedPathForBackground)
+            Dim chunkIndex As Integer = 0
 
-                Dim args As String = "status -vu --non-interactive " & quoteFilePathArgs(chunk)
-                Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(sSVNPath, args, savedPathForBackground)
+            For Each chunk As String() In chunks
+                chunkIndex += 1
+                Dim chunkSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+                Dim entriesBeforeChunk As Integer = allEntries.Count
+                timingLines.Add("Chunk " & chunkIndex.ToString() & ": " & chunk.Length.ToString() & " paths")
+
+                Dim statusArgs As String = "status -vu --non-interactive " & quoteFilePathArgs(chunk)
+                timingLines.Add("  status command length: " & statusArgs.Length.ToString() & " chars")
+
+                Dim statusSw As New System.Diagnostics.Stopwatch()
+                Dim releaseSw As New System.Diagnostics.Stopwatch()
+
+                Dim statusTask As Task(Of rawProcessReturn) = Task.Run(Function()
+                                                                           statusSw.Start()
+                                                                           Dim r As rawProcessReturn = runSvnProcessBackgroundNoUi(sSVNPath, statusArgs, savedPathForBackground)
+                                                                           statusSw.Stop()
+                                                                           Return r
+                                                                       End Function)
+
+                Dim releaseTask As Task(Of Dictionary(Of String, String)) = Task.Run(Function()
+                                                                                         releaseSw.Start()
+                                                                                         Dim r As Dictionary(Of String, String) = getReleasePropertiesForPathsBackground(chunk, savedPathForBackground)
+                                                                                         releaseSw.Stop()
+                                                                                         Return r
+                                                                                     End Function)
+
+                Task.WaitAll(New Task() {statusTask, releaseTask})
+
+                Dim statusResult As rawProcessReturn = statusTask.Result
+                Dim releaseByPath As Dictionary(Of String, String) = releaseTask.Result
+
+                Dim outputLength As Integer = 0
+                If statusResult.output IsNot Nothing Then outputLength = statusResult.output.Length
+
+                Dim errorLength As Integer = 0
+                If statusResult.outputError IsNot Nothing Then errorLength = statusResult.outputError.Length
+
+                timingLines.Add("  status -vu text: " & statusSw.ElapsedMilliseconds.ToString() & " ms" &
+                                " | stdout chars: " & outputLength.ToString() &
+                                " | stderr chars: " & errorLength.ToString())
+
+                timingLines.Add("  release propget XML parallel: " & releaseSw.ElapsedMilliseconds.ToString() & " ms" &
+                                " | props found: " & If(releaseByPath Is Nothing, 0, releaseByPath.Count).ToString())
 
                 If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
                     errorMessage = statusResult.outputError.Trim()
+                    chunkSw.Stop()
+                    overallSw.Stop()
+                    timingLines.Add("  FAILED chunk " & chunkIndex.ToString() & ": SVN status returned stderr")
+                    timingLines.Add("Chunk " & chunkIndex.ToString() & " total before failure: " & chunkSw.ElapsedMilliseconds.ToString() & " ms")
+                    timingLines.Add("Background total before failure: " & overallSw.ElapsedMilliseconds.ToString() & " ms")
+                    timingLog = String.Join(vbCrLf, timingLines.ToArray())
                     Return Nothing
                 End If
 
-                If statusResult.output Is Nothing Then Continue For
+                Dim possibleLockedByOtherPaths As New List(Of String)()
 
-                Dim lines() As String = statusResult.output.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
+                If statusResult.output IsNot Nothing Then
+                    Dim parseSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+                    Dim lines() As String = statusResult.output.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
 
-                For Each line As String In lines
-                    If String.IsNullOrWhiteSpace(line) Then Continue For
-                    If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+                    For Each line As String In lines
+                        If String.IsNullOrWhiteSpace(line) Then Continue For
+                        If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
 
-                    Dim matchedPath As String = findMatchingTargetPathInStatusLine(line, chunk)
-                    If String.IsNullOrWhiteSpace(matchedPath) Then Continue For
+                        Dim matchedPath As String = findMatchingTargetPathInStatusLine(line, chunk)
+                        If String.IsNullOrWhiteSpace(matchedPath) Then Continue For
 
-                    Dim fp As New SVNStatus.filePpty()
-                    fp.filename = matchedPath
-                    fp.modDoc = Nothing
-                    fp.bReconnect = False
-                    fp.revertUpdate = getLatestType.none
-                    fp.addDelChg1 = getStatusColumn(line, 0)
-                    fp.pptyMods2 = getStatusColumn(line, 1)
-                    fp.workingDirLock3 = getStatusColumn(line, 2)
-                    fp.addWithHist4 = getStatusColumn(line, 3)
-                    fp.switchWParent5 = getStatusColumn(line, 4)
-                    fp.lock6 = getStatusColumn(line, 5)
-                    fp.tree7 = getStatusColumn(line, 6)
-                    fp.upToDate9 = getStatusColumn(line, 8)
-                    fp.lockOwner = ""
-                    fp.released = ""
+                        Dim fp As New SVNStatus.filePpty()
+                        fp.filename = matchedPath
+                        fp.modDoc = Nothing
+                        fp.bReconnect = False
+                        fp.revertUpdate = getLatestType.none
+                        fp.addDelChg1 = getStatusColumn(line, 0)
+                        fp.pptyMods2 = getStatusColumn(line, 1)
+                        fp.workingDirLock3 = getStatusColumn(line, 2)
+                        fp.addWithHist4 = getStatusColumn(line, 3)
+                        fp.switchWParent5 = getStatusColumn(line, 4)
+                        fp.lock6 = getStatusColumn(line, 5)
+                        fp.tree7 = getStatusColumn(line, 6)
+                        fp.upToDate9 = getStatusColumn(line, 8)
+                        fp.lockOwner = ""
+                        fp.released = ""
 
-                    If ownersByPath IsNot Nothing Then
-                        Dim owner As String = ""
-                        If ownersByPath.TryGetValue(normalizeSvnPath(matchedPath), owner) Then
-                            fp.lockOwner = owner
+                        If releaseByPath IsNot Nothing Then
+                            Dim releaseState As String = ""
+                            If releaseByPath.TryGetValue(normalizeSvnPath(matchedPath), releaseState) Then
+                                fp.released = releaseState
+                            End If
                         End If
+
+                        If fp.lock6 = "O" Then
+                            possibleLockedByOtherPaths.Add(matchedPath)
+                        End If
+
+                        allEntries.Add(fp)
+                    Next
+
+                    parseSw.Stop()
+                    timingLines.Add("  parse status output: " & parseSw.ElapsedMilliseconds.ToString() & " ms" &
+                                    " | raw lines: " & lines.Length.ToString() &
+                                    " | entries added: " & (allEntries.Count - entriesBeforeChunk).ToString() &
+                                    " | locked-by-other candidates: " & possibleLockedByOtherPaths.Count.ToString())
+                End If
+
+                If possibleLockedByOtherPaths.Count > 0 Then
+                    Dim ownersSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+                    Dim ownersByPath As Dictionary(Of String, String) = getSvnLockOwnersForPathsBackground(possibleLockedByOtherPaths.ToArray(), savedPathForBackground)
+                    ownersSw.Stop()
+
+                    Dim ownersApplied As Integer = 0
+                    If ownersByPath IsNot Nothing AndAlso ownersByPath.Count > 0 Then
+                        For i As Integer = entriesBeforeChunk To allEntries.Count - 1
+                            Dim fpTemp As SVNStatus.filePpty = allEntries(i)
+                            Dim owner As String = ""
+                            If ownersByPath.TryGetValue(normalizeSvnPath(fpTemp.filename), owner) Then
+                                fpTemp.lockOwner = owner
+                                allEntries(i) = fpTemp
+                                ownersApplied += 1
+                            End If
+                        Next
                     End If
 
-                    If releaseByPath IsNot Nothing Then
-                        Dim releaseState As String = ""
-                        If releaseByPath.TryGetValue(normalizeSvnPath(matchedPath), releaseState) Then
-                            fp.released = releaseState
-                        End If
-                    End If
+                    timingLines.Add("  lock-owner XML on locked subset: " & ownersSw.ElapsedMilliseconds.ToString() & " ms" &
+                                    " | queried paths: " & possibleLockedByOtherPaths.Count.ToString() &
+                                    " | owners found: " & If(ownersByPath Is Nothing, 0, ownersByPath.Count).ToString() &
+                                    " | owners applied: " & ownersApplied.ToString())
+                Else
+                    timingLines.Add("  lock-owner XML skipped: 0 locked-by-other candidates")
+                End If
 
-                    allEntries.Add(fp)
-                Next
+                chunkSw.Stop()
+                timingLines.Add("Chunk " & chunkIndex.ToString() & " total: " & chunkSw.ElapsedMilliseconds.ToString() & " ms")
             Next
 
             Dim serverStatus As New SVNStatus()
@@ -1244,10 +1346,24 @@ Public Module svnModule
                 serverStatus.fp = allEntries.ToArray()
             End If
 
+            overallSw.Stop()
+            timingLines.Add("Entries returned: " & allEntries.Count.ToString())
+            timingLines.Add("Background total: " & overallSw.ElapsedMilliseconds.ToString() & " ms")
+            timingLog = String.Join(vbCrLf, timingLines.ToArray())
+
+            Try
+                System.Diagnostics.Debug.WriteLine(timingLog)
+            Catch
+            End Try
+
             Return serverStatus
 
         Catch ex As Exception
             errorMessage = ex.Message
+            overallSw.Stop()
+            timingLines.Add("EXCEPTION: " & ex.Message)
+            timingLines.Add("Background total before exception: " & overallSw.ElapsedMilliseconds.ToString() & " ms")
+            timingLog = String.Join(vbCrLf, timingLines.ToArray())
             Return Nothing
         End Try
     End Function

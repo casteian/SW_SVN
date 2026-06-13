@@ -696,6 +696,7 @@ Public Class UserControl1
 
         Dim pathsForBackground As String() = CType(syncPaths.Clone(), String())
         Dim savedPathForBackground As String = savedPATH
+        Dim uiStartTimestamp As DateTime = DateTime.Now
 
         syncStatusInProgress = True
         markSyncPendingForFilePathsPublic(pathsForBackground, True, pendingText)
@@ -704,16 +705,17 @@ Public Class UserControl1
         System.Threading.Tasks.Task.Run(Sub()
                                             Dim errorMessage As String = ""
                                             Dim serverStatus As SVNStatus = Nothing
+                                            Dim timingLog As String = ""
 
                                             Try
-                                                serverStatus = svnModule.getServerStatusForFilePathsBackgroundPublic(pathsForBackground, savedPathForBackground, errorMessage)
+                                                serverStatus = svnModule.getServerStatusForFilePathsBackgroundPublic(pathsForBackground, savedPathForBackground, errorMessage, timingLog)
                                             Catch ex As Exception
                                                 errorMessage = ex.Message
                                             End Try
 
                                             Try
                                                 If Me.IsHandleCreated Then
-                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage)))
+                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage, timingLog, uiStartTimestamp)))
                                                 Else
                                                     syncStatusInProgress = False
                                                 End If
@@ -725,7 +727,12 @@ Public Class UserControl1
 
     Private Sub finishAsyncSyncStatus(ByVal syncPaths() As String,
                                       ByVal serverStatus As SVNStatus,
-                                      ByVal errorMessage As String)
+                                      ByVal errorMessage As String,
+                                      ByVal timingLog As String,
+                                      ByVal uiStartTimestamp As DateTime)
+        Dim finishSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        Dim finishLines As New List(Of String)()
+
         Try
             markSyncPendingForFilePathsPublic(syncPaths, False)
         Catch
@@ -739,6 +746,8 @@ Public Class UserControl1
         syncStatusInProgress = False
 
         If Not String.IsNullOrWhiteSpace(errorMessage) Then
+            appendSyncTimingLog(timingLog & vbCrLf & "UI finish: failed before cache/tree update")
+
             iSwApp.SendMsgToUser2("Sync Status failed." & vbCrLf & vbCrLf & errorMessage,
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk)
@@ -746,17 +755,23 @@ Public Class UserControl1
         End If
 
         If serverStatus Is Nothing Then
+            appendSyncTimingLog(timingLog & vbCrLf & "UI finish: failed because no SVN status was returned")
+
             iSwApp.SendMsgToUser2("Sync Status failed. No SVN status was returned.",
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk)
             Exit Sub
         End If
 
+        Dim applySw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
         Try
             svnModule.applyServerStatusFromBackgroundPublic(serverStatus)
         Catch
         End Try
+        applySw.Stop()
+        finishLines.Add("UI apply cache: " & applySw.ElapsedMilliseconds.ToString() & " ms")
 
+        Dim recolorSw As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
         Try
             recolorTreeNodesForFilePathsPublic(syncPaths)
         Catch
@@ -765,9 +780,51 @@ Public Class UserControl1
             Catch
             End Try
         End Try
+        recolorSw.Stop()
+        finishLines.Add("UI recolor synced nodes: " & recolorSw.ElapsedMilliseconds.ToString() & " ms")
 
         Try
             setRefreshTreeButtonNormal()
+        Catch
+        End Try
+
+        finishSw.Stop()
+        finishLines.Add("UI finish total: " & finishSw.ElapsedMilliseconds.ToString() & " ms")
+        finishLines.Add("End-to-end visible sync time: " & CLng((DateTime.Now - uiStartTimestamp).TotalMilliseconds).ToString() & " ms")
+
+        Dim fullTimingLog As String = timingLog
+        If Not String.IsNullOrWhiteSpace(fullTimingLog) Then fullTimingLog &= vbCrLf
+        fullTimingLog &= String.Join(vbCrLf, finishLines.ToArray())
+
+        appendSyncTimingLog(fullTimingLog)
+
+        If debugIgnoreNamingConventionEnabled() Then
+            Dim displayTiming As String = fullTimingLog
+            If displayTiming.Length > 3000 Then
+                displayTiming = displayTiming.Substring(0, 3000) & vbCrLf & "... timing log truncated. Full log is in %TEMP%\PlumVault_SyncTiming.log"
+            End If
+
+            iSwApp.SendMsgToUser2("Sync Timing Log" & vbCrLf & vbCrLf & displayTiming,
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+        End If
+    End Sub
+
+    Private Sub appendSyncTimingLog(ByVal timingLog As String)
+        If String.IsNullOrWhiteSpace(timingLog) Then Exit Sub
+
+        Try
+            Dim logText As String = vbCrLf & "========== PlumVault Sync Timing " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") & " ==========" & vbCrLf & timingLog & vbCrLf
+
+            Try
+                System.Diagnostics.Debug.WriteLine(logText)
+            Catch
+            End Try
+
+            Try
+                File.AppendAllText(Path.Combine(Path.GetTempPath(), "PlumVault_SyncTiming.log"), logText)
+            Catch
+            End Try
         Catch
         End Try
     End Sub
