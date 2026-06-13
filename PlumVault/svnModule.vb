@@ -8,6 +8,7 @@ Imports System.Runtime.Remoting.Messaging
 Imports System.Windows.Forms.LinkLabel
 Imports System.Windows.Forms.VisualStyles.VisualStyleElement
 Imports System.Xml
+Imports System.Threading.Tasks
 
 Public Module svnModule
     Private Class ExternalReferenceInfo
@@ -25,6 +26,9 @@ Public Module svnModule
     Private closeGuardMessageShowing As Boolean = False
     Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
     Private unsafeForceCloseApprovedUntil As DateTime = DateTime.MinValue
+    Private statusCacheByNormalizedPath As New Dictionary(Of String, SVNStatus.filePpty)(StringComparer.OrdinalIgnoreCase)
+    Private asyncGetLocksInProgress As Boolean = False
+    Private asyncCommitInProgress As Boolean = False
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -70,19 +74,20 @@ Public Module svnModule
     End Sub
     Public Function updateLockStatusPublic(Optional bRefreshAllTreeViews As Boolean = True) As Boolean
         updateLockStatusPublic = statusOfAllOpenModels.updateStatusLocally(iSwApp)
+        rebuildStatusCacheFromStatus(statusOfAllOpenModels)
         If bRefreshAllTreeViews Then myUserControl.refreshAllTreeViewsVariable()
     End Function
     Public Function updateStatusOfAllModelsVariable(Optional bRefreshAllTreeViews As Boolean = False) As Boolean
         Dim bWhatToReturn As Boolean = False
 
         bWhatToReturn = statusOfAllOpenModels.updateFromSvnServer(bRefreshAllTreeViews)
+        rebuildStatusCacheFromStatus(statusOfAllOpenModels)
 
         If bRefreshAllTreeViews And bWhatToReturn Then
             myUserControl.refreshAllTreeViewsVariable()
         End If
         Return bWhatToReturn
     End Function
-
     Public Function liveCheckForAssemblyServerChangesOnly(ByRef modDocArr() As ModelDoc2) As Boolean
         If liveAssemblyChangeCheckInProgress Then Return False
         If myUserControl Is Nothing Then Return False
@@ -161,13 +166,17 @@ Public Module svnModule
                     isDirty = False
                 End Try
 
-                If isDirty Then
-                    openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
+                If String.IsNullOrWhiteSpace(docPath) Then
+                    openPaths.Add("[UNSAVED_NEW_FILE] " & title)
                     Continue For
                 End If
 
-                If String.IsNullOrWhiteSpace(docPath) Then
-                    openPaths.Add("[UNSAVED_NEW_FILE] " & title)
+                If isDirty Then
+                    If userHasSvnLockOnDoc(doc) OrElse isNewUnversionedOrAddedFile(docPath) Then
+                        openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
+                    Else
+                        openPaths.Add("[UNSAVED_WITHOUT_LOCK] " & title)
+                    End If
                     Continue For
                 End If
 
@@ -235,11 +244,15 @@ Public Module svnModule
                 isDirty = False
             End Try
 
-            If isDirty Then
-                openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
-
-            ElseIf String.IsNullOrWhiteSpace(docPath) Then
+            If String.IsNullOrWhiteSpace(docPath) Then
                 openPaths.Add("[UNSAVED_NEW_FILE] " & title)
+
+            ElseIf isDirty Then
+                If userHasSvnLockOnDoc(closingDoc) OrElse isNewUnversionedOrAddedFile(docPath) Then
+                    openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
+                Else
+                    openPaths.Add("[UNSAVED_WITHOUT_LOCK] " & title)
+                End If
 
             ElseIf isCadFilePath(docPath) AndAlso isPathInsideLocalRepo(docPath) Then
                 openPaths.Add(docPath)
@@ -282,12 +295,57 @@ Public Module svnModule
         Return blockCloseIfSingleDocUnsafe(activeDoc)
     End Function
 
+    Private Function userHasSvnLockOnDoc(ByVal doc As ModelDoc2) As Boolean
+        If doc Is Nothing Then Return False
+
+        Dim docPath As String = ""
+
+        Try
+            docPath = doc.GetPathName()
+        Catch
+            docPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(docPath) Then Return False
+        If Not isCadFilePath(docPath) Then Return False
+        If Not isPathInsideLocalRepo(docPath) Then Return False
+
+        'New/unversioned files do not have SVN locks yet, but they are valid to add/commit.
+        If isNewUnversionedOrAddedFile(docPath) Then Return True
+
+        Try
+            Dim docsToCheck As ModelDoc2() = New ModelDoc2() {doc}
+
+            Dim status As SVNStatus = getFileSVNStatus(
+                bCheckServer:=False,
+                modDocArr:=docsToCheck,
+                bUpdateStatusOfAllOpenModels:=False
+            )
+
+            If status IsNot Nothing AndAlso status.fp IsNot Nothing AndAlso status.fp.Length > 0 Then
+                If status.fp(0).lock6 = "K" Then Return True
+            End If
+        Catch
+        End Try
+
+        Try
+            Dim cachedStatus As SVNStatus = findStatusForFile(docPath)
+
+            If cachedStatus IsNot Nothing AndAlso cachedStatus.fp IsNot Nothing AndAlso cachedStatus.fp.Length > 0 Then
+                If cachedStatus.fp(0).lock6 = "K" Then Return True
+            End If
+        Catch
+        End Try
+
+        Return False
+    End Function
+
     Private Function showUnsafeClosePrompt(ByVal unsafeMsg As String) As Boolean
         Dim response As Integer = iSwApp.SendMsgToUser2(
             "One or more open CAD files are not safe to close yet." & vbCrLf & vbCrLf &
             unsafeMsg & vbCrLf &
             "Choose an action:" & vbCrLf &
-            "Yes = I want to go back to push/revert" & vbCrLf &
+            "Yes = I want to go back to get locks / push / revert" & vbCrLf &
             "No = I want to close SolidWorks anyway",
             swMessageBoxIcon_e.swMbWarning,
             swMessageBoxBtn_e.swMbYesNo
@@ -296,7 +354,7 @@ Public Module svnModule
         If response = swMessageBoxResult_e.swMbHitYes Then
             iSwApp.SendMsgToUser2(
                 "Close cancelled." & vbCrLf & vbCrLf &
-                "Commit/push your files, or use Unlock && Revert to go back to the original version.",
+                "Get Locks if needed, then Commit/push your files, or use Unlock && Revert to go back to the original version.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -325,7 +383,13 @@ Public Module svnModule
 
             If filePath.StartsWith("[UNSAVED_SOLIDWORKS_CHANGES]") Then
                 msg &= filePath.Replace("[UNSAVED_SOLIDWORKS_CHANGES] ", "") & vbCrLf &
-                "SolidWorks has unsaved changes." & vbCrLf & vbCrLf
+                "SolidWorks has unsaved changes and you have the SVN lock, or this is a new file ready to be committed." & vbCrLf & vbCrLf
+                Continue For
+            End If
+
+            If filePath.StartsWith("[UNSAVED_WITHOUT_LOCK]") Then
+                msg &= filePath.Replace("[UNSAVED_WITHOUT_LOCK] ", "") & vbCrLf &
+                "SolidWorks has unsaved changes, but you do NOT have the SVN lock. Click Get Locks before saving/committing, or revert/close to discard these changes." & vbCrLf & vbCrLf
                 Continue For
             End If
 
@@ -564,6 +628,60 @@ Public Module svnModule
         End Try
     End Function
 
+
+    Private Sub rebuildStatusCacheFromStatus(ByVal statusToCache As SVNStatus)
+        Try
+            statusCacheByNormalizedPath.Clear()
+
+            If statusToCache Is Nothing Then Exit Sub
+            If statusToCache.fp Is Nothing Then Exit Sub
+
+            For i As Integer = 0 To UBound(statusToCache.fp)
+                Dim filePath As String = statusToCache.fp(i).filename
+                If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+                Dim normalizedPath As String = normalizeSvnPath(filePath)
+                If String.IsNullOrWhiteSpace(normalizedPath) Then Continue For
+
+                statusCacheByNormalizedPath(normalizedPath) = statusToCache.fp(i)
+            Next
+        Catch
+            Try
+                statusCacheByNormalizedPath.Clear()
+            Catch
+            End Try
+        End Try
+    End Sub
+
+    Private Function tryFindCachedStatusProperty(ByVal filePath As String, ByRef foundStatus As SVNStatus.filePpty) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Try
+            If statusCacheByNormalizedPath Is Nothing OrElse statusCacheByNormalizedPath.Count = 0 Then
+                rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+            End If
+
+            Dim normalizedPath As String = normalizeSvnPath(filePath)
+            If statusCacheByNormalizedPath.ContainsKey(normalizedPath) Then
+                foundStatus = statusCacheByNormalizedPath(normalizedPath)
+                Return True
+            End If
+
+            'Fallback for older tree nodes that may pass only the filename.
+            Dim fileNameOnly As String = Path.GetFileName(filePath)
+            If fileNameOnly <> "" Then
+                For Each kvp As KeyValuePair(Of String, SVNStatus.filePpty) In statusCacheByNormalizedPath
+                    If String.Equals(Path.GetFileName(kvp.Value.filename), fileNameOnly, StringComparison.OrdinalIgnoreCase) Then
+                        foundStatus = kvp.Value
+                        Return True
+                    End If
+                Next
+            End If
+        Catch
+        End Try
+
+        Return False
+    End Function
     Private Function getSvnLockOwnersByPath(targetPath As String) As Dictionary(Of String, String)
         Dim lockOwners As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
 
@@ -610,10 +728,144 @@ Public Module svnModule
         Return lockOwners
     End Function
 
+
+    Private Function getSvnLockOwnersForFilePaths(ByVal targetPaths() As String) As Dictionary(Of String, String)
+        Dim lockOwners As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        If targetPaths Is Nothing OrElse targetPaths.Length = 0 Then Return lockOwners
+
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(targetPaths)
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return lockOwners
+
+        Dim currentChunk As New List(Of String)()
+        Dim currentLength As Integer = 0
+        Dim maxCommandLength As Integer = 28000
+
+        For Each filePath As String In filteredPaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Dim quotedPath As String = """" & filePath & """"
+            Dim addLength As Integer = quotedPath.Length + 1
+
+            If currentChunk.Count > 0 AndAlso currentLength + addLength > maxCommandLength Then
+                mergeLockOwnerDictionaries(lockOwners, getSvnLockOwnersForFilePathChunk(currentChunk.ToArray()))
+                currentChunk.Clear()
+                currentLength = 0
+            End If
+
+            currentChunk.Add(filePath)
+            currentLength += addLength
+        Next
+
+        If currentChunk.Count > 0 Then
+            mergeLockOwnerDictionaries(lockOwners, getSvnLockOwnersForFilePathChunk(currentChunk.ToArray()))
+        End If
+
+        Return lockOwners
+    End Function
+
+    Private Sub mergeLockOwnerDictionaries(ByVal destination As Dictionary(Of String, String),
+                                           ByVal source As Dictionary(Of String, String))
+        If destination Is Nothing Then Exit Sub
+        If source Is Nothing Then Exit Sub
+
+        For Each kvp As KeyValuePair(Of String, String) In source
+            destination(kvp.Key) = kvp.Value
+        Next
+    End Sub
+
+    Private Function getSvnLockOwnersForFilePathChunk(ByVal targetPaths() As String) As Dictionary(Of String, String)
+        Dim lockOwners As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        If targetPaths Is Nothing OrElse targetPaths.Length = 0 Then Return lockOwners
+
+        Dim pathArgs As String = ""
+
+        For Each filePath As String In targetPaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            pathArgs &= """" & filePath & """" & " "
+        Next
+
+        If pathArgs.Trim() = "" Then Return lockOwners
+
+        Dim xmlStatus As rawProcessReturn = runSvnProcess(
+        sSVNPath,
+        "status -u --xml --non-interactive " & pathArgs.Trim()
+    )
+
+        If xmlStatus.output Is Nothing Then Return lockOwners
+        If xmlStatus.outputError IsNot Nothing AndAlso xmlStatus.outputError.Trim() <> "" Then Return lockOwners
+        If xmlStatus.output.Trim() = "" Then Return lockOwners
+
+        Dim doc As New XmlDocument()
+
+        Try
+            doc.LoadXml(xmlStatus.output)
+        Catch
+            Return lockOwners
+        End Try
+
+        Dim entries As XmlNodeList = doc.SelectNodes("/status/target/entry")
+
+        For Each entry As XmlNode In entries
+            If entry.Attributes Is Nothing Then Continue For
+            If entry.Attributes("path") Is Nothing Then Continue For
+
+            Dim entryPath As String = entry.Attributes("path").Value
+            Dim ownerNode As XmlNode = entry.SelectSingleNode("repos-status/lock/owner")
+
+            If ownerNode Is Nothing Then
+                ownerNode = entry.SelectSingleNode("wc-status/lock/owner")
+            End If
+
+            If ownerNode Is Nothing Then Continue For
+
+            Dim owner As String = ownerNode.InnerText.Trim()
+            If owner = "" Then Continue For
+
+            lockOwners(normalizeSvnPath(entryPath)) = owner
+        Next
+
+        Return lockOwners
+    End Function
+
+
+    Private Function isUsableSvnStatusOutputLine(ByVal statusLine As String) As Boolean
+        If String.IsNullOrWhiteSpace(statusLine) Then Return False
+
+        Try
+            If statusLine.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Return False
+
+            'A targeted svn status -u call can legitimately return only one line.
+            'This happens for added/renamed/new files, for example:
+            'A       ?       C:\SVN test\part.SLDPRT
+            'Do not treat that as "incomplete status" just because there is no second line.
+            If myUserControl IsNot Nothing AndAlso myUserControl.localRepoPath IsNot Nothing Then
+                Dim repoRoot As String = myUserControl.localRepoPath.Text
+                If Not String.IsNullOrWhiteSpace(repoRoot) Then
+                    If statusLine.IndexOf(repoRoot, StringComparison.OrdinalIgnoreCase) >= 0 Then
+                        Return True
+                    End If
+                End If
+            End If
+
+            'Fallback: accept normal SVN status rows if they contain a CAD file name.
+            Dim upperLine As String = statusLine.ToUpperInvariant()
+            If upperLine.Contains(".SLDPRT") OrElse upperLine.Contains(".SLDASM") OrElse upperLine.Contains(".SLDDRW") Then
+                Return True
+            End If
+
+        Catch
+        End Try
+
+        Return False
+    End Function
+
     Public Function getFileSVNStatus(ByVal bCheckServer As Boolean,
                               Optional ByRef modDocArr() As ModelDoc2 = Nothing,
                               Optional ByRef bUpdateStatusOfAllOpenModels As Boolean = True,
-                              Optional ByVal iRecursiveLevel As Integer = 0) As SVNStatus
+                              Optional ByVal iRecursiveLevel As Integer = 0,
+                              Optional ByRef sDirectFilePathArr() As String = Nothing) As SVNStatus
         'Pass sFilePath = Create from the file path
         'Pass modDocArr = create from the modDocArr
         'Pass Neither = create for entire repo
@@ -655,9 +907,17 @@ Public Module svnModule
         'SVNstartInfo.Arguments = "status " & If(bCheckServer, "-u ", "") & "-v --non-interactive E:\SolidworksBackup\svn " 'sFilePathCat 
 
         If Not verifyLocalRepoPath(, bCheckLocalFolder:=True, bCheckServer = False) Then Return Nothing 'Don't check server because we will in runSVNProcess
-        If Not IsNothing(modDocArr) Then sModDocPathArr = getFilePathsFromModDocArr(modDocArr)
 
-        If bCheckServer Or (IsNothing(modDocArr)) Then bCheckAllFiles = True
+        If Not IsNothing(sDirectFilePathArr) Then
+            sModDocPathArr = filterExistingCadFilePathsOnly(sDirectFilePathArr)
+        ElseIf Not IsNothing(modDocArr) Then
+            sModDocPathArr = getFilePathsFromModDocArr(modDocArr)
+        End If
+
+        'Speed fix:
+        'Only scan the whole working copy when no specific files were supplied.
+        'Targeted server status is used by Get Locks and Sync Status so large assemblies do not feel like full-repo scans.
+        If IsNothing(sModDocPathArr) OrElse sModDocPathArr.Length = 0 Then bCheckAllFiles = True
 
         If bCheckAllFiles Then
             'Have to just check the whole file path, because otherwise, svn sends a separate server request for ech individual path sent
@@ -666,8 +926,12 @@ Public Module svnModule
             sPropArr = svnPropget("""" & myUserControl.localRepoPath.Text.TrimEnd("\\") & """")
         Else
 
-            statusArguments = "status -v --non-interactive " & formatFilePathArrForProc(sModDocPathArr, sDelimiter:=""" """) & """" 'sFilePathCat 
-            sPropArr = svnPropget(formatFilePathArrForProc(sModDocPathArr, sDelimiter:=""" """) & """")
+            'Safety fix:
+            'When checking targeted files against the server, keep the -u flag.
+            'Without -u, normal Get Locks could miss the remote "*" out-of-date marker
+            'and accidentally allow a user to lock/edit stale geometry.
+            statusArguments = "status -v" & If(bCheckServer, "u", "") & " --non-interactive " & formatFilePathArrForSvnProc(sModDocPathArr) 'sFilePathCat 
+            sPropArr = svnPropget(formatFilePathArrForSvnProc(sModDocPathArr))
         End If
 
 
@@ -677,21 +941,11 @@ Public Module svnModule
             lockOwnersByPath = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
 
             'Speed fix:
-            'For targeted status checks, do not scan the whole repo just to get lock owners.
-            'Normal Get Locks usually passes one or a few files, so query only those paths.
-            If sModDocPathArr IsNot Nothing AndAlso sModDocPathArr.Length > 0 AndAlso sModDocPathArr.Length <= 50 Then
-                For Each lockPath As String In sModDocPathArr
-                    If String.IsNullOrWhiteSpace(lockPath) Then Continue For
-
-                    Try
-                        Dim ownersForPath As Dictionary(Of String, String) = getSvnLockOwnersByPath(lockPath)
-
-                        For Each kvp As KeyValuePair(Of String, String) In ownersForPath
-                            lockOwnersByPath(kvp.Key) = kvp.Value
-                        Next
-                    Catch
-                    End Try
-                Next
+            'Do one batched XML lock-owner query for targeted file lists instead of
+            'spawning one svn.exe process per file. This keeps the safety check but
+            'removes most of the delay from normal Get Locks / Sync Status.
+            If sModDocPathArr IsNot Nothing AndAlso sModDocPathArr.Length > 0 Then
+                lockOwnersByPath = getSvnLockOwnersForFilePaths(sModDocPathArr)
             Else
                 lockOwnersByPath = getSvnLockOwnersByPath(myUserControl.localRepoPath.Text.TrimEnd("\"c))
             End If
@@ -729,7 +983,7 @@ Public Module svnModule
 
                     'https://tortoisesvn.net/docs/nightly/TortoiseSVN_en/tsvn-automation.html
                     runTortoiseProcexeWithMonitor("/command:repostatus /remote /path: """ & myUserControl.localRepoPath.Text & """") 'log in
-                    Return getFileSVNStatus(bCheckServer, modDocArr, bUpdateStatusOfAllOpenModels, iRecursiveLevel:=(iRecursiveLevel + 1))
+                    Return getFileSVNStatus(bCheckServer, modDocArr, bUpdateStatusOfAllOpenModels, iRecursiveLevel:=(iRecursiveLevel + 1), sDirectFilePathArr:=sDirectFilePathArr)
                 ElseIf sOutputErrorLines(i).Contains("E170013") Then
                     'Couldn't connect. Server is off or no internet connection
                     If iSwApp.SendMsgToUser2("SVN timed out while attempting to connect to the vault. " &
@@ -755,7 +1009,7 @@ Public Module svnModule
                                             swMessageBoxBtn_e.swMbYesNo)
                     If response = swMessageBoxResult_e.swMbHitYes Then
                         If (myUserControl.pickFolder() = System.Windows.Forms.DialogResult.OK) Then
-                            Return getFileSVNStatus(bCheckServer, modDocArr, bUpdateStatusOfAllOpenModels, iRecursiveLevel:=(iRecursiveLevel + 1))
+                            Return getFileSVNStatus(bCheckServer, modDocArr, bUpdateStatusOfAllOpenModels, iRecursiveLevel:=(iRecursiveLevel + 1), sDirectFilePathArr:=sDirectFilePathArr)
                         Else
                             Return Nothing
                         End If
@@ -785,13 +1039,17 @@ Public Module svnModule
         End If
 
         If (bCheckServer) Then
-            If sOutputLines(0).Substring(0, 23) = "Status against revision" Then
+            If sOutputLines(0).Length >= 23 AndAlso sOutputLines(0).Substring(0, 23) = "Status against revision" Then
                 iSwApp.SendMsgToUser("Status Returned from SVN Server with No Items") 'If you change the string, change it other places in the code too!
                 Return svnStatusOfPassedModDoc
             ElseIf (sOutputLines.Length = 1) Then
-                'If we are checking the server, we should expect a line 2. If its not there then theres an error.
-                iSwApp.SendMsgToUser("Error: Incomplete SVN Status. Could not Read Line 2. Line 1:" & sOutputLines(0))
-                Return svnStatusOfPassedModDoc
+                'Targeted svn status -u can legitimately return one usable status row.
+                'Example after rename/add: A       ?       C:\SVN test\part.SLDPRT
+                'That is not an incomplete response; continue and parse it normally.
+                If Not isUsableSvnStatusOutputLine(sOutputLines(0)) Then
+                    iSwApp.SendMsgToUser("Error: Incomplete SVN Status. Could not Read Line 2. Line 1:" & sOutputLines(0))
+                    Return svnStatusOfPassedModDoc
+                End If
             End If
         End If
 
@@ -853,6 +1111,7 @@ Public Module svnModule
 
         If bUpdateStatusOfAllOpenModels Then
             statusOfAllOpenModels = entireSVNStatus.Clone
+            rebuildStatusCacheFromStatus(statusOfAllOpenModels)
         End If
 
         If IsNothing(modDocArr) Then
@@ -863,6 +1122,287 @@ Public Module svnModule
         End If
 
     End Function
+
+    Public Function syncServerStatusForFilePaths(ByVal sFilePathArr() As String) As Boolean
+        If myUserControl Is Nothing Then Return False
+        If iSwApp Is Nothing Then Return False
+        If sFilePathArr Is Nothing Then Return False
+        If sFilePathArr.Length = 0 Then Return False
+        If Not myUserControl.onlineCheckBox.Checked Then Return False
+
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(sFilePathArr)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return False
+
+        Try
+            Dim serverStatus As SVNStatus = getFileSVNStatus(
+                bCheckServer:=True,
+                modDocArr:=Nothing,
+                bUpdateStatusOfAllOpenModels:=False,
+                sDirectFilePathArr:=filteredPaths
+            )
+
+            If serverStatus Is Nothing Then Return False
+
+            statusOfAllOpenModels = serverStatus.Clone
+            rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+
+            Try
+                myUserControl.statusOfAllOpenModels = statusOfAllOpenModels
+            Catch
+            End Try
+
+            Return True
+
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Public Function getServerStatusForFilePathsBackgroundPublic(ByVal sFilePathArr() As String,
+                                                               ByVal savedPathForBackground As String,
+                                                               ByRef errorMessage As String) As SVNStatus
+        errorMessage = ""
+
+        If sFilePathArr Is Nothing OrElse sFilePathArr.Length = 0 Then
+            errorMessage = "No file paths were supplied for Sync Status."
+            Return Nothing
+        End If
+
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(sFilePathArr)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
+            errorMessage = "No valid CAD file paths were supplied for Sync Status."
+            Return Nothing
+        End If
+
+        Try
+            Dim allEntries As New List(Of SVNStatus.filePpty)()
+
+            For Each chunk As String() In chunkFilePathsForBackground(filteredPaths, 50)
+                Dim ownersByPath As Dictionary(Of String, String) = getSvnLockOwnersForPathsBackground(chunk, savedPathForBackground)
+                Dim releaseByPath As Dictionary(Of String, String) = getReleasePropertiesForPathsBackground(chunk, savedPathForBackground)
+
+                Dim args As String = "status -vu --non-interactive " & quoteFilePathArgs(chunk)
+                Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(sSVNPath, args, savedPathForBackground)
+
+                If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                    errorMessage = statusResult.outputError.Trim()
+                    Return Nothing
+                End If
+
+                If statusResult.output Is Nothing Then Continue For
+
+                Dim lines() As String = statusResult.output.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
+
+                For Each line As String In lines
+                    If String.IsNullOrWhiteSpace(line) Then Continue For
+                    If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+                    Dim matchedPath As String = findMatchingTargetPathInStatusLine(line, chunk)
+                    If String.IsNullOrWhiteSpace(matchedPath) Then Continue For
+
+                    Dim fp As New SVNStatus.filePpty()
+                    fp.filename = matchedPath
+                    fp.modDoc = Nothing
+                    fp.bReconnect = False
+                    fp.revertUpdate = getLatestType.none
+                    fp.addDelChg1 = getStatusColumn(line, 0)
+                    fp.pptyMods2 = getStatusColumn(line, 1)
+                    fp.workingDirLock3 = getStatusColumn(line, 2)
+                    fp.addWithHist4 = getStatusColumn(line, 3)
+                    fp.switchWParent5 = getStatusColumn(line, 4)
+                    fp.lock6 = getStatusColumn(line, 5)
+                    fp.tree7 = getStatusColumn(line, 6)
+                    fp.upToDate9 = getStatusColumn(line, 8)
+                    fp.lockOwner = ""
+                    fp.released = ""
+
+                    If ownersByPath IsNot Nothing Then
+                        Dim owner As String = ""
+                        If ownersByPath.TryGetValue(normalizeSvnPath(matchedPath), owner) Then
+                            fp.lockOwner = owner
+                        End If
+                    End If
+
+                    If releaseByPath IsNot Nothing Then
+                        Dim releaseState As String = ""
+                        If releaseByPath.TryGetValue(normalizeSvnPath(matchedPath), releaseState) Then
+                            fp.released = releaseState
+                        End If
+                    End If
+
+                    allEntries.Add(fp)
+                Next
+            Next
+
+            Dim serverStatus As New SVNStatus()
+
+            If allEntries.Count = 0 Then
+                serverStatus.fp = Nothing
+            Else
+                serverStatus.fp = allEntries.ToArray()
+            End If
+
+            Return serverStatus
+
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return Nothing
+        End Try
+    End Function
+
+    Public Sub applyServerStatusFromBackgroundPublic(ByVal serverStatus As SVNStatus)
+        If serverStatus Is Nothing Then Exit Sub
+
+        Try
+            statusOfAllOpenModels = serverStatus.Clone
+            rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+        Catch
+        End Try
+
+        Try
+            If myUserControl IsNot Nothing Then
+                myUserControl.statusOfAllOpenModels = statusOfAllOpenModels
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Function chunkFilePathsForBackground(ByVal filePaths() As String,
+                                                 Optional ByVal chunkSize As Integer = 50) As List(Of String())
+        Dim chunks As New List(Of String())()
+
+        If filePaths Is Nothing Then Return chunks
+        If chunkSize <= 0 Then chunkSize = 50
+
+        Dim current As New List(Of String)()
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            current.Add(filePath)
+
+            If current.Count >= chunkSize Then
+                chunks.Add(current.ToArray())
+                current.Clear()
+            End If
+        Next
+
+        If current.Count > 0 Then chunks.Add(current.ToArray())
+
+        Return chunks
+    End Function
+
+    Private Function getStatusColumn(ByVal statusLine As String, ByVal index As Integer) As String
+        If statusLine Is Nothing Then Return " "
+        If statusLine.Length <= index Then Return " "
+        Return statusLine.Substring(index, 1)
+    End Function
+
+    Private Function findMatchingTargetPathInStatusLine(ByVal statusLine As String,
+                                                        ByVal targetPaths() As String) As String
+        If String.IsNullOrWhiteSpace(statusLine) Then Return ""
+        If targetPaths Is Nothing Then Return ""
+
+        Dim orderedPaths = targetPaths.
+            Where(Function(p) Not String.IsNullOrWhiteSpace(p)).
+            OrderByDescending(Function(p) p.Length)
+
+        For Each targetPath As String In orderedPaths
+            If statusLine.IndexOf(targetPath, StringComparison.OrdinalIgnoreCase) >= 0 Then
+                Return targetPath
+            End If
+        Next
+
+        Return ""
+    End Function
+
+    Private Function getSvnLockOwnersForPathsBackground(ByVal filePaths() As String,
+                                                        ByVal savedPathForBackground As String) As Dictionary(Of String, String)
+        Dim lockOwners As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Return lockOwners
+
+        Try
+            Dim xmlStatus As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                "status -u --xml --non-interactive " & quoteFilePathArgs(filePaths),
+                savedPathForBackground
+            )
+
+            If xmlStatus.output Is Nothing Then Return lockOwners
+            If xmlStatus.outputError IsNot Nothing AndAlso xmlStatus.outputError.Trim() <> "" Then Return lockOwners
+            If xmlStatus.output.Trim() = "" Then Return lockOwners
+
+            Dim doc As New XmlDocument()
+            doc.LoadXml(xmlStatus.output)
+
+            Dim entries As XmlNodeList = doc.SelectNodes("/status/target/entry")
+
+            For Each entry As XmlNode In entries
+                If entry.Attributes Is Nothing Then Continue For
+                If entry.Attributes("path") Is Nothing Then Continue For
+
+                Dim entryPath As String = entry.Attributes("path").Value
+                Dim ownerNode As XmlNode = entry.SelectSingleNode("repos-status/lock/owner")
+
+                If ownerNode Is Nothing Then
+                    ownerNode = entry.SelectSingleNode("wc-status/lock/owner")
+                End If
+
+                If ownerNode Is Nothing Then Continue For
+
+                Dim owner As String = ownerNode.InnerText.Trim()
+                If owner = "" Then Continue For
+
+                lockOwners(normalizeSvnPath(entryPath)) = owner
+            Next
+        Catch
+        End Try
+
+        Return lockOwners
+    End Function
+
+    Private Function getReleasePropertiesForPathsBackground(ByVal filePaths() As String,
+                                                            ByVal savedPathForBackground As String) As Dictionary(Of String, String)
+        Dim releaseByPath As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Return releaseByPath
+
+        Try
+            Dim propResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                "propget addin:release_state --xml " & quoteFilePathArgs(filePaths),
+                savedPathForBackground
+            )
+
+            If propResult.output Is Nothing Then Return releaseByPath
+            If propResult.outputError IsNot Nothing AndAlso propResult.outputError.Trim() <> "" Then Return releaseByPath
+            If propResult.output.Trim() = "" Then Return releaseByPath
+
+            Dim doc As New XmlDocument()
+            doc.LoadXml(propResult.output)
+
+            Dim targets As XmlNodeList = doc.SelectNodes("/properties/target")
+
+            For Each target As XmlNode In targets
+                If target.Attributes Is Nothing Then Continue For
+                If target.Attributes("path") Is Nothing Then Continue For
+
+                Dim targetPath As String = target.Attributes("path").Value
+                Dim propertyNode As XmlNode = target.SelectSingleNode("property")
+
+                If propertyNode Is Nothing Then Continue For
+
+                releaseByPath(normalizeSvnPath(targetPath)) = propertyNode.InnerText.Trim()
+            Next
+        Catch
+        End Try
+
+        Return releaseByPath
+    End Function
+
     Function verifyCommandArgumentLength(input As String, Optional bVerbose As Boolean = False) As Boolean
         If input Is Nothing Then Return False
         If input.Length > (32768 - 1) Then
@@ -969,6 +1509,76 @@ Public Module svnModule
         System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
         Return output
     End Function
+
+    Private Function runSvnProcessBackgroundNoUi(ByVal filename As String,
+                                                 ByVal arguments As String,
+                                                 ByVal savedPathForBackground As String) As rawProcessReturn
+        Dim output As New rawProcessReturn()
+
+        Try
+            If String.IsNullOrWhiteSpace(filename) Then
+                output.output = ""
+                output.outputError = "SVN executable path is blank."
+                Return output
+            End If
+
+            If arguments Is Nothing Then
+                output.output = ""
+                output.outputError = "SVN arguments are blank."
+                Return output
+            End If
+
+            If Not verifyCommandArgumentLength(arguments) Then
+                output.output = ""
+                output.outputError = "SVN command was too long for Windows command-line limits."
+                Return output
+            End If
+
+            Dim p As New Process()
+            Dim startInfo As New ProcessStartInfo()
+
+            startInfo.FileName = filename
+            startInfo.Arguments = arguments
+            startInfo.UseShellExecute = False
+            startInfo.RedirectStandardOutput = True
+            startInfo.RedirectStandardError = True
+            startInfo.CreateNoWindow = True
+
+            Try
+                startInfo.EnvironmentVariables.Remove("SVN_SSH")
+            Catch
+            End Try
+
+            Try
+                If Not String.IsNullOrWhiteSpace(savedPathForBackground) Then
+                    startInfo.EnvironmentVariables("PATH") = savedPathForBackground
+                End If
+            Catch
+            End Try
+
+            p.StartInfo = startInfo
+            p.Start()
+
+            output.output = p.StandardOutput.ReadToEnd()
+            output.outputError = p.StandardError.ReadToEnd()
+
+            If Not p.WaitForExit(120000) Then
+                Try
+                    p.Kill()
+                Catch
+                End Try
+
+                output.outputError = "SVN command timed out while running in the background."
+            End If
+
+            Return output
+
+        Catch ex As Exception
+            output.output = ""
+            output.outputError = ex.Message
+            Return output
+        End Try
+    End Function
     Sub myUnlockWithDependents(modDoc As ModelDoc2)
 
         'Dim modDoc() As ModelDoc2 = {iSwApp.ActiveDoc()}
@@ -1011,9 +1621,7 @@ Public Module svnModule
             i += 1
         Next
 
-        updateLockStatusPublic(bRefreshAllTreeViews:=True)
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
-        statusOfAllOpenModels.setReadWriteFromLockStatus()
+        refreshActiveTreeAfterSvnAction()
 
         If Not bGotLockArr.All(Function(b) b) Then
             iSwApp.SendMsgToUser("Unable to Get locks on following Files: " & vbCrLf & sFails)
@@ -1134,10 +1742,7 @@ Public Module svnModule
             End If
         End If
 
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
-        updateLockStatusPublic(bRefreshAllTreeViews:=True)
-        statusOfAllOpenModels.setReadWriteFromLockStatus()
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+        refreshActiveTreeAfterSvnAction()
 
         'Message User
         If bSuccess1 Then
@@ -1318,6 +1923,14 @@ Public Module svnModule
         "^GRC27_(BR|DT|AE|FR|EL|ST|SU|WT|MI)_[A-Z]{0,3}\d+_R\d+\.(SLDPRT|SLDASM|SLDDRW)$",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase
     )
+    End Function
+
+    Private Function shouldIgnoreGrc27NamingConventionForDebug() As Boolean
+        Try
+            Return myUserControl IsNot Nothing AndAlso myUserControl.debugIgnoreNamingConventionEnabled()
+        Catch
+            Return False
+        End Try
     End Function
 
     Private Function promptForValidGrc27FileName(originalPath As String) As String
@@ -1616,10 +2229,15 @@ Public Module svnModule
 
             Try
                 If myUserControl IsNot Nothing Then
-                    myUserControl.refreshAllTreeViewsVariable()
-                    myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+                    myUserControl.refreshCurrentTreeViewOnly()
                 End If
             Catch
+                Try
+                    If myUserControl IsNot Nothing Then
+                        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+                    End If
+                Catch
+                End Try
             End Try
 
             iSwApp.SendMsgToUser2(
@@ -1733,6 +2351,11 @@ Public Module svnModule
 
             If String.IsNullOrWhiteSpace(docPath) Then Continue For
             If Not isCadFilePath(docPath) Then Continue For
+
+            'Debug override:
+            'Used only for testing/import cleanup. It bypasses the GRC27 naming convention prompt,
+            'but still keeps duplicate checks, repo checks, add/commit behavior, etc.
+            If shouldIgnoreGrc27NamingConventionForDebug() Then Continue For
 
             'External/vendor refs already handled during this commit should not be forced through normal naming.
             If shouldSkipNameCheckForPendingExternalRef(docPath) Then Continue For
@@ -2374,27 +2997,29 @@ Public Module svnModule
         Return True
     End Function
 
-    Function commitAllowedOnlyIfUpToDate(ByRef modDocArr() As ModelDoc2) As Boolean
+    Function commitAllowedOnlyIfUpToDate(ByRef modDocArr() As ModelDoc2, Optional bIncludeDependents As Boolean = False) As Boolean
         If modDocArr Is Nothing Then Return False
         If modDocArr.Length = 0 Then Return False
 
         Dim modDocArrToCheckForLatest As ModelDoc2() = modDocArr
 
-        Try
-            For Each docToCheck As ModelDoc2 In modDocArr
-                If docToCheck Is Nothing Then Continue For
+        If bIncludeDependents Then
+            Try
+                For Each docToCheck As ModelDoc2 In modDocArr
+                    If docToCheck Is Nothing Then Continue For
 
-                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    modDocArrToCheckForLatest = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                    modDocArr,
-                    bResolveLightweight:=True
-                )
-                    Exit For
-                End If
-            Next
-        Catch
-            modDocArrToCheckForLatest = modDocArr
-        End Try
+                    If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                        modDocArrToCheckForLatest = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                        modDocArr,
+                        bResolveLightweight:=True
+                    )
+                        Exit For
+                    End If
+                Next
+            Catch
+                modDocArrToCheckForLatest = modDocArr
+            End Try
+        End If
 
         If modDocArrToCheckForLatest Is Nothing Then modDocArrToCheckForLatest = modDocArr
 
@@ -2474,7 +3099,132 @@ Public Module svnModule
         myGetLatestOrRevert(modDocArr, getLatestType.revert)
 
     End Sub
-    Sub tortCommitDocs(ByRef modDocArr() As ModelDoc2, Optional sCommitMessage As String = "")
+    Private Function isFirstCommitCandidatePath(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+        If Not isCadFilePath(filePath) Then Return False
+        If Not isPathInsideLocalRepo(filePath) Then Return False
+
+        Try
+            Dim statusChar As Char = getFirstSvnStatusChar(filePath)
+
+            '? = unversioned inside working copy
+            'A = scheduled for add but never committed at this path
+            Return statusChar = "?"c OrElse statusChar = "A"c
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function allCommitPathsAreFirstCommitCandidates(ByVal commitPaths() As String) As Boolean
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        For Each p As String In commitPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+
+            If Not isFirstCommitCandidatePath(p) Then
+                Return False
+            End If
+        Next
+
+        Return True
+    End Function
+
+    Private Function autoCommitFirstDatasetPaths(ByVal commitPaths() As String, ByVal sCommitMessage As String) As Boolean
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        Dim safeMessage As String = sCommitMessage
+
+        If String.IsNullOrWhiteSpace(safeMessage) Then
+            safeMessage = "Initial CAD commit from SolidWorks SVN add-in"
+        End If
+
+        safeMessage = safeMessage.Replace("""", "'")
+
+        Try
+            Dim processOutputArr() As rawProcessReturn = runSvnByArgs(
+                commitPaths,
+                "commit --non-interactive",
+                "-m",
+                """" & safeMessage & """",
+                bEach:=False
+            )
+
+            If processOutputArr Is Nothing OrElse processOutputArr.Length = 0 Then Return False
+
+            For Each processOutput As rawProcessReturn In processOutputArr
+                If processOutput.outputError IsNot Nothing AndAlso processOutput.outputError.Trim() <> "" Then
+                    iSwApp.SendMsgToUser2(
+                        "Automatic first commit failed." & vbCrLf & vbCrLf &
+                        processOutput.outputError.Trim() & vbCrLf & vbCrLf &
+                        "The plugin will open the normal TortoiseSVN commit window instead.",
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                    Return False
+                End If
+            Next
+
+            iSwApp.SendMsgToUser2(
+                "Initial commit completed." & vbCrLf & vbCrLf &
+                "The new CAD dataset was added and pushed to SVN automatically.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+
+            Return True
+
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+                "Automatic first commit failed." & vbCrLf & vbCrLf &
+                ex.Message & vbCrLf & vbCrLf &
+                "The plugin will open the normal TortoiseSVN commit window instead.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return False
+        End Try
+    End Function
+
+    Private Function tryMakeFirstCommitDocWritable(ByVal doc As ModelDoc2) As Boolean
+        If doc Is Nothing Then Return False
+
+        Dim docPath As String = ""
+
+        Try
+            docPath = doc.GetPathName()
+        Catch
+            docPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(docPath) Then Return False
+        If Not isFirstCommitCandidatePath(docPath) Then Return False
+
+        Try
+            File.SetAttributes(docPath, File.GetAttributes(docPath) And Not FileAttributes.ReadOnly)
+        Catch
+        End Try
+
+        Try
+            doc.SetReadOnlyState(False)
+        Catch
+        End Try
+
+        Return True
+    End Function
+
+    Private Sub makeFirstCommitCandidatesWritable(ByRef modDocArr() As ModelDoc2)
+        If modDocArr Is Nothing Then Exit Sub
+
+        For Each doc As ModelDoc2 In modDocArr
+            Try
+                tryMakeFirstCommitDocWritable(doc)
+            Catch
+            End Try
+        Next
+    End Sub
+
+    Sub tortCommitDocs(ByRef modDocArr() As ModelDoc2, Optional sCommitMessage As String = "", Optional bIncludeDependents As Boolean = False)
         Dim bSuccess As Boolean = False
         Dim sErrorFiles As String = ""
         Dim i As Integer
@@ -2496,65 +3246,101 @@ Public Module svnModule
 
         Dim docsForExternalRefCheck As ModelDoc2() = modDocArr
 
-        Try
-            For Each docToCheck As ModelDoc2 In modDocArr
-                If docToCheck Is Nothing Then Continue For
-                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    docsForExternalRefCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                modDocArr,
-                bResolveLightweight:=True
-            )
-                    Exit For
-                End If
-            Next
-        Catch
-            docsForExternalRefCheck = modDocArr
-        End Try
+        If bIncludeDependents Then
+            Try
+                For Each docToCheck As ModelDoc2 In modDocArr
+                    If docToCheck Is Nothing Then Continue For
+                    If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                        docsForExternalRefCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                    modDocArr,
+                    bResolveLightweight:=True
+                )
+                        Exit For
+                    End If
+                Next
+            Catch
+                docsForExternalRefCheck = modDocArr
+            End Try
+        End If
 
         If Not activeAssemblyMustBeLockedForReferenceChanges() Then Exit Sub
 
         If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
 
-        'After external/vendor CAD is copied and relinked, rebuild the commit array.
-        'This makes sure newly copied SVN files are included in the commit.
-        Try
-            For Each docToCheck As ModelDoc2 In modDocArr
-                If docToCheck Is Nothing Then Continue For
+        'After external/vendor CAD is copied and relinked, rebuild the commit array only for the explicit
+        'With Dependents path. Normal assembly commit stays assembly-file-only for speed.
+        If bIncludeDependents Then
+            Try
+                For Each docToCheck As ModelDoc2 In modDocArr
+                    If docToCheck Is Nothing Then Continue For
 
-                If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    modDocArr = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                modDocArr,
-                bResolveLightweight:=True
-            )
-                    Exit For
-                End If
-            Next
-        Catch
-        End Try
+                    If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                        modDocArr = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                    modDocArr,
+                    bResolveLightweight:=True
+                )
+                        Exit For
+                    End If
+                Next
+            Catch
+            End Try
+        End If
 
         If Not validateCadNamesBeforeCommit(modDocArr) Then Exit Sub
 
         Dim docsForDuplicateCheck As ModelDoc2() = modDocArr
 
-        Try
-            For Each d As ModelDoc2 In modDocArr
-                If d IsNot Nothing AndAlso d.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    docsForDuplicateCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                modDocArr,
-                bResolveLightweight:=True
-            )
-                    Exit For
-                End If
-            Next
-        Catch
-            docsForDuplicateCheck = modDocArr
-        End Try
+        If bIncludeDependents Then
+            Try
+                For Each d As ModelDoc2 In modDocArr
+                    If d IsNot Nothing AndAlso d.GetType = swDocumentTypes_e.swDocASSEMBLY Then
+                        docsForDuplicateCheck = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
+                    modDocArr,
+                    bResolveLightweight:=True
+                )
+                        Exit For
+                    End If
+                Next
+            Catch
+                docsForDuplicateCheck = modDocArr
+            End Try
+        End If
 
         If Not validateNoDuplicateCadFileNames(docsForDuplicateCheck) Then Exit Sub
-        If Not commitAllowedOnlyIfUpToDate(modDocArr) Then Exit Sub
+        If Not commitAllowedOnlyIfUpToDate(modDocArr, bIncludeDependents:=bIncludeDependents) Then Exit Sub
 
-        'Filter out read-only files
+        'First-commit CAD files are not lockable yet because SVN does not know them until add/commit.
+        'Make them writable before the normal read-only filter runs.
+        makeFirstCommitCandidatesWritable(modDocArr)
+
+        'Filter out read-only files.
+        'Exception: brand-new first-commit CAD cannot be locked yet, so keep it in the commit list
+        'after forcing it writable. This is what allows initial datasets to commit without Get Locks.
         For i = 0 To UBound(modDocArr)
+            If modDocArr(i) Is Nothing Then
+                j += 1
+                Continue For
+            End If
+
+            Dim currentCommitDocPath As String = ""
+
+            Try
+                currentCommitDocPath = modDocArr(i).GetPathName()
+            Catch
+                currentCommitDocPath = ""
+            End Try
+
+            If isFirstCommitCandidatePath(currentCommitDocPath) Then
+                tryMakeFirstCommitDocWritable(modDocArr(i))
+
+                If modDocArr(i).IsOpenedViewOnly() Then
+                    modDocArr(i) = Nothing
+                    j += 1
+                End If
+
+                Continue For
+            End If
+
             If modDocArr(i).IsOpenedReadOnly() Or modDocArr(i).IsOpenedViewOnly() Then
 
                 'If bRequiredDoc(i) Then
@@ -2615,25 +3401,555 @@ Public Module svnModule
             Exit Sub
         End If
 
-        runSvnByArgs(sModDocPathArr, "add", bEach:=True)  'adds any not added. 
+        runSvnByArgs(sModDocPathArr, "add", bEach:=True)  'adds any not added.
+
+        Dim bAutoFirstCommitDataset As Boolean = allCommitPathsAreFirstCommitCandidates(sModDocPathArr)
+
         svnPropset(sModDocPathArr, "addin:release_state", "||EDIT||")
 
         If save3AndShowErrorMessages(modDocArr) <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
 
-        bSuccess = runTortoiseProcexeWithMonitor("/command:commit /path:" &
-                                         formatFilePathArrForProc(
-                                            sModDocPathArr) & " /logmsg:""" & sCommitMessage & """" & " /closeonend:3")
-        If Not bSuccess Then iSwApp.SendMsgToUser("Tortoise App Failed.") : Exit Sub
-
-        'If Filter() files -> any In list have 'unknown' status before, then call server for updates.
-
-        bSuccess = updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True)
-        If Not bSuccess Then Exit Sub
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
-        statusOfAllOpenModels.setReadWriteFromLockStatus()
+        'Run the upload/commit portion in the background so SolidWorks stays usable.
+        'All SolidWorks API work above this point has already finished on the main thread.
+        startCommitProcessBackground(sModDocPathArr, sCommitMessage, bAutoFirstCommitDataset)
+        Exit Sub
     End Sub
+    Public Sub tortCommitPathsAsync(ByVal commitPaths() As String, Optional sCommitMessage As String = "")
+        'Path-first commit used by the add-in tree.
+        'This lets a user commit the selected child part without requiring the parent assembly
+        'to be checked out, as long as the child itself is valid/current/writable.
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No CAD file paths were selected for Commit.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If asyncCommitInProgress Then
+            iSwApp.SendMsgToUser2("A Commit operation is already running in the background.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim sModDocPathArr() As String = filterCommitPathsInsideRepoOnly(commitPaths)
+
+        If sModDocPathArr Is Nothing OrElse sModDocPathArr.Length = 0 Then
+            iSwApp.SendMsgToUser2(
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "No valid SVN working-copy CAD paths were available to commit.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Exit Sub
+        End If
+
+        If Not validateCadPathNamesBeforeCommit(sModDocPathArr) Then Exit Sub
+        If Not validateNoDuplicateCadFileNamesForPaths(sModDocPathArr) Then Exit Sub
+        If Not commitPathsAllowedOnlyIfUpToDate(sModDocPathArr) Then Exit Sub
+
+        makeFirstCommitCandidatePathsWritable(sModDocPathArr)
+
+        runSvnByArgs(sModDocPathArr, "add", bEach:=True)
+
+        Dim bAutoFirstCommitDataset As Boolean = allCommitPathsAreFirstCommitCandidates(sModDocPathArr)
+
+        svnPropset(sModDocPathArr, "addin:release_state", "||EDIT||")
+
+        If Not saveOpenDocsForCommitPaths(sModDocPathArr) Then Exit Sub
+
+        warnIfActiveAssemblyDirtyButNotInCommit(sModDocPathArr)
+
+        startCommitProcessBackground(sModDocPathArr, sCommitMessage, bAutoFirstCommitDataset)
+    End Sub
+
+    Private Function validateNoDuplicateCadFileNamesForPaths(ByVal filePaths() As String) As Boolean
+        If filePaths Is Nothing Then Return True
+
+        Dim seenNames As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+        Dim duplicateMsg As String = ""
+
+        For Each docPath As String In filePaths
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+            If Not isCadFilePath(docPath) Then Continue For
+
+            Dim fileName As String = Path.GetFileName(docPath)
+
+            If seenNames.ContainsKey(fileName) Then
+                duplicateMsg &= fileName & vbCrLf &
+                            "1) " & seenNames(fileName) & vbCrLf &
+                            "2) " & docPath & vbCrLf & vbCrLf
+            Else
+                seenNames(fileName) = docPath
+            End If
+        Next
+
+        If duplicateMsg <> "" Then
+            iSwApp.SendMsgToUser2(
+            "Commit blocked." & vbCrLf & vbCrLf &
+            "Duplicate CAD file names were found in this commit." & vbCrLf &
+            "Each CAD file must have a unique file name." & vbCrLf & vbCrLf &
+            duplicateMsg &
+            "Rename one of the duplicate files before committing.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+            Return False
+        End If
+
+        Return True
+    End Function
+
+    Private Function validateCadPathNamesBeforeCommit(ByRef filePaths() As String) As Boolean
+        If filePaths Is Nothing Then Return True
+
+        For i As Integer = 0 To UBound(filePaths)
+            Dim docPath As String = filePaths(i)
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+            If Not isCadFilePath(docPath) Then Continue For
+
+            If shouldIgnoreGrc27NamingConventionForDebug() Then Continue For
+            If shouldSkipNameCheckForPendingExternalRef(docPath) Then Continue For
+            If isVendorPartPath(docPath) Then Continue For
+
+            If Not isValidGrc27FileName(docPath) Then
+                Dim openDoc As ModelDoc2 = getOpenModelByPathSafe(docPath)
+
+                If openDoc IsNot Nothing Then
+                    Dim result As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+                        "This CAD file does not follow the GRC27 naming convention:" & vbCrLf & vbCrLf &
+                        Path.GetFileName(docPath) & vbCrLf & vbCrLf &
+                        "Would you like to rename it now?",
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbYesNo
+                    )
+
+                    If result <> swMessageBoxResult_e.swMbHitYes Then Return False
+                    If Not renameCadFileToGrc27Name(openDoc) Then Return False
+
+                    Try
+                        filePaths(i) = openDoc.GetPathName()
+                    Catch
+                    End Try
+                Else
+                    iSwApp.SendMsgToUser2(
+                        "Commit blocked." & vbCrLf & vbCrLf &
+                        "This CAD file does not follow the GRC27 naming convention:" & vbCrLf & vbCrLf &
+                        Path.GetFileName(docPath) & vbCrLf & vbCrLf &
+                        "Open the file and rename it, or enable Debug: ignore naming for testing.",
+                        swMessageBoxIcon_e.swMbStop,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                    Return False
+                End If
+            End If
+        Next
+
+        filePaths = filterCommitPathsInsideRepoOnly(filePaths)
+        Return filePaths IsNot Nothing AndAlso filePaths.Length > 0
+    End Function
+
+    Private Function commitPathsAllowedOnlyIfUpToDate(ByVal commitPaths() As String) As Boolean
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        Dim statusForCommitCheck As SVNStatus = getFileSVNStatus(
+            bCheckServer:=True,
+            modDocArr:=Nothing,
+            bUpdateStatusOfAllOpenModels:=False,
+            sDirectFilePathArr:=commitPaths
+        )
+
+        If statusForCommitCheck Is Nothing Then
+            iSwApp.SendMsgToUser2(
+            "Commit blocked. Could not verify latest SVN status.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+            Return False
+        End If
+
+        Dim outOfDateFiles As String() = statusForCommitCheck.sFilterUpToDate9("*")
+
+        If outOfDateFiles IsNot Nothing Then
+            Dim msg As String =
+            "Commit blocked." & vbCrLf & vbCrLf &
+            "The selected file is out of date." & vbCrLf & vbCrLf &
+            "Use Get Latest, confirm the geometry, then commit again." & vbCrLf & vbCrLf &
+            "Out-of-date files:" & vbCrLf &
+            stringArrToSingleStringWithNewLines(outOfDateFiles, bTrimFileNames:=True, iLimit:=10)
+
+            iSwApp.SendMsgToUser2(
+            msg,
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+            Return False
+        End If
+
+        Return True
+    End Function
+
+    Private Sub makeFirstCommitCandidatePathsWritable(ByVal commitPaths() As String)
+        If commitPaths Is Nothing Then Exit Sub
+
+        For Each p As String In commitPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+            If Not isFirstCommitCandidatePath(p) Then Continue For
+
+            Try
+                If File.Exists(p) Then
+                    File.SetAttributes(p, File.GetAttributes(p) And Not FileAttributes.ReadOnly)
+                End If
+            Catch
+            End Try
+
+            Try
+                Dim doc As ModelDoc2 = getOpenModelByPathSafe(p)
+                If doc IsNot Nothing Then doc.SetReadOnlyState(False)
+            Catch
+            End Try
+        Next
+    End Sub
+
+    Private Function saveOpenDocsForCommitPaths(ByVal commitPaths() As String) As Boolean
+        If commitPaths Is Nothing Then Return True
+
+        For Each p As String In commitPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+
+            Dim doc As ModelDoc2 = getOpenModelByPathSafe(p)
+            If doc Is Nothing Then Continue For
+
+            Try
+                Dim errors As Integer = 0
+                Dim warnings As Integer = 0
+
+                If Not doc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, errors, warnings) Then
+                    iSwApp.SendMsgToUser2(
+                        "Commit blocked." & vbCrLf & vbCrLf &
+                        "Could not save the selected CAD file before commit:" & vbCrLf &
+                        p & vbCrLf & vbCrLf &
+                        "Make sure the file is locked by you and writable, then try again.",
+                        swMessageBoxIcon_e.swMbStop,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                    Return False
+                End If
+            Catch ex As Exception
+                iSwApp.SendMsgToUser2(
+                    "Commit blocked." & vbCrLf & vbCrLf &
+                    "Could not save the selected CAD file before commit:" & vbCrLf &
+                    p & vbCrLf & vbCrLf &
+                    ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End Try
+        Next
+
+        Return True
+    End Function
+
+    Private Sub warnIfActiveAssemblyDirtyButNotInCommit(ByVal commitPaths() As String)
+        Try
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc Is Nothing Then Exit Sub
+            If activeDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Exit Sub
+            If Not activeDoc.GetSaveFlag() Then Exit Sub
+
+            Dim activePath As String = activeDoc.GetPathName()
+            If String.IsNullOrWhiteSpace(activePath) Then Exit Sub
+
+            For Each p As String In commitPaths
+                If pathsAreSame(activePath, p) Then Exit Sub
+            Next
+
+            iSwApp.SendMsgToUser2(
+                "Child file commit started." & vbCrLf & vbCrLf &
+                "Note: the parent assembly still has unsaved changes. The child can be committed separately, but commit/check out the parent assembly only if you intentionally changed assembly-level mates, positions, references, or display/config state.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+        Catch
+        End Try
+    End Sub
+
+    Sub tortCommitDocsAsync(ByRef modDocArr() As ModelDoc2, Optional sCommitMessage As String = "", Optional bIncludeDependents As Boolean = False)
+        'Fast normal commit path:
+        'For normal Commit, do not run the heavier document/dependency workflow.
+        'Convert the selected/open documents to file paths and use the path-first async commit.
+        'The explicit Commit With Dependents command still uses the heavier synchronous preparation path.
+        If bIncludeDependents Then
+            tortCommitDocs(modDocArr, sCommitMessage, bIncludeDependents:=True)
+            Exit Sub
+        End If
+
+        Dim commitPaths() As String = Nothing
+
+        Try
+            commitPaths = getFilePathsFromModDocArr(modDocArr)
+        Catch
+            commitPaths = Nothing
+        End Try
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No CAD file paths were selected for Commit.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        tortCommitPathsAsync(commitPaths, sCommitMessage)
+    End Sub
+
+    Private Sub startCommitProcessBackground(ByVal commitPaths() As String,
+                                             ByVal sCommitMessage As String,
+                                             ByVal bAutoFirstCommitDataset As Boolean)
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Exit Sub
+
+        If asyncCommitInProgress Then
+            iSwApp.SendMsgToUser2("A Commit operation is already running in the background.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim pathsForBackground() As String = CType(commitPaths.Clone(), String())
+        Dim savedPathForBackground As String = ""
+        Dim repoRootForBackground As String = ""
+        Dim tortoiseArgs As String = ""
+        Dim commitMessageForBackground As String = sCommitMessage
+
+        Try
+            savedPathForBackground = myUserControl.savedPATH
+        Catch
+            savedPathForBackground = ""
+        End Try
+
+        Try
+            repoRootForBackground = myUserControl.localRepoPath.Text
+        Catch
+            repoRootForBackground = ""
+        End Try
+
+        Try
+            tortoiseArgs = "/command:commit /path:" &
+                formatFilePathArrForProc(pathsForBackground) &
+                " /logmsg:""" & commitMessageForBackground.Replace("""", "'") & """" &
+                " /closeonend:3"
+        Catch
+            tortoiseArgs = ""
+        End Try
+
+        asyncCommitInProgress = True
+
+        Try
+            myUserControl.markCommitPendingForFilePathsPublic(pathsForBackground, True, "Committing...")
+        Catch
+        End Try
+
+        Task.Run(Sub()
+                     Dim success As Boolean = False
+                     Dim errorMessage As String = ""
+
+                     Try
+                         If bAutoFirstCommitDataset Then
+                             success = autoCommitFirstDatasetPathsBackground(pathsForBackground, commitMessageForBackground, savedPathForBackground, errorMessage)
+                         Else
+                             success = runTortoiseProcBackgroundNoUi(tortoiseArgs, repoRootForBackground, errorMessage)
+                         End If
+
+                         If success Then
+                             For Each commitPath As String In pathsForBackground
+                                 Try
+                                     If File.Exists(commitPath) Then
+                                         File.SetAttributes(commitPath, File.GetAttributes(commitPath) Or FileAttributes.ReadOnly)
+                                     End If
+                                 Catch
+                                 End Try
+                             Next
+                         End If
+
+                     Catch ex As Exception
+                         success = False
+                         errorMessage = ex.Message
+                     End Try
+
+                     Try
+                         If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                             myUserControl.BeginInvoke(New MethodInvoker(Sub() finishCommitProcessOnMainThread(pathsForBackground, success, errorMessage, bAutoFirstCommitDataset)))
+                         Else
+                             asyncCommitInProgress = False
+                         End If
+                     Catch
+                         asyncCommitInProgress = False
+                     End Try
+                 End Sub)
+    End Sub
+
+    Private Sub finishCommitProcessOnMainThread(ByVal commitPaths() As String,
+                                                ByVal success As Boolean,
+                                                ByVal errorMessage As String,
+                                                ByVal bAutoFirstCommitDataset As Boolean)
+        asyncCommitInProgress = False
+
+        Try
+            myUserControl.markCommitPendingForFilePathsPublic(commitPaths, False)
+        Catch
+        End Try
+
+        If Not success Then
+            iSwApp.SendMsgToUser2("Commit did not complete." & vbCrLf & vbCrLf & errorMessage,
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Try
+            myUserControl.markCommitResultForFilePathsPublic(commitPaths, True)
+        Catch
+        End Try
+
+        Try
+            If bAutoFirstCommitDataset Then
+                iSwApp.SendMsgToUser2("Initial commit completed." & vbCrLf & vbCrLf &
+                    "The new CAD dataset was added and pushed to SVN automatically.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk)
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Function autoCommitFirstDatasetPathsBackground(ByVal commitPaths() As String,
+                                                           ByVal sCommitMessage As String,
+                                                           ByVal savedPathForBackground As String,
+                                                           ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then
+            errorMessage = "No commit paths were supplied."
+            Return False
+        End If
+
+        Dim safeMessage As String = sCommitMessage
+
+        If String.IsNullOrWhiteSpace(safeMessage) Then
+            safeMessage = "Initial CAD commit from SolidWorks SVN add-in"
+        End If
+
+        safeMessage = safeMessage.Replace("""", "'")
+
+        Try
+            Dim commitResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                "commit --non-interactive -m """ & safeMessage & """ " & quoteFilePathArgs(commitPaths),
+                savedPathForBackground
+            )
+
+            If commitResult.outputError IsNot Nothing AndAlso commitResult.outputError.Trim() <> "" Then
+                errorMessage = commitResult.outputError.Trim()
+                Return False
+            End If
+
+            Return True
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return False
+        End Try
+    End Function
+
+    Private Function runTortoiseProcBackgroundNoUi(ByVal arguments As String,
+                                                   ByVal repoRoot As String,
+                                                   ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        Try
+            If String.IsNullOrWhiteSpace(sTortPath) Then
+                errorMessage = "TortoiseProc.exe path is blank."
+                Return False
+            End If
+
+            If String.IsNullOrWhiteSpace(arguments) Then
+                errorMessage = "TortoiseSVN arguments are blank."
+                Return False
+            End If
+
+            If arguments.Length > (32768 - 1) Then
+                errorMessage = "Too many files were sent to TortoiseSVN. Use Windows Explorer/TortoiseSVN for this large commit."
+                Return False
+            End If
+
+            Dim p As New Process()
+            Dim startInfo As New ProcessStartInfo()
+            startInfo.FileName = sTortPath
+            startInfo.Arguments = arguments
+            startInfo.UseShellExecute = True
+
+            If Not String.IsNullOrWhiteSpace(repoRoot) Then
+                startInfo.WorkingDirectory = repoRoot
+            End If
+
+            p.StartInfo = startInfo
+            p.Start()
+
+            Do While Not p.HasExited
+                System.Threading.Thread.Sleep(50)
+            Loop
+
+            Return True
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return False
+        End Try
+    End Function
+
     Public Sub externalSetReadWriteFromLockStatus()
         statusOfAllOpenModels.setReadWriteFromLockStatus()
+    End Sub
+
+    Private Sub refreshActiveTreeAfterSvnAction(Optional ByVal bUpdateLocalLockStatus As Boolean = True,
+                                             Optional ByVal bRebuildTree As Boolean = False)
+        'Speed fix:
+        'After normal SVN actions, do not rebuild every open tree.
+        'Default behavior is now node/status recolor only. Use bRebuildTree:=True when geometry/tree structure changed.
+        Try
+            If bUpdateLocalLockStatus Then
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+            End If
+        Catch
+        End Try
+
+        Try
+            If myUserControl IsNot Nothing Then
+                If bRebuildTree Then
+                    myUserControl.refreshCurrentTreeViewOnly()
+                Else
+                    myUserControl.recolorCurrentTreeFromStatusPublic()
+                End If
+            End If
+        Catch
+            Try
+                If myUserControl IsNot Nothing Then
+                    myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+                End If
+            Catch
+            End Try
+        End Try
+
+        Try
+            statusOfAllOpenModels.setReadWriteFromLockStatus()
+        Catch
+        End Try
+
+        Try
+            keepNewUncommittedCadFilesWritable()
+        Catch
+        End Try
     End Sub
     Public Sub myCommitAll()
         Dim bSuccess As Boolean
@@ -2655,11 +3971,9 @@ Public Module svnModule
 
         'Dim sOpenDocPath() As String = getFilePathsFromModDoiSwApp.SendMsgToUser("Active Document not found") cArr(OpenDocModels)
 
-        bSuccess = updateLockStatusPublic(bRefreshAllTreeViews:=True)
-        If Not bSuccess Then Exit Sub
-        myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
-        statusOfAllOpenModels.setReadWriteFromLockStatus()
-        keepNewUncommittedCadFilesWritable()
+        'Speed fix:
+        'Commit All can touch the whole repo, but the task pane only needs the active tree refreshed afterward.
+        refreshActiveTreeAfterSvnAction()
 
     End Sub
     Sub myRepoStatus()
@@ -2751,9 +4065,494 @@ Public Module svnModule
         Return output.ToArray()
     End Function
 
+    Private Class AsyncGetLocksResult
+        Public Property Success As Boolean = False
+        Public Property Message As String = ""
+        Public Property IsWarning As Boolean = False
+        Public Property IsInfoOnly As Boolean = False
+        Public Property AttemptedPaths As String() = Nothing
+        Public Property LockedPaths As String() = Nothing
+    End Class
+
+    Public Sub getLocksOfPathsAsync(ByVal selectedPaths() As String,
+                                    Optional bBreakLocks As Boolean = False,
+                                    Optional bUseTortoise As Boolean = False,
+                                    Optional sMessage As String = "")
+        If asyncGetLocksInProgress Then
+            iSwApp.SendMsgToUser2(
+                "Get Locks is already running." & vbCrLf & vbCrLf &
+                "Wait for the current lock request to finish before starting another one.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If bUseTortoise Then
+            Dim pathDocs() As ModelDoc2 = getOpenDocsForPaths(selectedPaths)
+            If pathDocs IsNot Nothing AndAlso pathDocs.Length > 0 Then
+                getLocksOfDocs(pathDocs, bBreakLocks, bUseTortoise, sMessage)
+            Else
+                iSwApp.SendMsgToUser2("No open CAD documents were available for the Tortoise Get Locks path.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk)
+            End If
+            Exit Sub
+        End If
+
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(selectedPaths)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2(
+                "No valid CAD file paths were selected for Get Locks.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim repoRootPathForBackground As String = ""
+        Dim savedPathForBackground As String = ""
+
+        Try
+            If myUserControl IsNot Nothing AndAlso myUserControl.localRepoPath IsNot Nothing Then
+                repoRootPathForBackground = myUserControl.localRepoPath.Text
+            End If
+        Catch
+            repoRootPathForBackground = ""
+        End Try
+
+        Try
+            If myUserControl IsNot Nothing Then savedPathForBackground = myUserControl.savedPATH
+        Catch
+            savedPathForBackground = ""
+        End Try
+
+        asyncGetLocksInProgress = True
+
+        Try
+            myUserControl.markLockPendingForFilePathsPublic(filteredPaths, True, "Locking...")
+        Catch
+        End Try
+
+        Task.Run(Sub()
+                     Dim result As AsyncGetLocksResult = performGetLocksForPathsBackground(filteredPaths, bBreakLocks, sMessage, repoRootPathForBackground, savedPathForBackground)
+
+                     Try
+                         If myUserControl IsNot Nothing AndAlso Not myUserControl.IsDisposed AndAlso myUserControl.IsHandleCreated Then
+                             myUserControl.BeginInvoke(New MethodInvoker(Sub() finishAsyncGetLocksOnMainThread(result)))
+                         Else
+                             asyncGetLocksInProgress = False
+                         End If
+                     Catch
+                         asyncGetLocksInProgress = False
+                     End Try
+                 End Sub)
+    End Sub
+
+    Public Sub getLocksOfDocsAsync(ByRef modDocArr() As ModelDoc2,
+                                   Optional bBreakLocks As Boolean = False,
+                                   Optional bUseTortoise As Boolean = False,
+                                   Optional sMessage As String = "")
+        If bUseTortoise Then
+            getLocksOfDocs(modDocArr, bBreakLocks, bUseTortoise, sMessage)
+            Exit Sub
+        End If
+
+        Dim selectedPaths() As String = getCadFilePathsFromDocsForAsyncLock(modDocArr)
+        getLocksOfPathsAsync(selectedPaths, bBreakLocks:=bBreakLocks, bUseTortoise:=False, sMessage:=sMessage)
+    End Sub
+
+    Private Function getCadFilePathsFromDocsForAsyncLock(ByRef modDocArr() As ModelDoc2) As String()
+        If modDocArr Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each doc As ModelDoc2 In modDocArr
+            If doc Is Nothing Then Continue For
+
+            Dim docPath As String = ""
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                docPath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+            If Not File.Exists(docPath) Then Continue For
+            If Not isCadFilePath(docPath) Then Continue For
+
+            Try
+                docPath = Path.GetFullPath(docPath)
+            Catch
+            End Try
+
+            If Not seen.Contains(docPath) Then
+                seen.Add(docPath)
+                output.Add(docPath)
+            End If
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function getOpenDocsForPaths(ByVal filePaths() As String) As ModelDoc2()
+        If filePaths Is Nothing Then Return Nothing
+
+        Dim output As New List(Of ModelDoc2)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Dim normalizedPath As String = filePath
+            Try
+                normalizedPath = Path.GetFullPath(filePath)
+            Catch
+            End Try
+
+            If seen.Contains(normalizedPath) Then Continue For
+            seen.Add(normalizedPath)
+
+            Dim doc As ModelDoc2 = getOpenModelByPathSafe(normalizedPath)
+            If doc IsNot Nothing Then output.Add(doc)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function isFirstCommitCandidatePathForAsyncLock(ByVal filePath As String,
+                                                            ByVal repoRootPathForBackground As String,
+                                                            ByVal savedPathForBackground As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+        If Not isCadFilePath(filePath) Then Return False
+        If Not isPathInsideRepoRootForBackground(filePath, repoRootPathForBackground) Then Return False
+
+        Try
+            Dim statusChar As Char = getFirstSvnStatusCharForBackground(filePath, savedPathForBackground)
+            Return statusChar = "?"c OrElse statusChar = "A"c
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function isPathInsideRepoRootForBackground(ByVal filePath As String,
+                                                       ByVal repoRootPathForBackground As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If String.IsNullOrWhiteSpace(repoRootPathForBackground) Then Return False
+
+        Try
+            Dim repoRoot As String = Path.GetFullPath(repoRootPathForBackground).TrimEnd("\"c)
+            Dim fullPath As String = Path.GetFullPath(filePath).TrimEnd("\"c)
+
+            If String.Equals(fullPath, repoRoot, StringComparison.OrdinalIgnoreCase) Then Return True
+            Return fullPath.StartsWith(repoRoot & "\", StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function getFirstSvnStatusCharForBackground(ByVal filePath As String,
+                                                        ByVal savedPathForBackground As String) As Char
+        If String.IsNullOrWhiteSpace(filePath) Then Return ChrW(0)
+        If Not File.Exists(filePath) Then Return ChrW(0)
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                "status --non-interactive """ & filePath.Replace("""", "") & """",
+                savedPathForBackground
+            )
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Return ChrW(0)
+            End If
+
+            Dim statusText As String = ""
+            If statusResult.output IsNot Nothing Then statusText = statusResult.output.Trim()
+
+            If String.IsNullOrWhiteSpace(statusText) Then Return " "c
+
+            Return statusText(0)
+
+        Catch
+            Return ChrW(0)
+        End Try
+    End Function
+
+    Private Function performGetLocksForPathsBackground(ByVal selectedPaths() As String,
+                                                       ByVal bBreakLocks As Boolean,
+                                                       ByVal sMessage As String,
+                                                       ByVal repoRootPathForBackground As String,
+                                                       ByVal savedPathForBackground As String) As AsyncGetLocksResult
+        Dim result As New AsyncGetLocksResult()
+        result.AttemptedPaths = selectedPaths
+
+        Try
+            Dim filteredPaths() As String = filterExistingCadFilePathsOnly(selectedPaths)
+
+            If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
+                result.Message = "No valid CAD file paths were selected for Get Locks."
+                result.IsWarning = True
+                Return result
+            End If
+
+            Dim lockablePaths As New List(Of String)()
+            Dim firstCommitPaths As New List(Of String)()
+
+            For Each filePath As String In filteredPaths
+                If isFirstCommitCandidatePathForAsyncLock(filePath, repoRootPathForBackground, savedPathForBackground) Then
+                    Try
+                        File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
+                    Catch
+                    End Try
+
+                    firstCommitPaths.Add(filePath)
+                Else
+                    lockablePaths.Add(filePath)
+                End If
+            Next
+
+            If lockablePaths.Count = 0 Then
+                result.IsInfoOnly = True
+                result.Message = "No SVN lock needed." & vbCrLf & vbCrLf &
+                    "The selected file appears to be new and not committed yet." & vbCrLf &
+                    "Click Commit instead. The plugin will add it to SVN during the first commit."
+                Return result
+            End If
+
+            Dim outOfDatePaths() As String = getOutOfDatePathsForAsyncLock(lockablePaths.ToArray(), result.Message, savedPathForBackground)
+            If result.Message <> "" Then
+                result.IsWarning = True
+                Return result
+            End If
+
+            If outOfDatePaths IsNot Nothing AndAlso outOfDatePaths.Length > 0 Then
+                result.IsWarning = True
+                result.Message = "Lock cancelled because one or more selected files are out of date." & vbCrLf & vbCrLf &
+                    "Use Get Latest first so you are working from the newest geometry, then click Get Locks again." & vbCrLf & vbCrLf &
+                    "Out-of-date files:" & vbCrLf &
+                    stringArrToSingleStringWithNewLines(outOfDatePaths, bTrimFileNames:=True, iLimit:=10)
+                Return result
+            End If
+
+            Dim releasedPaths() As String = getReleasedPathsForAsyncLock(lockablePaths.ToArray(), savedPathForBackground)
+            If releasedPaths IsNot Nothing AndAlso releasedPaths.Length > 0 AndAlso sMessage <> "#UP REV EDIT#" Then
+                Dim releasedSet As New HashSet(Of String)(releasedPaths.Select(Function(p) normalizeSvnPath(p)), StringComparer.OrdinalIgnoreCase)
+                Dim remaining As New List(Of String)()
+
+                For Each filePath As String In lockablePaths
+                    If Not releasedSet.Contains(normalizeSvnPath(filePath)) Then
+                        remaining.Add(filePath)
+                    End If
+                Next
+
+                If remaining.Count = 0 Then
+                    result.IsWarning = True
+                    result.Message = "Unable to lock the selected file(s), since they are in RELEASED state." & vbCrLf & vbCrLf &
+                        "Use 'EDIT New Revision' to get edit access." & vbCrLf & vbCrLf &
+                        stringArrToSingleStringWithNewLines(releasedPaths, bTrimFileNames:=True, iLimit:=10)
+                    Return result
+                End If
+
+                lockablePaths = remaining
+            End If
+
+            Dim lockResult As rawProcessReturn = runSvnLockForPathsBackground(lockablePaths.ToArray(), bBreakLocks, sMessage, savedPathForBackground)
+
+            If lockResult.outputError IsNot Nothing AndAlso lockResult.outputError.Trim() <> "" Then
+                result.IsWarning = True
+                result.Message = "Locking failed." & vbCrLf & vbCrLf & lockResult.outputError.Trim()
+                Return result
+            End If
+
+            Dim propResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                "propset addin:release_state ""||EDIT||"" " & quoteFilePathArgs(lockablePaths.ToArray()),
+                savedPathForBackground
+            )
+
+            If propResult.outputError IsNot Nothing AndAlso propResult.outputError.Trim() <> "" Then
+                result.IsWarning = True
+                result.Message = "Files were locked, but setting the SVN edit property failed." & vbCrLf & vbCrLf &
+                    propResult.outputError.Trim()
+                result.LockedPaths = lockablePaths.ToArray()
+                Return result
+            End If
+
+            For Each filePath As String In lockablePaths
+                Try
+                    File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
+                Catch
+                End Try
+            Next
+
+            result.Success = True
+            result.LockedPaths = lockablePaths.ToArray()
+            Return result
+
+        Catch ex As Exception
+            result.IsWarning = True
+            result.Message = "Error running Get Locks in the background: " & ex.Message
+            Return result
+        End Try
+    End Function
+
+    Private Sub finishAsyncGetLocksOnMainThread(ByVal result As AsyncGetLocksResult)
+        Try
+            If result IsNot Nothing AndAlso result.AttemptedPaths IsNot Nothing Then
+                myUserControl.markLockPendingForFilePathsPublic(result.AttemptedPaths, False)
+            End If
+        Catch
+        End Try
+
+        Try
+            If result IsNot Nothing AndAlso result.LockedPaths IsNot Nothing AndAlso result.LockedPaths.Length > 0 Then
+                myUserControl.forceWriteAccessForLockedFilePathsPublic(result.LockedPaths)
+                myUserControl.markLockResultForFilePathsPublic(result.LockedPaths, True, "Locked by you")
+            End If
+        Catch
+        End Try
+
+        asyncGetLocksInProgress = False
+
+        If result Is Nothing Then Exit Sub
+
+        If Not String.IsNullOrWhiteSpace(result.Message) Then
+            Dim icon As swMessageBoxIcon_e = If(result.IsWarning, swMessageBoxIcon_e.swMbWarning, swMessageBoxIcon_e.swMbInformation)
+            iSwApp.SendMsgToUser2(result.Message, icon, swMessageBoxBtn_e.swMbOk)
+        End If
+    End Sub
+
+    Private Function quoteFilePathArgs(ByVal filePaths() As String) As String
+        If filePaths Is Nothing Then Return ""
+
+        Dim args As New List(Of String)()
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            args.Add("""" & filePath.Replace("""", "") & """")
+        Next
+
+        Return String.Join(" ", args)
+    End Function
+
+    Private Function runSvnLockForPathsBackground(ByVal filePaths() As String,
+                                                  ByVal bBreakLocks As Boolean,
+                                                  ByVal sMessage As String,
+                                                  ByVal savedPathForBackground As String) As rawProcessReturn
+        Dim args As String = "lock "
+
+        If bBreakLocks Then args &= "--force "
+        If Not String.IsNullOrWhiteSpace(sMessage) Then args &= "-m """ & sMessage.Replace("""", "'") & """ "
+
+        args &= quoteFilePathArgs(filePaths)
+
+        Return runSvnProcessBackgroundNoUi(sSVNPath, args, savedPathForBackground)
+    End Function
+
+    Private Function getOutOfDatePathsForAsyncLock(ByVal filePaths() As String,
+                                                   ByRef errorMessage As String,
+                                                   ByVal savedPathForBackground As String) As String()
+        errorMessage = ""
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Return Nothing
+
+        Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+            sSVNPath,
+            "status -vu --non-interactive " & quoteFilePathArgs(filePaths),
+            savedPathForBackground
+        )
+
+        If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+            errorMessage = "Could not verify latest SVN status before locking." & vbCrLf & vbCrLf & statusResult.outputError.Trim()
+            Return Nothing
+        End If
+
+        If statusResult.output Is Nothing OrElse statusResult.output.Trim() = "" Then Return Nothing
+
+        Dim outOfDate As New List(Of String)()
+        Dim lines() As String = statusResult.output.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
+
+        For Each line As String In lines
+            If String.IsNullOrWhiteSpace(line) Then Continue For
+            If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+            If line.Length >= 9 AndAlso line(8) = "*"c Then
+                Dim matchedPath As String = matchStatusLineToPath(line, filePaths)
+                If matchedPath = "" Then matchedPath = line.Trim()
+                outOfDate.Add(matchedPath)
+            End If
+        Next
+
+        If outOfDate.Count = 0 Then Return Nothing
+        Return outOfDate.ToArray()
+    End Function
+
+    Private Function matchStatusLineToPath(ByVal statusLine As String,
+                                           ByVal filePaths() As String) As String
+        If String.IsNullOrWhiteSpace(statusLine) OrElse filePaths Is Nothing Then Return ""
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Try
+                If statusLine.EndsWith(filePath, StringComparison.OrdinalIgnoreCase) Then Return filePath
+            Catch
+            End Try
+        Next
+
+        Return ""
+    End Function
+
+    Private Function getReleasedPathsForAsyncLock(ByVal filePaths() As String,
+                                                  ByVal savedPathForBackground As String) As String()
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Return Nothing
+
+        Dim propResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+            sSVNPath,
+            "propget addin:release_state --xml " & quoteFilePathArgs(filePaths),
+            savedPathForBackground
+        )
+
+        If propResult.output Is Nothing OrElse propResult.output.Trim() = "" Then Return Nothing
+        If propResult.outputError IsNot Nothing AndAlso propResult.outputError.Trim() <> "" Then Return Nothing
+
+        Dim released As New List(Of String)()
+        Dim doc As New XmlDocument()
+
+        Try
+            doc.LoadXml(propResult.output)
+        Catch
+            Return Nothing
+        End Try
+
+        Dim targets As XmlNodeList = doc.SelectNodes("/properties/target")
+
+        For Each target As XmlNode In targets
+            If target.Attributes Is Nothing OrElse target.Attributes("path") Is Nothing Then Continue For
+
+            Dim propNode As XmlNode = target.SelectSingleNode("property")
+            If propNode Is Nothing Then Continue For
+
+            If String.Equals(propNode.InnerText.Trim(), "||RELEASED||", StringComparison.OrdinalIgnoreCase) Then
+                released.Add(target.Attributes("path").Value)
+            End If
+        Next
+
+        If released.Count = 0 Then Return Nothing
+        Return released.ToArray()
+    End Function
+
     Public Sub getLocksOfDocs(ByRef modDocArr() As ModelDoc2, Optional bBreakLocks As Boolean = False, Optional bUseTortoise As Boolean = False, Optional sMessage As String = "")
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc()
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Active Document not found") : Exit Sub
+
+        'New/uncommitted CAD cannot be SVN-locked yet. Keep it writable and tell the user to Commit.
+        makeFirstCommitCandidatesWritable(modDocArr)
 
         modDocArr = filterOutNewUnversionedOrAddedDocs(modDocArr)
 
@@ -2879,7 +4678,7 @@ Public Module svnModule
         If Not bSuccess Then Exit Sub
 
         Try
-            myUserControl.refreshCurrentTreeViewOnly()
+            myUserControl.recolorCurrentTreeFromStatusPublic()
         Catch
             myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
         End Try
@@ -3399,8 +5198,8 @@ Public Module svnModule
 
         If j = 0 Then
             If bVerbose Then iSwApp.SendMsgToUser("All Files Checked Are Up to Date!")
-            If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True) Then
-                myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+            If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False) Then
+                refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
             End If
             Exit Sub
         End If
@@ -3431,8 +5230,8 @@ Public Module svnModule
         status.reattachDocsToFileSystem(indexOfFilestoRevert, iSwApp)
         status.reattachDocsToFileSystem(indexOfFilestoUpdate, iSwApp)
 
-        If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True) Then
-            myUserControl.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+        If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False) Then
+            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
         End If
 
         System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
@@ -3446,6 +5245,21 @@ Public Module svnModule
         update = 2
         both = 3
     End Enum
+    Private Function formatFilePathArrForSvnProc(ByVal sFilePathArr() As String) As String
+        If sFilePathArr Is Nothing OrElse sFilePathArr.Length = 0 Then Return ""
+
+        Dim output As New List(Of String)()
+
+        For Each filePath As String In sFilePathArr
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            If filePath.Contains("~~") Then Continue For
+            output.Add("""" & filePath & """")
+        Next
+
+        If output.Count = 0 Then Return ""
+        Return String.Join(" ", output.ToArray())
+    End Function
+
     Function formatFilePathArrForProc(ByRef sFilePathArr() As String, Optional sDelimiter As String = "*") As String
         'Use "*" delimiter for tortoiseProc.exe, and " " (space) for SVN.exe
         'Dim bSkipDelimiterForFirstOne As Boolean = True
@@ -3595,25 +5409,37 @@ Public Module svnModule
 
 
     Public Function findStatusForFile(ByRef sFileName As String) As SVNStatus
-        Dim i As Integer
         Dim bSuccess As Boolean
         Dim output As SVNStatus = New SVNStatus()
+        Dim cachedFp As New SVNStatus.filePpty()
+
+        If String.IsNullOrWhiteSpace(sFileName) Then Return Nothing
 
         If IsNothing(statusOfAllOpenModels) Then
             bSuccess = updateStatusOfAllModelsVariable()
             If Not bSuccess Then Return Nothing
         End If
 
-        ReDim output.fp(0)
+        If tryFindCachedStatusProperty(sFileName, cachedFp) Then
+            ReDim output.fp(0)
+            output.fp(0) = cachedFp
+            Return output
+        End If
 
-        For i = 0 To UBound(statusOfAllOpenModels.fp)
-            If (Strings.InStr(statusOfAllOpenModels.fp(i).filename, sFileName, CompareMethod.Text) <> 0) Then
-                Exit For
-            End If
-        Next
-        If i = (UBound(statusOfAllOpenModels.fp) + 1) Then Return Nothing
-        output.fp(0) = statusOfAllOpenModels.fp(i)
-        Return output
+        'Fallback to the original contains-based scan for unusual legacy inputs.
+        Try
+            ReDim output.fp(0)
+
+            For i As Integer = 0 To UBound(statusOfAllOpenModels.fp)
+                If (Strings.InStr(statusOfAllOpenModels.fp(i).filename, sFileName, CompareMethod.Text) <> 0) Then
+                    output.fp(0) = statusOfAllOpenModels.fp(i)
+                    Return output
+                End If
+            Next
+        Catch
+        End Try
+
+        Return Nothing
     End Function
     Public Structure rawProcessReturn
         Public output As String

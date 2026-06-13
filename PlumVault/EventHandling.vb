@@ -22,16 +22,16 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
 
     <DllImport("user32.dll", SetLastError:=True)>
     Private Shared Function SetWindowsHookEx(ByVal idHook As Integer,
-                                             ByVal lpfn As KeyboardHookProc,
-                                             ByVal hMod As IntPtr,
-                                             ByVal dwThreadId As UInteger) As IntPtr
+                                                 ByVal lpfn As KeyboardHookProc,
+                                                 ByVal hMod As IntPtr,
+                                                 ByVal dwThreadId As UInteger) As IntPtr
     End Function
 
     <DllImport("user32.dll", SetLastError:=True)>
     Private Shared Function CallNextHookEx(ByVal hhk As IntPtr,
-                                           ByVal nCode As Integer,
-                                           ByVal wParam As IntPtr,
-                                           ByVal lParam As IntPtr) As IntPtr
+                                               ByVal nCode As Integer,
+                                               ByVal wParam As IntPtr,
+                                               ByVal lParam As IntPtr) As IntPtr
     End Function
 
     <DllImport("user32.dll")>
@@ -47,11 +47,11 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
 
         Try
             hookHandle = SetWindowsHookEx(
-                WH_KEYBOARD,
-                hookCallback,
-                IntPtr.Zero,
-                GetCurrentThreadId()
-            )
+                    WH_KEYBOARD,
+                    hookCallback,
+                    IntPtr.Zero,
+                    GetCurrentThreadId()
+                )
         Catch
             hookHandle = IntPtr.Zero
         End Try
@@ -76,9 +76,9 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
 
                     If Not isKeyRelease Then
                         Dim ctrlDown As Boolean =
-                            IsKeyCurrentlyDown(VK_CONTROL) OrElse
-                            IsKeyCurrentlyDown(VK_LCONTROL) OrElse
-                            IsKeyCurrentlyDown(VK_RCONTROL)
+                                IsKeyCurrentlyDown(VK_CONTROL) OrElse
+                                IsKeyCurrentlyDown(VK_LCONTROL) OrElse
+                                IsKeyCurrentlyDown(VK_RCONTROL)
 
                         If ctrlDown Then
                             If svnModule.blockCloseIfActiveDocUnsafe() Then
@@ -126,14 +126,14 @@ Public Class DocumentEventHandler
         Try
             If Not String.IsNullOrWhiteSpace(docPath) Then
                 If String.Equals(System.IO.Path.GetFullPath(docPath),
-                                 System.IO.Path.GetFullPath(fileName),
-                                 StringComparison.OrdinalIgnoreCase) Then
+                                     System.IO.Path.GetFullPath(fileName),
+                                     StringComparison.OrdinalIgnoreCase) Then
                     Return True
                 End If
 
                 If String.Equals(System.IO.Path.GetFileName(docPath),
-                                 System.IO.Path.GetFileName(fileName),
-                                 StringComparison.OrdinalIgnoreCase) Then
+                                     System.IO.Path.GetFileName(fileName),
+                                     StringComparison.OrdinalIgnoreCase) Then
                     Return True
                 End If
             End If
@@ -628,7 +628,7 @@ Public Class DocView
                     Dim keyCode As Integer = m.WParam.ToInt32()
 
                     If keyCode = CInt(Keys.W) AndAlso
-                       ((Control.ModifierKeys And Keys.Control) = Keys.Control) Then
+                           ((Control.ModifierKeys And Keys.Control) = Keys.Control) Then
 
                         If svnModule.blockCloseIfActiveDocUnsafe() Then
                             Return

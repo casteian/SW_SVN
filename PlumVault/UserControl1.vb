@@ -35,30 +35,274 @@ Public Class UserControl1
     'Public allTreeViews As New List(Of TreeView())
 
     Private WithEvents liveChangeCheckTimer As System.Windows.Forms.Timer
+    Private WithEvents butSyncStatus As Button
+    Private WithEvents chkDebugIgnoreNaming As CheckBox
+    Private syncProgressBar As ProgressBar
+    Private syncProgressLabel As Label
+    Private syncStatusContextMenu As ContextMenuStrip
+    Private Const LAZY_LOAD_PLACEHOLDER_TEXT As String = "<load children>"
+    Private syncStatusInProgress As Boolean = False
     Private refreshTreeNeedsUpdate As Boolean = False
     Private normalRefreshTreeBackColor As Color
     Private lastLiveCheckedActivePath As String = ""
 
+    'Tracks whether the TreeView selection came from an actual user click.
+    'WinForms/SolidWorks can leave the root node selected even when the user thinks
+    'nothing is selected. Sync uses this so the default click stays Level-1-only.
+    Private lastUserClickedTreeNodeForSync As TreeNode = Nothing
+
     Private Sub setRefreshTreeButtonNormal()
         refreshTreeNeedsUpdate = False
 
-        butRefresh.Text = "Refresh Tree"
-        butRefresh.Size = New Size(220, 32)
-        butRefresh.Font = New Font(butRefresh.Font.FontFamily, 10.0!, FontStyle.Bold)
+        If butRefresh Is Nothing Then Exit Sub
+
+        If CStr(If(butRefresh.Tag, "")) = "CompactSvnActionButton" Then
+            butRefresh.Text = "Refresh"
+            butRefresh.Size = New Size(74, 24)
+            butRefresh.Font = New Font(butRefresh.Font.FontFamily, 8.25!, FontStyle.Bold)
+        Else
+            butRefresh.Text = "Refresh Tree"
+            butRefresh.Size = New Size(220, 32)
+            butRefresh.Font = New Font(butRefresh.Font.FontFamily, 10.0!, FontStyle.Bold)
+        End If
+
         butRefresh.BackColor = normalRefreshTreeBackColor
         butRefresh.UseVisualStyleBackColor = True
     End Sub
-
     Private Sub setRefreshTreeButtonUpdateNeeded()
         refreshTreeNeedsUpdate = True
 
-        butRefresh.Text = "Changes made - Update now"
-        butRefresh.Size = New Size(220, 32)
-        butRefresh.Font = New Font(butRefresh.Font.FontFamily, 9.0!, FontStyle.Bold)
+        If butRefresh Is Nothing Then Exit Sub
+
+        If CStr(If(butRefresh.Tag, "")) = "CompactSvnActionButton" Then
+            butRefresh.Text = "Refresh*"
+            butRefresh.Size = New Size(74, 24)
+            butRefresh.Font = New Font(butRefresh.Font.FontFamily, 8.25!, FontStyle.Bold)
+        Else
+            butRefresh.Text = "Changes made - Update now"
+            butRefresh.Size = New Size(220, 32)
+            butRefresh.Font = New Font(butRefresh.Font.FontFamily, 9.0!, FontStyle.Bold)
+        End If
+
         butRefresh.BackColor = Color.LightGreen
         butRefresh.UseVisualStyleBackColor = False
     End Sub
+    Private Sub ensureSyncStatusButton()
+        If butRefresh Is Nothing Then Exit Sub
 
+        Dim parentControl As Control = butRefresh.Parent
+        If parentControl Is Nothing Then parentControl = Me
+
+        If butSyncStatus Is Nothing Then
+            butSyncStatus = New Button()
+            butSyncStatus.Name = "butSyncStatus"
+            butSyncStatus.TabIndex = butRefresh.TabIndex + 1
+            parentControl.Controls.Add(butSyncStatus)
+        ElseIf butSyncStatus.Parent Is Nothing Then
+            parentControl.Controls.Add(butSyncStatus)
+        End If
+
+        setCompactSvnActionButtonStyle(butRefresh, "Refresh")
+        setCompactSvnActionButtonStyle(butSyncStatus, "Sync")
+        setupSyncStatusContextMenu()
+        ensureDebugIgnoreNamingCheckbox(parentControl)
+        ensureSyncProgressControls(parentControl)
+
+        positionRefreshAndSyncButtonsBesideCommit()
+    End Sub
+
+    Private Sub ensureDebugIgnoreNamingCheckbox(ByVal parentControl As Control)
+        If parentControl Is Nothing Then parentControl = Me
+
+        If chkDebugIgnoreNaming Is Nothing Then
+            chkDebugIgnoreNaming = New CheckBox()
+            chkDebugIgnoreNaming.Name = "chkDebugIgnoreNaming"
+            chkDebugIgnoreNaming.Text = "Debug: ignore naming"
+            chkDebugIgnoreNaming.AutoSize = True
+            chkDebugIgnoreNaming.Font = New Font(Me.Font.FontFamily, 7.5!, FontStyle.Regular)
+            chkDebugIgnoreNaming.BackColor = SystemColors.Control
+            chkDebugIgnoreNaming.UseVisualStyleBackColor = True
+            chkDebugIgnoreNaming.Checked = False
+            chkDebugIgnoreNaming.Visible = True
+            chkDebugIgnoreNaming.TabIndex = butRefresh.TabIndex + 2
+            parentControl.Controls.Add(chkDebugIgnoreNaming)
+        ElseIf chkDebugIgnoreNaming.Parent Is Nothing Then
+            parentControl.Controls.Add(chkDebugIgnoreNaming)
+        End If
+    End Sub
+
+    Private Sub ensureSyncProgressControls(ByVal parentControl As Control)
+        If parentControl Is Nothing Then parentControl = Me
+
+        If syncProgressBar Is Nothing Then
+            syncProgressBar = New ProgressBar()
+            syncProgressBar.Name = "syncProgressBar"
+            syncProgressBar.Size = New Size(154, 10)
+            syncProgressBar.Style = ProgressBarStyle.Marquee
+            syncProgressBar.MarqueeAnimationSpeed = 0
+            syncProgressBar.Visible = False
+            syncProgressBar.TabIndex = butRefresh.TabIndex + 3
+            parentControl.Controls.Add(syncProgressBar)
+        ElseIf syncProgressBar.Parent Is Nothing Then
+            parentControl.Controls.Add(syncProgressBar)
+        End If
+
+        If syncProgressLabel Is Nothing Then
+            syncProgressLabel = New Label()
+            syncProgressLabel.Name = "syncProgressLabel"
+            syncProgressLabel.AutoSize = True
+            syncProgressLabel.Font = New Font(Me.Font.FontFamily, 7.0!, FontStyle.Regular)
+            syncProgressLabel.BackColor = SystemColors.Control
+            syncProgressLabel.Text = "Sync pending..."
+            syncProgressLabel.Visible = False
+            syncProgressLabel.TabIndex = butRefresh.TabIndex + 4
+            parentControl.Controls.Add(syncProgressLabel)
+        ElseIf syncProgressLabel.Parent Is Nothing Then
+            parentControl.Controls.Add(syncProgressLabel)
+        End If
+    End Sub
+
+    Private Sub setSyncProgressVisible(ByVal visible As Boolean,
+                                       Optional ByVal message As String = "",
+                                       Optional ByVal fileCount As Integer = 0)
+        Try
+            If syncProgressBar Is Nothing OrElse syncProgressLabel Is Nothing Then Exit Sub
+
+            If visible Then
+                Dim msg As String = If(String.IsNullOrWhiteSpace(message), "Syncing", message)
+                If fileCount > 0 Then msg &= " (" & fileCount.ToString() & " files)"
+
+                syncProgressLabel.Text = msg
+                syncProgressLabel.Visible = True
+                syncProgressBar.Visible = True
+                syncProgressBar.Style = ProgressBarStyle.Marquee
+                syncProgressBar.MarqueeAnimationSpeed = 35
+                syncProgressBar.BringToFront()
+                syncProgressLabel.BringToFront()
+            Else
+                syncProgressBar.MarqueeAnimationSpeed = 0
+                syncProgressBar.Visible = False
+                syncProgressLabel.Visible = False
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Public Function debugIgnoreNamingConventionEnabled() As Boolean
+        Try
+            Return chkDebugIgnoreNaming IsNot Nothing AndAlso chkDebugIgnoreNaming.Checked
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Sub setupSyncStatusContextMenu()
+        If butSyncStatus Is Nothing Then Exit Sub
+
+        If syncStatusContextMenu Is Nothing Then
+            syncStatusContextMenu = New ContextMenuStrip()
+
+            Dim syncBranchItem As New ToolStripMenuItem("Sync Selected Branch", Nothing, AddressOf syncSelectedBranchMenuItem_Click)
+            Dim syncWholeCarItem As New ToolStripMenuItem("Sync Whole Car Status (slow)", Nothing, AddressOf syncWholeCarMenuItem_Click)
+
+            syncStatusContextMenu.Items.Add(syncBranchItem)
+            syncStatusContextMenu.Items.Add(syncWholeCarItem)
+        End If
+
+        butSyncStatus.ContextMenuStrip = syncStatusContextMenu
+        butSyncStatus.Text = "Sync"
+        butSyncStatus.AutoEllipsis = True
+        butSyncStatus.UseVisualStyleBackColor = True
+    End Sub
+
+    Private Sub syncSelectedBranchMenuItem_Click(sender As Object, e As EventArgs)
+        performSyncStatus()
+    End Sub
+
+    Private Sub syncWholeCarMenuItem_Click(sender As Object, e As EventArgs)
+        performSyncStatusWholeCar()
+    End Sub
+
+    Private Sub setCompactSvnActionButtonStyle(ByVal btn As Button, ByVal buttonText As String)
+        If btn Is Nothing Then Exit Sub
+
+        btn.Tag = "CompactSvnActionButton"
+        btn.Text = buttonText
+        btn.Size = New Size(74, 24)
+        btn.Font = New Font(btn.Font.FontFamily, 8.25!, FontStyle.Bold)
+        btn.BackColor = SystemColors.Control
+        btn.UseVisualStyleBackColor = True
+        btn.Anchor = AnchorStyles.Top Or AnchorStyles.Left
+    End Sub
+
+    Private Sub positionRefreshAndSyncButtonsBesideCommit()
+        If butRefresh Is Nothing Then Exit Sub
+        If butSyncStatus Is Nothing Then Exit Sub
+        If ToolStripDropDownButCommit Is Nothing Then Exit Sub
+        If ToolStripDropDownButCommit.Owner Is Nothing Then Exit Sub
+
+        Dim parentControl As Control = butRefresh.Parent
+        If parentControl Is Nothing Then parentControl = Me
+
+        Dim ownerControl As Control = TryCast(ToolStripDropDownButCommit.Owner, Control)
+        If ownerControl Is Nothing Then Exit Sub
+
+        Try
+            Dim commitBounds As Rectangle = ToolStripDropDownButCommit.Bounds
+            Dim startScreen As Point = ownerControl.PointToScreen(New Point(commitBounds.Right + 8, commitBounds.Top + 2))
+            Dim startPoint As Point = parentControl.PointToClient(startScreen)
+
+            Dim gap As Integer = 4
+            Dim minLeft As Integer = 4
+            Dim maxLeft As Integer = Math.Max(minLeft, parentControl.ClientSize.Width - butRefresh.Width - gap)
+            Dim x As Integer = Math.Max(minLeft, Math.Min(startPoint.X, maxLeft))
+            Dim y As Integer = Math.Max(0, startPoint.Y)
+
+            'Prefer putting both buttons beside Commit. If the task pane is too narrow,
+            'stack Sync below Refresh so they do not get clipped at the bottom of the pane.
+            If x + butRefresh.Width + gap + butSyncStatus.Width <= parentControl.ClientSize.Width - 2 Then
+                butRefresh.Location = New Point(x, y)
+                butSyncStatus.Location = New Point(x + butRefresh.Width + gap, y)
+            Else
+                butRefresh.Location = New Point(x, y)
+                butSyncStatus.Location = New Point(x, y + butRefresh.Height + gap)
+            End If
+
+            If chkDebugIgnoreNaming IsNot Nothing Then
+                chkDebugIgnoreNaming.Location = New Point(butRefresh.Left, Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2)
+                chkDebugIgnoreNaming.BringToFront()
+            End If
+
+            If syncProgressLabel IsNot Nothing AndAlso syncProgressBar IsNot Nothing Then
+                Dim progressTop As Integer = Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2
+                If chkDebugIgnoreNaming IsNot Nothing Then progressTop = chkDebugIgnoreNaming.Bottom + 2
+                syncProgressLabel.Location = New Point(butRefresh.Left, progressTop)
+                syncProgressBar.Location = New Point(butRefresh.Left, syncProgressLabel.Bottom + 1)
+                syncProgressBar.Width = Math.Max(120, Math.Min(180, parentControl.ClientSize.Width - butRefresh.Left - 8))
+            End If
+
+            butRefresh.BringToFront()
+            butSyncStatus.BringToFront()
+        Catch
+            'Fallback: keep the buttons near their original area if the ToolStrip geometry is unavailable.
+            Dim fallbackTop As Integer = Math.Max(0, butRefresh.Top)
+            butRefresh.Location = New Point(Math.Max(4, butRefresh.Left), fallbackTop)
+            butSyncStatus.Location = New Point(butRefresh.Right + 4, fallbackTop)
+
+            If chkDebugIgnoreNaming IsNot Nothing Then
+                chkDebugIgnoreNaming.Location = New Point(butRefresh.Left, Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2)
+                chkDebugIgnoreNaming.BringToFront()
+            End If
+
+            If syncProgressLabel IsNot Nothing AndAlso syncProgressBar IsNot Nothing Then
+                Dim progressTop As Integer = Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2
+                If chkDebugIgnoreNaming IsNot Nothing Then progressTop = chkDebugIgnoreNaming.Bottom + 2
+                syncProgressLabel.Location = New Point(butRefresh.Left, progressTop)
+                syncProgressBar.Location = New Point(butRefresh.Left, syncProgressLabel.Bottom + 1)
+                syncProgressBar.Width = Math.Max(120, Math.Min(180, parentControl.ClientSize.Width - butRefresh.Left - 8))
+            End If
+        End Try
+    End Sub
     Private Function getActiveAssemblyTreeForLiveCheck() As ModelDoc2()
         Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
 
@@ -92,6 +336,7 @@ Public Class UserControl1
 
         normalRefreshTreeBackColor = butRefresh.BackColor
         setRefreshTreeButtonNormal()
+        ensureSyncStatusButton()
 
         liveChangeCheckTimer = New System.Windows.Forms.Timer()
         liveChangeCheckTimer.Interval = 30000 '30 seconds
@@ -133,6 +378,8 @@ Public Class UserControl1
 
         ToolStripSplitButFolder.DropDown.AutoClose = True
 
+        ensureSyncStatusButton()
+
         If iSwApp.GetDocumentCount = 0 Then
 
             If verifyLocalRepoPath(bInteractive:=True, bCheckLocalFolder:=True, bCheckServer:=False) Then
@@ -154,7 +401,16 @@ Public Class UserControl1
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
 
-        getLocksOfDocs(GetSelectedModDocList(iSwApp))
+        'Fast normal Get Locks:
+        'Tree selection wins. If a child part is selected in the add-in tree, lock that file only.
+        'Do not let SOLIDWORKS edit-context make us accidentally target the parent assembly.
+        Dim selectedTreePaths() As String = getSelectedTreeCadPathsForFileAction()
+        If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
+            getLocksOfPathsAsync(selectedTreePaths)
+        Else
+            getLocksOfDocsAsync(GetSelectedModDocList(iSwApp))
+        End If
+
         updateStatusStrip()
     End Sub
 
@@ -195,7 +451,17 @@ Public Class UserControl1
     Private Sub ToolStripDropDownButCommit_ButtonClick(sender As Object, e As EventArgs) Handles ToolStripDropDownButCommit.ButtonClick
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
-        tortCommitDocs(GetSelectedModDocList(iSwApp))
+
+        'Fast normal Commit:
+        'Tree selection wins. This lets a user commit a locked child part without needing
+        'the parent assembly checked out, unless the parent itself was actually changed.
+        Dim selectedTreePaths() As String = getSelectedTreeCadPathsForFileAction()
+        If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
+            tortCommitPathsAsync(selectedTreePaths)
+        Else
+            tortCommitDocsAsync(GetSelectedModDocList(iSwApp))
+        End If
+
         updateStatusStrip()
     End Sub
 
@@ -271,6 +537,16 @@ Public Class UserControl1
         updateStatusStrip()
     End Sub
     Private Sub dropDownGetLatestAll_Click(sender As Object, e As EventArgs) Handles dropDownGetLatestAll.Click
+        Dim response As Integer = iSwApp.SendMsgToUser2(
+            "You are about to run Get Latest on the whole SVN working copy / whole car." & vbCrLf & vbCrLf &
+            "This can take a long time and is not recommended for large assemblies unless you really need the entire car updated." & vbCrLf & vbCrLf &
+            "Continue?",
+            swMessageBoxIcon_e.swMbWarning,
+            swMessageBoxBtn_e.swMbYesNo
+        )
+
+        If response <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
+
         saveAllOpenFiles(bShowError:=True)
         myGetLatestOrRevert(,, bVerbose:=True)
         updateStatusStrip()
@@ -292,6 +568,467 @@ Public Class UserControl1
 
     Private Sub butRefresh_Click(sender As Object, e As EventArgs) Handles butRefresh.Click
         performLightweightRefresh()
+    End Sub
+
+    Private Sub butSyncStatus_Click(sender As Object, e As EventArgs) Handles butSyncStatus.Click
+        'Normal click syncs the selected branch only.
+        'Shift+click is the explicit slow whole-car status sync.
+        If (ModifierKeys And Keys.Shift) = Keys.Shift Then
+            performSyncStatusWholeCar()
+        Else
+            performSyncStatus()
+        End If
+    End Sub
+
+    Private Sub performSyncStatus()
+        'Async Sync Status:
+        'Collect/load tree paths on the SolidWorks/UI thread, then run SVN server checks in the background.
+        'This keeps SolidWorks usable while SVN talks to the server.
+
+        If iSwApp.GetDocumentCount() = 0 Then
+            iSwApp.SendMsgToUser2("No open SolidWorks documents to sync status for.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If Not onlineCheckBox.Checked Then
+            iSwApp.SendMsgToUser2("Online mode is off. Turn on Online before using Sync Status.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim selectedNode As TreeNode = getSelectedTreeNodeForSync()
+        Dim syncPaths() As String = Nothing
+
+        If selectedNode Is Nothing Then
+            'No tree node selected:
+            'Default to Level 1 only under the active/root assembly.
+            Dim rootNode As TreeNode = getRootTreeNodeForSync()
+
+            If rootNode IsNot Nothing Then
+                loadImmediateChildrenForNode(rootNode)
+                syncPaths = collectImmediateChildCadPathsForSync(rootNode)
+            End If
+        Else
+            'Selected Level 0 -> sync selected node + Level 1.
+            'Selected Level 1 -> sync selected node + Level 2.
+            loadImmediateChildrenForNode(selectedNode)
+            syncPaths = collectSelectedBranchCadPathsForSync(selectedNode)
+        End If
+
+        If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No CAD file paths were found in the selected tree branch to sync.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        startAsyncSyncStatus(syncPaths, "Syncing...")
+    End Sub
+
+    Private Sub performSyncStatusWholeCar()
+        'Explicit slow operation. This recursively loads the visible active assembly tree
+        'and server-checks every CAD path it can find. It does NOT download geometry.
+
+        Dim response As Integer = iSwApp.SendMsgToUser2(
+            "You are about to Sync Status for the whole visible car / active assembly tree." & vbCrLf & vbCrLf &
+            "This recursively loads branches and checks many CAD files against the SVN server." & vbCrLf &
+            "It can take a long time and is not recommended for large assemblies unless you really need the full-car status." & vbCrLf & vbCrLf &
+            "This does NOT download geometry. Use Get Latest for that." & vbCrLf & vbCrLf &
+            "Continue?",
+            swMessageBoxIcon_e.swMbWarning,
+            swMessageBoxBtn_e.swMbYesNo
+        )
+
+        If response <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
+
+        If iSwApp.GetDocumentCount() = 0 Then
+            iSwApp.SendMsgToUser2("No open SolidWorks documents to sync status for.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If Not onlineCheckBox.Checked Then
+            iSwApp.SendMsgToUser2("Online mode is off. Turn on Online before using Sync Status.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Try
+            If TreeView1 IsNot Nothing AndAlso TreeView1.Nodes IsNot Nothing Then
+                TreeView1.BeginUpdate()
+                Try
+                    For Each node As TreeNode In TreeView1.Nodes
+                        loadEntireLazyTree(node)
+                    Next
+                Finally
+                    TreeView1.EndUpdate()
+                End Try
+            End If
+        Catch
+        End Try
+
+        Dim syncPaths() As String = collectCurrentTreeCadPaths()
+
+        If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No CAD file paths were found in the current tree to sync.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        startAsyncSyncStatus(syncPaths, "Syncing whole car...")
+    End Sub
+
+    Private Sub startAsyncSyncStatus(ByVal syncPaths() As String, Optional ByVal pendingText As String = "Syncing...")
+        If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then Exit Sub
+
+        If syncStatusInProgress Then
+            iSwApp.SendMsgToUser2("A Sync Status operation is already running in the background.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim pathsForBackground As String() = CType(syncPaths.Clone(), String())
+        Dim savedPathForBackground As String = savedPATH
+
+        syncStatusInProgress = True
+        markSyncPendingForFilePathsPublic(pathsForBackground, True, pendingText)
+        setSyncProgressVisible(True, pendingText, pathsForBackground.Length)
+
+        System.Threading.Tasks.Task.Run(Sub()
+                                            Dim errorMessage As String = ""
+                                            Dim serverStatus As SVNStatus = Nothing
+
+                                            Try
+                                                serverStatus = svnModule.getServerStatusForFilePathsBackgroundPublic(pathsForBackground, savedPathForBackground, errorMessage)
+                                            Catch ex As Exception
+                                                errorMessage = ex.Message
+                                            End Try
+
+                                            Try
+                                                If Me.IsHandleCreated Then
+                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage)))
+                                                Else
+                                                    syncStatusInProgress = False
+                                                End If
+                                            Catch
+                                                syncStatusInProgress = False
+                                            End Try
+                                        End Sub)
+    End Sub
+
+    Private Sub finishAsyncSyncStatus(ByVal syncPaths() As String,
+                                      ByVal serverStatus As SVNStatus,
+                                      ByVal errorMessage As String)
+        Try
+            markSyncPendingForFilePathsPublic(syncPaths, False)
+        Catch
+        End Try
+
+        Try
+            setSyncProgressVisible(False)
+        Catch
+        End Try
+
+        syncStatusInProgress = False
+
+        If Not String.IsNullOrWhiteSpace(errorMessage) Then
+            iSwApp.SendMsgToUser2("Sync Status failed." & vbCrLf & vbCrLf & errorMessage,
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If serverStatus Is Nothing Then
+            iSwApp.SendMsgToUser2("Sync Status failed. No SVN status was returned.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Try
+            svnModule.applyServerStatusFromBackgroundPublic(serverStatus)
+        Catch
+        End Try
+
+        Try
+            recolorTreeNodesForFilePathsPublic(syncPaths)
+        Catch
+            Try
+                recolorCurrentTreeFromStatus()
+            Catch
+            End Try
+        End Try
+
+        Try
+            setRefreshTreeButtonNormal()
+        Catch
+        End Try
+    End Sub
+
+    Private Function getSelectedTreeNodeForSync() As TreeNode
+        Try
+            If TreeView1 Is Nothing Then Return Nothing
+
+            Dim selectedNode As TreeNode = TreeView1.SelectedNode
+            If selectedNode Is Nothing Then Return Nothing
+
+            'Important safety fix:
+            'After a refresh/rebuild, the root node can remain selected automatically.
+            'If the user simply clicks Sync, that used to behave like Level 0 was selected
+            'and would sync the root assembly too. Treat an auto-selected root as
+            '"nothing selected" so default Sync remains Level 1 only.
+            If selectedNode.Parent Is Nothing Then
+                If lastUserClickedTreeNodeForSync Is Nothing Then Return Nothing
+                If Not Object.ReferenceEquals(selectedNode, lastUserClickedTreeNodeForSync) Then Return Nothing
+            End If
+
+            Return selectedNode
+
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function getRootTreeNodeForSync() As TreeNode
+        Try
+            If TreeView1 Is Nothing Then Return Nothing
+
+            If TreeView1.Nodes IsNot Nothing AndAlso TreeView1.Nodes.Count > 0 Then
+                Return TreeView1.Nodes(0)
+            End If
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function collectSelectedBranchCadPathsForSync(ByVal selectedNode As TreeNode) As String()
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If selectedNode IsNot Nothing Then
+            addTreeNodePathToSyncList(selectedNode, seen, output)
+
+            For Each childNode As TreeNode In selectedNode.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+                addTreeNodePathToSyncList(childNode, seen, output)
+            Next
+        End If
+
+        'Never fall back to collectCurrentTreeCadPaths() here.
+        'That fallback turns a failed/empty selected-branch sync into a whole loaded-tree sync,
+        'which breaks the Level 0 / Level 1 / Level 2 controls.
+        If output.Count = 0 Then Return Nothing
+
+        Return output.ToArray()
+    End Function
+    Private Function collectImmediateChildCadPathsForSync(ByVal parentNode As TreeNode) As String()
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If parentNode IsNot Nothing Then
+            For Each childNode As TreeNode In parentNode.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+                addTreeNodePathToSyncList(childNode, seen, output)
+            Next
+        End If
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Sub addTreeNodePathToSyncList(ByVal node As TreeNode,
+                                          ByVal seen As HashSet(Of String),
+                                          ByVal output As List(Of String))
+        If node Is Nothing Then Exit Sub
+        If isLazyPlaceholderNode(node) Then Exit Sub
+
+        Dim nodePath As String = getCadPathFromTreeNode(node)
+
+        If Not isCadPathForSync(nodePath) Then Exit Sub
+
+        Try
+            nodePath = Path.GetFullPath(nodePath)
+        Catch
+        End Try
+
+        If seen.Contains(nodePath) Then Exit Sub
+
+        seen.Add(nodePath)
+        output.Add(nodePath)
+    End Sub
+
+    Private Function collectCurrentTreeCadPaths() As String()
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            If TreeView1 IsNot Nothing AndAlso TreeView1.Nodes IsNot Nothing AndAlso TreeView1.Nodes.Count > 0 Then
+                For Each node As TreeNode In TreeView1.Nodes
+                    collectCadPathsFromTreeNode(node, seen, output)
+                Next
+            End If
+        Catch
+        End Try
+
+        If output.Count = 0 Then
+            Try
+                Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+
+                If activeDoc IsNot Nothing Then
+                    Dim activePath As String = activeDoc.GetPathName()
+
+                    If isCadPathForSync(activePath) AndAlso Not seen.Contains(activePath) Then
+                        seen.Add(activePath)
+                        output.Add(activePath)
+                    End If
+                End If
+            Catch
+            End Try
+        End If
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Sub collectCadPathsFromTreeNode(ByVal node As TreeNode,
+                                            ByVal seen As HashSet(Of String),
+                                            ByVal output As List(Of String))
+        If node Is Nothing Then Exit Sub
+
+        Dim nodePath As String = getCadPathFromTreeNode(node)
+
+        If isCadPathForSync(nodePath) Then
+            Try
+                nodePath = Path.GetFullPath(nodePath)
+            Catch
+            End Try
+
+            If Not seen.Contains(nodePath) Then
+                seen.Add(nodePath)
+                output.Add(nodePath)
+            End If
+        End If
+
+        For Each childNode As TreeNode In node.Nodes
+            collectCadPathsFromTreeNode(childNode, seen, output)
+        Next
+    End Sub
+
+    Private Function getCadPathFromTreeNode(ByVal node As TreeNode) As String
+        If node Is Nothing Then Return ""
+
+        Try
+            If TypeOf node.Tag Is ModelDoc2 Then
+                Return CType(node.Tag, ModelDoc2).GetPathName()
+            End If
+
+            If TypeOf node.Tag Is Component2 Then
+                Return CType(node.Tag, Component2).GetPathName()
+            End If
+        Catch
+        End Try
+
+        Return ""
+    End Function
+
+    Private Function isCadPathForSync(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+
+        Dim ext As String = ""
+
+        Try
+            ext = Path.GetExtension(filePath).ToUpperInvariant()
+        Catch
+            Return False
+        End Try
+
+        Return ext = ".SLDPRT" OrElse ext = ".SLDASM" OrElse ext = ".SLDDRW"
+    End Function
+
+    Private Function getSelectedTreeCadPathForFileAction() As String
+        'Fast action helper:
+        'If the user selected a node in the add-in tree, normal Get Locks / Commit
+        'should act on that exact file path, not whatever SOLIDWORKS currently thinks
+        'the active/edited document is. This prevents child part commits from accidentally
+        'trying to commit/check out the parent assembly.
+        Try
+            If TreeView1 Is Nothing Then Return ""
+            If TreeView1.SelectedNode Is Nothing Then Return ""
+            If isLazyPlaceholderNode(TreeView1.SelectedNode) Then Return ""
+
+            Dim nodePath As String = getCadPathFromTreeNode(TreeView1.SelectedNode)
+
+            If Not isCadPathForSync(nodePath) Then Return ""
+
+            Try
+                nodePath = Path.GetFullPath(nodePath)
+            Catch
+            End Try
+
+            Return nodePath
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Function getSelectedTreeCadPathsForFileAction() As String()
+        Dim selectedPath As String = getSelectedTreeCadPathForFileAction()
+        If String.IsNullOrWhiteSpace(selectedPath) Then Return Nothing
+        Return New String() {selectedPath}
+    End Function
+
+    Private Sub recolorCurrentTreeFromStatus()
+        Try
+            If TreeView1 IsNot Nothing Then
+                For Each node As TreeNode In TreeView1.Nodes
+                    recolorTreeNodeRecursive(node)
+                Next
+            End If
+        Catch
+        End Try
+
+        Try
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc Is Nothing Then Exit Sub
+
+            Dim activePath As String = activeDoc.GetPathName()
+            If String.IsNullOrWhiteSpace(activePath) Then Exit Sub
+
+            Dim treeIndex As Integer = findStoredTreeView(activePath, bRetryWithRefresh:=False)
+
+            If treeIndex >= 0 AndAlso allTreeViews IsNot Nothing AndAlso treeIndex <= UBound(allTreeViews) Then
+                If allTreeViews(treeIndex) IsNot Nothing Then
+                    For Each node As TreeNode In allTreeViews(treeIndex).Nodes
+                        recolorTreeNodeRecursive(node)
+                    Next
+                End If
+            End If
+        Catch
+        End Try
+    End Sub
+
+
+    Public Sub recolorCurrentTreeFromStatusPublic()
+        recolorCurrentTreeFromStatus()
+    End Sub
+    Private Sub recolorTreeNodeRecursive(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+
+        setNodeColorFromStatus(node)
+
+        For Each childNode As TreeNode In node.Nodes
+            recolorTreeNodeRecursive(childNode)
+        Next
     End Sub
 
     Private Sub performLightweightRefresh()
@@ -404,40 +1141,20 @@ Public Class UserControl1
     End Sub
     Public Function refreshAddIn(Optional bsaveLocalRepoPathSettings As Boolean = True) As Boolean
 
-        If Not verifyLocalRepoPath(, bCheckLocalFolder:=True, bCheckServer:=False) Then Return False     'Only need to check the local since updateStatusOfAllModelsVariable will check server. 
+        If Not verifyLocalRepoPath(, bCheckLocalFolder:=True, bCheckServer:=False) Then Return False
 
-        Dim pathArr() As String = IO.Directory.GetDirectories(localRepoPath.Text, "*.*", IO.SearchOption.AllDirectories)
-        'Dim sUserPreference As String
-
-        'Set the referenced folder file to the local repository.
-        'This will allow solidworks to find the files.
-        'https://blogs.solidworks.com/tech/2014/06/search-path-order-for-opening-files-in-solidworks.html
-        'http://help.solidworks.com/2012/English/api/swconst/SO_FileLocations.htm
-
-        '=== Had to comment out, since it was adding 5000 file locations references to SolidWorks====
-        ''Add all the subdirectories of the repo to the "reference files location" 
-        '' This will let solidworks find the files!
-        'For Each myPath In pathArr
-        '    If myPath.Contains("\.svn") Then Continue For 'Skips the hidden folder that contains all the backup files
-
-        '    sUserPreference = iSwApp.GetUserPreferenceStringValue(
-        '        swUserPreferenceStringValue_e.swFileLocationsDocuments) 'Get existing preferences
-
-        '    iSwApp.SetUserPreferenceStringValue(
-        '        swUserPreferenceStringValue_e.swFileLocationsDocuments,
-        '        sUserPreference & ";" & myPath)
-        'Next
-
-        'TODO: try to change setuserPreference to only be once in this file
-
-        'Also: Prevent multiple files with the same name to be added to the vault!
-
-        ''iSwApp.SetUserPreferenceStringValue(swUserPreferenceStringValue_e.swFileLocationsDocuments, "C:\Users\benne\Documents\SVN\fsae9\CAD\Subfolder")
-
-        If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True) Then
-            switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
+        'Speed fix:
+        'Do not scan every subfolder or run server/all-tree refresh when the add-in refreshes.
+        'Use the same lightweight path as the Refresh Tree button.
+        If iSwApp IsNot Nothing AndAlso iSwApp.GetDocumentCount() > 0 Then
+            performLightweightRefresh()
         End If
-        saveLocalRepoPathSettings()
+
+        If bsaveLocalRepoPathSettings Then
+            saveLocalRepoPathSettings()
+        End If
+
+        Return True
     End Function
 
     Public Sub saveLocalRepoPathSettings()
@@ -467,6 +1184,14 @@ Public Class UserControl1
     ByVal e As TreeNodeMouseClickEventArgs) _
     Handles TreeView1.NodeMouseClick
 
+        Try
+            If e IsNot Nothing AndAlso e.Node IsNot Nothing Then
+                TreeView1.SelectedNode = e.Node
+                lastUserClickedTreeNodeForSync = e.Node
+            End If
+        Catch
+        End Try
+
         'Dim sText As String = e.Node.Text
         'Dim modDoc As ModelDoc2
         Dim comp As Component2
@@ -487,6 +1212,13 @@ Public Class UserControl1
             comp.Select(False)
         End If
 
+    End Sub
+
+    Private Sub TreeView1_BeforeExpand(sender As Object, e As TreeViewCancelEventArgs) Handles TreeView1.BeforeExpand
+        Try
+            loadImmediateChildrenForNode(e.Node)
+        Catch
+        End Try
     End Sub
 
     Public Sub updateStatusStrip()
@@ -563,45 +1295,43 @@ Public Class UserControl1
 
     End Sub
     Function findStoredTreeView(pathName As String, Optional bRetryWithRefresh As Boolean = True) As Integer
-        Dim i As Integer
-        Dim bSuccess As Boolean
-        'Dim bFound As Boolean = False
+        Dim activeFileName As String = System.IO.Path.GetFileName(pathName)
 
-        If IsNothing(allTreeViews) Then
-            bSuccess = updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True)
-            If Not bSuccess Then iSwApp.SendMsgToUser("Status Update Failed.") : Return Nothing
-            bRetryWithRefresh = False
-        End If
+        If String.IsNullOrWhiteSpace(activeFileName) Then Return Nothing
 
-        If allTreeViews.Length = 0 Then
-            bSuccess = updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True)
-            If Not bSuccess Then iSwApp.SendMsgToUser("Status Update Failed.") : Return Nothing
-            bRetryWithRefresh = False
-        End If
+        If allTreeViews IsNot Nothing AndAlso allTreeViews.Length > 0 Then
+            For i As Integer = 0 To UBound(allTreeViews)
+                If allTreeViews(i) Is Nothing Then Continue For
+                If allTreeViews(i).Nodes.Count = 0 Then Continue For
 
-
-        'Try to find it using the existing allTreeViews object. This is the fastest
-        For i = 0 To UBound(allTreeViews)
-            If allTreeViews(i).Nodes.Count = 0 Then Continue For
-            If (Strings.InStr(allTreeViews(i).Nodes(0).Text, System.IO.Path.GetFileName(pathName), CompareMethod.Text) <> 0) Then
-                Return i
-            End If
-        Next
-
-        If Not bRetryWithRefresh Then Return Nothing
-        bSuccess = updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True)
-        If Not bSuccess Then iSwApp.SendMsgToUser("Status Update Failed.") : Return Nothing
-
-        For i = 0 To UBound(allTreeViews)
-            If allTreeViews(i).Nodes.Count > 0 Then
-                If (Strings.InStr(allTreeViews(i).Nodes(0).Text, System.IO.Path.GetFileName(pathName), CompareMethod.Text) <> 0) Then
+                If Strings.InStr(allTreeViews(i).Nodes(0).Text, activeFileName, CompareMethod.Text) <> 0 Then
                     Return i
                 End If
-            End If
-        Next
+            Next
+        End If
 
-        Return Nothing 'Couldn't find it!
+        If Not bRetryWithRefresh Then Return Nothing
 
+        'Speed fix:
+        'If the tree is missing, build only the active tree.
+        'Do NOT run updateStatusOfAllModelsVariable(True), because that hits the server and rebuilds every tree.
+        Try
+            refreshCurrentTreeViewOnly()
+        Catch
+        End Try
+
+        If allTreeViews IsNot Nothing AndAlso allTreeViews.Length > 0 Then
+            For i As Integer = 0 To UBound(allTreeViews)
+                If allTreeViews(i) Is Nothing Then Continue For
+                If allTreeViews(i).Nodes.Count = 0 Then Continue For
+
+                If Strings.InStr(allTreeViews(i).Nodes(0).Text, activeFileName, CompareMethod.Text) <> 0 Then
+                    Return i
+                End If
+            Next
+        End If
+
+        Return Nothing
     End Function
     Sub refreshAllTreeViewsVariable()
         Dim modDocArray As ModelDoc2() = getAllOpenDocs(bMustBeVisible:=True)
@@ -625,12 +1355,16 @@ Public Class UserControl1
             If modDocArray(i) Is Nothing Then Continue For
             allTreeViews(i) = New TreeView
             allTreeViews(i).Visible = False
-            getComponentsOfAssemblyOptionalUpdateTree({modDocArray(i)}, i)
+            getComponentsOfAssemblyOptionalUpdateTree({modDocArray(i)}, i, iTreeDepthLimit:=1)
         Next
     End Sub
 
     Public Sub refreshCurrentTreeViewOnly()
         Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+
+        'Tree rebuilds can create/default-select a new root node.
+        'Clear explicit sync selection so a plain Sync click remains Level-1-only.
+        lastUserClickedTreeNodeForSync = Nothing
 
         If activeDoc Is Nothing Then Exit Sub
 
@@ -673,7 +1407,7 @@ Public Class UserControl1
         End If
 
         allTreeViews(treeIndex).Visible = False
-        getComponentsOfAssemblyOptionalUpdateTree({activeDoc}, treeIndex)
+        getComponentsOfAssemblyOptionalUpdateTree({activeDoc}, treeIndex, iTreeDepthLimit:=1)
         switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
     End Sub
 
@@ -893,20 +1627,22 @@ Public Class UserControl1
                                     ByRef modDoc As ModelDoc2,
                                     Optional ByVal allTreeViewsIndexToUpdate As Integer = -1,
                                     Optional ByVal bUniqueOnly As Boolean = True,
-                                    Optional ByVal bResolveLightweight As Boolean = False) As ModelDoc2()
+                                    Optional ByVal bResolveLightweight As Boolean = False,
+                                    Optional ByVal iTreeDepthLimit As Integer = -1) As ModelDoc2()
 
         If modDoc Is Nothing Then Return Nothing
 
         Dim modDocArr() As ModelDoc2 = {modDoc}
 
-        Return getComponentsOfAssemblyOptionalUpdateTree(modDocArr, allTreeViewsIndexToUpdate, bUniqueOnly, bResolveLightweight)
+        Return getComponentsOfAssemblyOptionalUpdateTree(modDocArr, allTreeViewsIndexToUpdate, bUniqueOnly, bResolveLightweight, iTreeDepthLimit)
     End Function
 
     Public Function getComponentsOfAssemblyOptionalUpdateTree(
                                     ByRef modDocArr() As ModelDoc2,
                                     Optional ByVal allTreeViewsIndexToUpdate As Integer = -1,
                                     Optional ByVal bUniqueOnly As Boolean = True,
-                                    Optional ByVal bResolveLightweight As Boolean = False) As ModelDoc2()
+                                    Optional ByVal bResolveLightweight As Boolean = False,
+                                    Optional ByVal iTreeDepthLimit As Integer = -1) As ModelDoc2()
 
         'Returns ModelDoc2() for normal/open/resolved files.
         'The tree can also show suppressed/path-only components by using Component2.GetPathName().
@@ -965,9 +1701,9 @@ Public Class UserControl1
                 swConf = swConfMgr.ActiveConfiguration
                 swRootComp = swConf.GetRootComponent3(True)
 
-                TraverseComponent(swRootComp, modelDocList, 1, parentNode, bUniqueOnly, bResolveLightweight)
+                TraverseComponent(swRootComp, modelDocList, 1, parentNode, bUniqueOnly, bResolveLightweight, iTreeDepthLimit)
 
-                If bUpdateTreeView Then
+                If bUpdateTreeView AndAlso iTreeDepthLimit < 0 Then
                     addMissingComponentsFromFlatAssemblyList(CType(modDocArr(i), AssemblyDoc), modelDocList, parentNode, bUniqueOnly, bResolveLightweight)
                 End If
 
@@ -1029,7 +1765,8 @@ Public Class UserControl1
                          ByVal nLevel As Long,
                          Optional ByRef rootNode As TreeNode = Nothing,
                          Optional ByVal bUniqueOnly As Boolean = True,
-                         Optional ByVal bResolveLightweight As Boolean = False)
+                         Optional ByVal bResolveLightweight As Boolean = False,
+                         Optional ByVal iTreeDepthLimit As Integer = -1)
 
         'Keeps suppressed/lightweight components visible in the tree.
         'Suppressed components are not unsuppressed automatically.
@@ -1141,18 +1878,31 @@ Public Class UserControl1
 
             If childIsAssembly AndAlso modDocChild IsNot Nothing Then
 
+                If bUC AndAlso iTreeDepthLimit >= 0 AndAlso nLevel >= iTreeDepthLimit Then
+                    addModelDocIfMissing(mdComponentList, modDocChild, bUniqueOnly)
+
+                    childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
+                    childNode.Tag = swChildComp
+                    setNodeColorFromStatus(childNode)
+                    addLazyPlaceholderIfNeeded(childNode)
+                    parentNode.Nodes.Add(childNode)
+
+                    Continue For
+                End If
+
                 If bUniqueOnly AndAlso modelDocListContainsPath(mdComponentList, getSafeModelPath(modDocChild)) Then
                     If bUC Then
                         childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
                         childNode.Tag = swChildComp
                         setNodeColorFromStatus(childNode)
+                        addLazyPlaceholderIfNeeded(childNode)
                         parentNode.Nodes.Add(childNode)
                     End If
 
                     Continue For
                 End If
 
-                TraverseComponent(swChildComp, mdComponentList, nLevel + 1, parentNode, bUniqueOnly, bResolveLightweight)
+                TraverseComponent(swChildComp, mdComponentList, nLevel + 1, parentNode, bUniqueOnly, bResolveLightweight, iTreeDepthLimit)
 
             Else
 
@@ -1180,6 +1930,161 @@ Public Class UserControl1
         End If
 
     End Sub
+    Private Function isLazyPlaceholderNode(ByVal node As TreeNode) As Boolean
+        If node Is Nothing Then Return False
+        Return String.Equals(node.Text, LAZY_LOAD_PLACEHOLDER_TEXT, StringComparison.OrdinalIgnoreCase)
+    End Function
+
+    Private Function hasLazyPlaceholder(ByVal node As TreeNode) As Boolean
+        If node Is Nothing Then Return False
+        If node.Nodes Is Nothing OrElse node.Nodes.Count = 0 Then Return False
+        Return isLazyPlaceholderNode(node.Nodes(0))
+    End Function
+
+    Private Function isTreeNodeAssembly(ByVal node As TreeNode) As Boolean
+        If node Is Nothing Then Return False
+
+        Try
+            If TypeOf node.Tag Is ModelDoc2 Then
+                Return CType(node.Tag, ModelDoc2).GetType() = swDocumentTypes_e.swDocASSEMBLY
+            End If
+
+            If TypeOf node.Tag Is Component2 Then
+                Dim comp As Component2 = CType(node.Tag, Component2)
+                Dim compPath As String = getSafeComponentPath(comp)
+
+                If Not String.IsNullOrWhiteSpace(compPath) Then
+                    If String.Equals(Path.GetExtension(compPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then
+                        Return True
+                    End If
+                End If
+
+                Dim compDoc As ModelDoc2 = TryCast(comp.GetModelDoc2(), ModelDoc2)
+                If compDoc IsNot Nothing Then
+                    Return compDoc.GetType() = swDocumentTypes_e.swDocASSEMBLY
+                End If
+            End If
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Private Sub addLazyPlaceholderIfNeeded(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+        If Not isTreeNodeAssembly(node) Then Exit Sub
+        If node.Nodes IsNot Nothing AndAlso node.Nodes.Count > 0 Then Exit Sub
+
+        'Only add the placeholder if SolidWorks can actually provide children.
+        'Suppressed/path-only assemblies can be shown, but cannot be expanded without resolving/opening them.
+        If TypeOf node.Tag Is Component2 Then
+            Try
+                Dim comp As Component2 = CType(node.Tag, Component2)
+                If isComponentSuppressedState(getSafeComponentSuppression(comp)) Then Exit Sub
+                If comp.GetModelDoc2() Is Nothing Then Exit Sub
+            Catch
+                Exit Sub
+            End Try
+        End If
+
+        node.Nodes.Add(New TreeNode(LAZY_LOAD_PLACEHOLDER_TEXT))
+    End Sub
+
+    Private Sub loadImmediateChildrenForNode(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+        If Not isTreeNodeAssembly(node) Then Exit Sub
+
+        If node.Nodes IsNot Nothing AndAlso node.Nodes.Count > 0 AndAlso Not hasLazyPlaceholder(node) Then
+            Exit Sub
+        End If
+
+        Dim childObj As Object = Nothing
+
+        Try
+            If TypeOf node.Tag Is ModelDoc2 Then
+                Dim asmDoc As AssemblyDoc = TryCast(node.Tag, AssemblyDoc)
+                If asmDoc Is Nothing Then Exit Sub
+
+                Dim modelDoc As ModelDoc2 = CType(node.Tag, ModelDoc2)
+                Dim confMgr As ConfigurationManager = modelDoc.ConfigurationManager
+                Dim conf As Configuration = confMgr.ActiveConfiguration
+                Dim rootComp As Component2 = conf.GetRootComponent3(True)
+                If rootComp Is Nothing Then Exit Sub
+
+                childObj = rootComp.GetChildren()
+
+            ElseIf TypeOf node.Tag Is Component2 Then
+                Dim comp As Component2 = CType(node.Tag, Component2)
+
+                If isComponentSuppressedState(getSafeComponentSuppression(comp)) Then Exit Sub
+
+                childObj = comp.GetChildren()
+            Else
+                Exit Sub
+            End If
+        Catch
+            childObj = Nothing
+        End Try
+
+        If childObj Is Nothing Then Exit Sub
+
+        Dim childArr As Object() = Nothing
+
+        Try
+            childArr = CType(childObj, Object())
+        Catch
+            Exit Sub
+        End Try
+
+        node.Nodes.Clear()
+
+        For Each child As Object In childArr
+            Dim childComp As Component2 = TryCast(child, Component2)
+            If childComp Is Nothing Then Continue For
+
+            Try
+                If childComp.IsEnvelope Then Continue For
+            Catch
+            End Try
+
+            Dim childPath As String = getSafeComponentPath(childComp)
+            Dim childSuppression As Integer = getSafeComponentSuppression(childComp)
+            Dim childDoc As ModelDoc2 = Nothing
+
+            If Not isComponentSuppressedState(childSuppression) Then
+                Try
+                    childDoc = TryCast(childComp.GetModelDoc2(), ModelDoc2)
+                Catch
+                    childDoc = Nothing
+                End Try
+            End If
+
+            If String.IsNullOrWhiteSpace(childPath) AndAlso childDoc Is Nothing Then Continue For
+
+            Dim childNode As New TreeNode(buildComponentNodeText(childComp, childDoc))
+            childNode.Tag = childComp
+            setNodeColorFromStatus(childNode)
+            addLazyPlaceholderIfNeeded(childNode)
+            node.Nodes.Add(childNode)
+        Next
+
+        Try
+            node.TreeView.Sort()
+        Catch
+        End Try
+    End Sub
+
+    Private Sub loadEntireLazyTree(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+
+        loadImmediateChildrenForNode(node)
+
+        For Each childNode As TreeNode In node.Nodes
+            If isLazyPlaceholderNode(childNode) Then Continue For
+            loadEntireLazyTree(childNode)
+        Next
+    End Sub
+
     Public Class myContextMenuClass
 
         Public Shared iSwApp2 As SldWorks
@@ -1225,7 +2130,7 @@ Public Class UserControl1
             myUnlockWithDependents(modDoc)
         End Sub
         Sub commitEventHandler(sender As Object, e As EventArgs)
-            tortCommitDocs({modDoc})
+            tortCommitDocsAsync({modDoc})
         End Sub
         Public Sub commitWithDependentsEventHandler(sender As Object, e As EventArgs)
             modDocArr = parentUserControl2.GetSelectedModDocList(iSwApp2)
@@ -1238,11 +2143,12 @@ Public Class UserControl1
                                    "attempt to check in their copies, a conflict can occur. Always communicate " &
                                    "your intention to break someone's lock with that user.",
                                     swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOkCancel) Then
-                getLocksOfDocs({modDoc}, bBreakLocks:=True)
+                getLocksOfDocsAsync({modDoc}, bBreakLocks:=True)
             End If
         End Sub
         Sub getLockActiveDocEventHandler(sender As Object, e As EventArgs)
-            getLocksOfDocs(parentUserControl2.GetSelectedModDocList(iSwApp2))
+            'Context menu belongs to this node, so lock this node's file only.
+            getLocksOfDocsAsync({modDoc})
         End Sub
         Sub getLocksActiveWithDependentsEventHandler(sender As Object, e As EventArgs)
             getLocksOfDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(parentUserControl2.GetSelectedModDocList(iSwApp2)))
@@ -1294,18 +2200,22 @@ Public Class UserControl1
     Private Function stripStatusSuffix(nodeText As String) As String
         If String.IsNullOrWhiteSpace(nodeText) Then Return nodeText
 
-        Dim lockedStart As Integer = nodeText.IndexOf(" [Locked", StringComparison.OrdinalIgnoreCase)
-        Dim notCommittedStart As Integer = nodeText.IndexOf(" [Not committed", StringComparison.OrdinalIgnoreCase)
-
         Dim suffixStart As Integer = -1
+        Dim knownSuffixes As String() = {
+            " [Locked",
+            " [Not committed",
+            " [Locking",
+            " [Syncing",
+            " [Committing",
+            " [Pending"
+        }
 
-        If lockedStart >= 0 Then suffixStart = lockedStart
-
-        If notCommittedStart >= 0 Then
-            If suffixStart = -1 OrElse notCommittedStart < suffixStart Then
-                suffixStart = notCommittedStart
+        For Each suffix As String In knownSuffixes
+            Dim idx As Integer = nodeText.IndexOf(suffix, StringComparison.OrdinalIgnoreCase)
+            If idx >= 0 Then
+                If suffixStart = -1 OrElse idx < suffixStart Then suffixStart = idx
             End If
-        End If
+        Next
 
         If suffixStart >= 0 Then
             Return nodeText.Substring(0, suffixStart)
@@ -1313,6 +2223,407 @@ Public Class UserControl1
 
         Return nodeText
     End Function
+
+    Public Sub markLockPendingForFilePathsPublic(ByVal filePaths() As String,
+                                                  ByVal isPending As Boolean,
+                                                  Optional ByVal pendingText As String = "Locking...")
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() markLockPendingForFilePathsPublic(filePaths, isPending, pendingText)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        Dim normalizedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filePaths
+            Dim normalizedPath As String = normalizePathForNodeMatch(filePath)
+            If normalizedPath <> "" AndAlso Not normalizedPaths.Contains(normalizedPath) Then
+                normalizedPaths.Add(normalizedPath)
+            End If
+        Next
+
+        If normalizedPaths.Count = 0 Then Exit Sub
+
+        Try
+            If TreeView1 IsNot Nothing Then
+                For Each node As TreeNode In TreeView1.Nodes
+                    markLockPendingOnNodeRecursive(node, normalizedPaths, isPending, pendingText)
+                Next
+            End If
+        Catch
+        End Try
+
+        'Do not recolor the whole tree here.
+        'This method is used by async Get Locks, and a full recolor/status pass can make
+        'SolidWorks feel frozen right when the background lock finishes.
+    End Sub
+
+    Private Function normalizePathForNodeMatch(ByVal filePath As String) As String
+        If String.IsNullOrWhiteSpace(filePath) Then Return ""
+
+        Try
+            Return Path.GetFullPath(filePath).TrimEnd("\"c).ToLowerInvariant()
+        Catch
+            Return filePath.Replace("/", "\").TrimEnd("\"c).ToLowerInvariant()
+        End Try
+    End Function
+
+    Private Sub markLockPendingOnNodeRecursive(ByVal node As TreeNode,
+                                               ByVal normalizedPaths As HashSet(Of String),
+                                               ByVal isPending As Boolean,
+                                               ByVal pendingText As String)
+        If node Is Nothing Then Exit Sub
+
+        Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+
+        If nodePath <> "" AndAlso normalizedPaths.Contains(nodePath) Then
+            If isPending Then
+                Dim baseText As String = stripStatusSuffix(node.Text)
+                node.Text = baseText & " [" & pendingText & "]"
+                node.BackColor = Color.LightSkyBlue
+                node.ToolTipText = "SVN Get Locks is running in the background. You can keep using SolidWorks."
+            Else
+                node.Text = stripStatusSuffix(node.Text)
+            End If
+        End If
+
+        For Each childNode As TreeNode In node.Nodes
+            markLockPendingOnNodeRecursive(childNode, normalizedPaths, isPending, pendingText)
+        Next
+    End Sub
+
+
+    Public Sub markLockResultForFilePathsPublic(ByVal filePaths() As String,
+                                                ByVal lockedByYou As Boolean,
+                                                Optional ByVal resultText As String = "Locked by you")
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() markLockResultForFilePathsPublic(filePaths, lockedByYou, resultText)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        Dim normalizedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filePaths
+            Dim normalizedPath As String = normalizePathForNodeMatch(filePath)
+            If normalizedPath <> "" AndAlso Not normalizedPaths.Contains(normalizedPath) Then
+                normalizedPaths.Add(normalizedPath)
+            End If
+        Next
+
+        If normalizedPaths.Count = 0 Then Exit Sub
+
+        Try
+            If TreeView1 IsNot Nothing Then
+                For Each node As TreeNode In TreeView1.Nodes
+                    markLockResultOnNodeRecursive(node, normalizedPaths, lockedByYou, resultText)
+                Next
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub markLockResultOnNodeRecursive(ByVal node As TreeNode,
+                                              ByVal normalizedPaths As HashSet(Of String),
+                                              ByVal lockedByYou As Boolean,
+                                              ByVal resultText As String)
+        If node Is Nothing Then Exit Sub
+
+        Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+
+        If nodePath <> "" AndAlso normalizedPaths.Contains(nodePath) Then
+            Dim baseText As String = stripStatusSuffix(node.Text)
+
+            If lockedByYou Then
+                node.Text = baseText & " [" & resultText & "]"
+                node.BackColor = Color.LightGreen
+                node.ToolTipText = "SVN lock completed. This file should now be writable."
+            Else
+                node.Text = baseText
+                node.ToolTipText = ""
+            End If
+        End If
+
+        For Each childNode As TreeNode In node.Nodes
+            markLockResultOnNodeRecursive(childNode, normalizedPaths, lockedByYou, resultText)
+        Next
+    End Sub
+
+
+    Public Sub markSyncPendingForFilePathsPublic(ByVal filePaths() As String,
+                                                 ByVal isPending As Boolean,
+                                                 Optional ByVal pendingText As String = "Syncing...")
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() markSyncPendingForFilePathsPublic(filePaths, isPending, pendingText)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        Dim normalizedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filePaths
+            Dim normalizedPath As String = normalizePathForNodeMatch(filePath)
+            If normalizedPath <> "" AndAlso Not normalizedPaths.Contains(normalizedPath) Then
+                normalizedPaths.Add(normalizedPath)
+            End If
+        Next
+
+        If normalizedPaths.Count = 0 Then Exit Sub
+
+        Try
+            If TreeView1 IsNot Nothing Then
+                TreeView1.BeginUpdate()
+                Try
+                    For Each node As TreeNode In TreeView1.Nodes
+                        markSyncPendingOnNodeRecursive(node, normalizedPaths, isPending, pendingText)
+                    Next
+                Finally
+                    TreeView1.EndUpdate()
+                End Try
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub markSyncPendingOnNodeRecursive(ByVal node As TreeNode,
+                                               ByVal normalizedPaths As HashSet(Of String),
+                                               ByVal isPending As Boolean,
+                                               ByVal pendingText As String)
+        If node Is Nothing Then Exit Sub
+
+        Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+
+        If nodePath <> "" AndAlso normalizedPaths.Contains(nodePath) Then
+            If isPending Then
+                Dim baseText As String = stripStatusSuffix(node.Text)
+                node.Text = baseText & " [" & pendingText & "]"
+                node.BackColor = Color.LightSkyBlue
+                node.ToolTipText = "SVN Sync Status is running in the background. You can keep using SolidWorks."
+            Else
+                node.Text = stripStatusSuffix(node.Text)
+            End If
+        End If
+
+        For Each childNode As TreeNode In node.Nodes
+            markSyncPendingOnNodeRecursive(childNode, normalizedPaths, isPending, pendingText)
+        Next
+    End Sub
+
+    Public Sub recolorTreeNodesForFilePathsPublic(ByVal filePaths() As String)
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() recolorTreeNodesForFilePathsPublic(filePaths)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        Dim normalizedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filePaths
+            Dim normalizedPath As String = normalizePathForNodeMatch(filePath)
+            If normalizedPath <> "" AndAlso Not normalizedPaths.Contains(normalizedPath) Then
+                normalizedPaths.Add(normalizedPath)
+            End If
+        Next
+
+        If normalizedPaths.Count = 0 Then Exit Sub
+
+        Try
+            If TreeView1 IsNot Nothing Then
+                TreeView1.BeginUpdate()
+                Try
+                    For Each node As TreeNode In TreeView1.Nodes
+                        recolorTreeNodeIfPathMatchesRecursive(node, normalizedPaths)
+                    Next
+                Finally
+                    TreeView1.EndUpdate()
+                End Try
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub recolorTreeNodeIfPathMatchesRecursive(ByVal node As TreeNode,
+                                                      ByVal normalizedPaths As HashSet(Of String))
+        If node Is Nothing Then Exit Sub
+
+        Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+
+        If nodePath <> "" AndAlso normalizedPaths.Contains(nodePath) Then
+            setNodeColorFromStatus(node)
+        End If
+
+        For Each childNode As TreeNode In node.Nodes
+            recolorTreeNodeIfPathMatchesRecursive(childNode, normalizedPaths)
+        Next
+    End Sub
+
+    Public Sub forceWriteAccessForLockedFilePathsPublic(ByVal filePaths() As String)
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() forceWriteAccessForLockedFilePathsPublic(filePaths)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Try
+                If File.Exists(filePath) Then
+                    File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
+                End If
+            Catch
+            End Try
+
+            Dim doc As ModelDoc2 = Nothing
+
+            Try
+                doc = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+            Catch
+                doc = Nothing
+            End Try
+
+            If doc Is Nothing Then Continue For
+
+            Try
+                doc.SetReadOnlyState(False)
+            Catch
+            End Try
+
+            'This prevents the SolidWorks "opened read-only but now writable" prompt when the user right-clicks Edit Part.
+            'It is the programmatic equivalent of the user clicking File > Reload after getting the SVN lock.
+            Try
+                If doc.IsOpenedReadOnly() Then
+                    doc.ReloadOrReplace(ReadOnly:=False, ReplaceFileName:=Nothing, DiscardChanges:=True)
+                End If
+            Catch
+            End Try
+        Next
+    End Sub
+
+    Public Sub setOpenDocsReadOnlyForFilePathsPublic(ByVal filePaths() As String)
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() setOpenDocsReadOnlyForFilePathsPublic(filePaths)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Try
+                If File.Exists(filePath) Then
+                    File.SetAttributes(filePath, File.GetAttributes(filePath) Or FileAttributes.ReadOnly)
+                End If
+            Catch
+            End Try
+
+            Try
+                Dim doc As ModelDoc2 = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+                If doc IsNot Nothing Then doc.SetReadOnlyState(True)
+            Catch
+            End Try
+        Next
+    End Sub
+
+    Public Sub markCommitPendingForFilePathsPublic(ByVal filePaths() As String,
+                                                   ByVal isPending As Boolean,
+                                                   Optional ByVal pendingText As String = "Committing...")
+        'Commit uses the same visual pending helper as Sync, but with a different label.
+        markSyncPendingForFilePathsPublic(filePaths, isPending, pendingText)
+    End Sub
+
+    Public Sub markCommitResultForFilePathsPublic(ByVal filePaths() As String,
+                                                  ByVal success As Boolean)
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() markCommitResultForFilePathsPublic(filePaths, success)))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        If success Then
+            Try
+                setOpenDocsReadOnlyForFilePathsPublic(filePaths)
+            Catch
+            End Try
+        End If
+
+        Dim normalizedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filePaths
+            Dim normalizedPath As String = normalizePathForNodeMatch(filePath)
+            If normalizedPath <> "" AndAlso Not normalizedPaths.Contains(normalizedPath) Then
+                normalizedPaths.Add(normalizedPath)
+            End If
+        Next
+
+        If normalizedPaths.Count = 0 Then Exit Sub
+
+        Try
+            If TreeView1 IsNot Nothing Then
+                TreeView1.BeginUpdate()
+                Try
+                    For Each node As TreeNode In TreeView1.Nodes
+                        markCommitResultOnNodeRecursive(node, normalizedPaths, success)
+                    Next
+                Finally
+                    TreeView1.EndUpdate()
+                End Try
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub markCommitResultOnNodeRecursive(ByVal node As TreeNode,
+                                                ByVal normalizedPaths As HashSet(Of String),
+                                                ByVal success As Boolean)
+        If node Is Nothing Then Exit Sub
+
+        Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+
+        If nodePath <> "" AndAlso normalizedPaths.Contains(nodePath) Then
+            node.Text = stripStatusSuffix(node.Text)
+
+            If success Then
+                node.BackColor = SystemColors.Window
+                node.ToolTipText = "Commit finished. Click Sync to verify latest server status if needed."
+            Else
+                node.BackColor = Color.LightSalmon
+                node.ToolTipText = "Commit did not complete."
+            End If
+        End If
+
+        For Each childNode As TreeNode In node.Nodes
+            markCommitResultOnNodeRecursive(childNode, normalizedPaths, success)
+        Next
+    End Sub
 
     Sub setNodeColorFromStatus(
         ByRef rootNode As TreeNode)
