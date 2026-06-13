@@ -3890,6 +3890,7 @@ Public Class UserControl1
         Dim modDocArr As ModelDoc2() = GetSelectedModDocList(iSwApp)
         If IsNothing(modDocArr) Then modDocArr = getComponentsOfAssemblyOptionalUpdateTree(iSwApp.ActiveDoc, bResolveLightweight:=True)
         If IsNothing(modDocArr) Then
+
             iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
             Exit Sub
         End If
