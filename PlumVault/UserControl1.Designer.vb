@@ -24,7 +24,6 @@ Partial Class UserControl1
     Private Sub InitializeComponent()
         Dim TreeNode1 As System.Windows.Forms.TreeNode = New System.Windows.Forms.TreeNode("Open a File to See its Status")
         Me.TreeView1 = New System.Windows.Forms.TreeView()
-        Me.onlineCheckBox = New System.Windows.Forms.CheckBox()
         Me.localRepoPath = New System.Windows.Forms.TextBox()
         Me.butPickFolder = New System.Windows.Forms.Button()
         Me.butRefresh = New System.Windows.Forms.Button()
@@ -91,19 +90,6 @@ Partial Class UserControl1
         Me.TreeView1.ShowNodeToolTips = True
         Me.TreeView1.Size = New System.Drawing.Size(692, 300)
         Me.TreeView1.TabIndex = 10
-        '
-        'onlineCheckBox
-        '
-        Me.onlineCheckBox.AutoSize = True
-        Me.onlineCheckBox.Checked = True
-        Me.onlineCheckBox.CheckState = System.Windows.Forms.CheckState.Checked
-        Me.onlineCheckBox.Location = New System.Drawing.Point(3, 29)
-        Me.onlineCheckBox.Margin = New System.Windows.Forms.Padding(2)
-        Me.onlineCheckBox.Name = "onlineCheckBox"
-        Me.onlineCheckBox.Size = New System.Drawing.Size(80, 24)
-        Me.onlineCheckBox.TabIndex = 14
-        Me.onlineCheckBox.Text = "Online"
-        Me.onlineCheckBox.UseVisualStyleBackColor = True
         '
         'localRepoPath
         '
@@ -487,7 +473,7 @@ Partial Class UserControl1
         'versionLabel
         '
         Me.versionLabel.AutoSize = True
-        Me.versionLabel.Location = New System.Drawing.Point(187, 69)
+        Me.versionLabel.Location = New System.Drawing.Point(282, 70)
         Me.versionLabel.Margin = New System.Windows.Forms.Padding(2, 0, 2, 0)
         Me.versionLabel.Name = "versionLabel"
         Me.versionLabel.Size = New System.Drawing.Size(121, 20)
@@ -504,7 +490,6 @@ Partial Class UserControl1
         Me.Controls.Add(Me.butRefresh)
         Me.Controls.Add(Me.butPickFolder)
         Me.Controls.Add(Me.localRepoPath)
-        Me.Controls.Add(Me.onlineCheckBox)
         Me.Controls.Add(Me.butCleanup)
         Me.Controls.Add(Me.TreeView1)
         Me.Name = "UserControl1"
@@ -517,7 +502,6 @@ Partial Class UserControl1
     End Sub
     Friend WithEvents TreeView1 As Windows.Forms.TreeView
     Friend WithEvents butCleanup As Windows.Forms.Button
-    Friend WithEvents onlineCheckBox As Windows.Forms.CheckBox
     Friend WithEvents localRepoPath As Windows.Forms.TextBox
     Friend WithEvents butPickFolder As Windows.Forms.Button
     Friend WithEvents butRefresh As Windows.Forms.Button

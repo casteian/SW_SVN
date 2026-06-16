@@ -38,6 +38,7 @@ Public Class UserControl1
     Private WithEvents graphicalSelectionSyncTimer As System.Windows.Forms.Timer
     Private WithEvents butSyncStatus As Button
     Private WithEvents chkDebugIgnoreNaming As CheckBox
+    Private WithEvents onlineCheckBox As CheckBox
     Private syncProgressBar As ProgressBar
     Private syncProgressLabel As Label
     Private syncStatusContextMenu As ContextMenuStrip
@@ -50,6 +51,11 @@ Public Class UserControl1
     Private lastGraphicallyHighlightedTreeNode As TreeNode = Nothing
     Private ReadOnly treeSelectionBackColor As Color = Color.FromArgb(0, 82, 180)
     Private ReadOnly treeSelectionForeColor As Color = Color.White
+    Private WithEvents treeStartDragHandle As Panel
+    Private treeStartDragInProgress As Boolean = False
+    Private treeStartDragMouseOffsetY As Integer = 0
+    Private treeStartDefaultTop As Integer = -1
+    Private userAdjustedTreeStart As Boolean = False
 
     Private Function normalTreeTextColor() As Color
         Return Color.Black
@@ -120,6 +126,112 @@ Public Class UserControl1
         positionRefreshAndSyncButtonsBesideCommit()
     End Sub
 
+
+
+    Private Sub ensureOnlineCheckbox()
+        Dim parentControl As Control = Nothing
+
+        Try
+            If versionLabel IsNot Nothing Then parentControl = versionLabel.Parent
+        Catch
+            parentControl = Nothing
+        End Try
+
+        If parentControl Is Nothing Then parentControl = Me
+
+        If onlineCheckBox Is Nothing Then
+            Try
+                onlineCheckBox = TryCast(parentControl.Controls.Find("onlineCheckBox", True).FirstOrDefault(), CheckBox)
+            Catch
+                onlineCheckBox = Nothing
+            End Try
+        End If
+
+        If onlineCheckBox Is Nothing Then
+            onlineCheckBox = New CheckBox()
+            onlineCheckBox.Name = "onlineCheckBox"
+            onlineCheckBox.Text = "Online"
+            onlineCheckBox.Checked = True
+            onlineCheckBox.Visible = True
+            onlineCheckBox.AutoSize = True
+            onlineCheckBox.BackColor = SystemColors.Control
+            onlineCheckBox.UseVisualStyleBackColor = True
+            onlineCheckBox.Font = readableUiFont(False, 8.5!)
+            onlineCheckBox.Anchor = AnchorStyles.Top Or AnchorStyles.Left
+
+            Try
+                If butRefresh IsNot Nothing Then
+                    onlineCheckBox.TabIndex = butRefresh.TabIndex + 5
+                Else
+                    onlineCheckBox.TabIndex = 50
+                End If
+            Catch
+                onlineCheckBox.TabIndex = 50
+            End Try
+
+            parentControl.Controls.Add(onlineCheckBox)
+        Else
+            If onlineCheckBox.Parent Is Nothing Then
+                parentControl.Controls.Add(onlineCheckBox)
+            End If
+
+            onlineCheckBox.Text = "Online"
+            onlineCheckBox.Visible = True
+            onlineCheckBox.AutoSize = True
+            onlineCheckBox.BackColor = SystemColors.Control
+            onlineCheckBox.UseVisualStyleBackColor = True
+            onlineCheckBox.Font = readableUiFont(False, 8.5!)
+            onlineCheckBox.Anchor = AnchorStyles.Top Or AnchorStyles.Left
+        End If
+
+        Try
+            RemoveHandler onlineCheckBox.CheckedChanged, AddressOf boxCheck_Check
+        Catch
+        End Try
+
+        Try
+            AddHandler onlineCheckBox.CheckedChanged, AddressOf boxCheck_Check
+        Catch
+        End Try
+
+        positionOnlineCheckboxBesideVersion()
+
+        Try
+            onlineCheckBox.BringToFront()
+        Catch
+        End Try
+    End Sub
+
+    Private Sub positionOnlineCheckboxBesideVersion()
+        Try
+            If onlineCheckBox Is Nothing Then Exit Sub
+            If versionLabel Is Nothing Then Exit Sub
+
+            Dim parentControl As Control = onlineCheckBox.Parent
+            If parentControl Is Nothing Then parentControl = Me
+
+            'Place Online significantly to the right of Version, but still inside the task pane.
+            Dim desiredX As Integer = versionLabel.Right + uiPx(95)
+            Dim minimumX As Integer = versionLabel.Left + uiPx(270)
+            desiredX = Math.Max(desiredX, minimumX)
+
+            Dim maxX As Integer = parentControl.ClientSize.Width - onlineCheckBox.Width - uiPx(8)
+            If maxX < uiPx(4) Then maxX = uiPx(4)
+
+            Dim finalX As Integer = Math.Min(desiredX, maxX)
+
+            'If the pane is narrow, keep it at least a little right of the version label.
+            If finalX < versionLabel.Right + uiPx(20) Then
+                finalX = Math.Max(uiPx(4), maxX)
+            End If
+
+            Dim finalY As Integer = versionLabel.Top + CInt(Math.Round((versionLabel.Height - onlineCheckBox.Height) / 2.0))
+
+            onlineCheckBox.Location = New Point(finalX, Math.Max(0, finalY))
+            onlineCheckBox.BringToFront()
+        Catch
+        End Try
+    End Sub
     Private Sub ensureDebugIgnoreNamingCheckbox(ByVal parentControl As Control)
         If parentControl Is Nothing Then parentControl = Me
 
@@ -260,7 +372,10 @@ Public Class UserControl1
                 syncProgressBar.Width = uiPx(190)
             End If
 
+            ensureTreeStartDragHandle()
             positionRefreshAndSyncButtonsBesideCommit()
+            ensureOnlineCheckbox()
+            positionOnlineCheckboxBesideVersion()
         Catch
         End Try
     End Sub
@@ -299,6 +414,155 @@ Public Class UserControl1
             For Each child As Control In root.Controls
                 applyDpiFriendlySizingRecursive(child)
             Next
+        Catch
+        End Try
+    End Sub
+
+    Private Sub ensureTreeStartDragHandle()
+        Try
+            If TreeView1 Is Nothing Then Exit Sub
+
+            Dim parentControl As Control = TreeView1.Parent
+            If parentControl Is Nothing Then parentControl = Me
+
+            If treeStartDefaultTop < 0 Then treeStartDefaultTop = TreeView1.Top
+
+            If treeStartDragHandle Is Nothing Then
+                treeStartDragHandle = New Panel()
+                treeStartDragHandle.Name = "treeStartDragHandle"
+                treeStartDragHandle.Height = uiPx(8)
+                treeStartDragHandle.BackColor = SystemColors.ControlDark
+                treeStartDragHandle.Cursor = Cursors.HSplit
+                treeStartDragHandle.TabStop = False
+                treeStartDragHandle.Visible = True
+                treeStartDragHandle.BorderStyle = BorderStyle.None
+                treeStartDragHandle.Anchor = AnchorStyles.Left Or AnchorStyles.Right Or AnchorStyles.Top
+                treeStartDragHandle.Tag = "Drag this bar up/down to adjust where the SVN tree starts. Double-click to reset."
+                parentControl.Controls.Add(treeStartDragHandle)
+            ElseIf treeStartDragHandle.Parent Is Nothing Then
+                parentControl.Controls.Add(treeStartDragHandle)
+            End If
+
+            positionTreeStartDragHandle()
+            treeStartDragHandle.BringToFront()
+        Catch
+        End Try
+    End Sub
+
+    Private Sub positionTreeStartDragHandle()
+        Try
+            If TreeView1 Is Nothing Then Exit Sub
+            If treeStartDragHandle Is Nothing Then Exit Sub
+
+            Dim parentControl As Control = TreeView1.Parent
+            If parentControl Is Nothing Then parentControl = Me
+
+            Dim handleHeight As Integer = Math.Max(uiPx(6), treeStartDragHandle.Height)
+            treeStartDragHandle.Height = handleHeight
+            treeStartDragHandle.Left = TreeView1.Left
+            treeStartDragHandle.Width = Math.Max(uiPx(40), TreeView1.Width)
+            treeStartDragHandle.Top = Math.Max(0, TreeView1.Top - handleHeight)
+            treeStartDragHandle.BringToFront()
+        Catch
+        End Try
+    End Sub
+
+    Private Function getMinimumTreeStartTop() As Integer
+        Try
+            If TreeView1 Is Nothing Then Return uiPx(120)
+
+            Dim parentControl As Control = TreeView1.Parent
+            If parentControl Is Nothing Then parentControl = Me
+
+            Dim minTop As Integer = uiPx(120)
+            Dim treeBottom As Integer = TreeView1.Bottom
+
+            For Each sibling As Control In parentControl.Controls
+                If sibling Is Nothing Then Continue For
+                If Object.ReferenceEquals(sibling, TreeView1) Then Continue For
+                If treeStartDragHandle IsNot Nothing AndAlso Object.ReferenceEquals(sibling, treeStartDragHandle) Then Continue For
+                If Not sibling.Visible Then Continue For
+
+                'Only protect the action/header controls above the tree. This keeps users from
+                'dragging the tree start over Refresh/Sync/Commit/etc., while still allowing DPI fixes.
+                If sibling.Bottom <= treeBottom AndAlso sibling.Top < TreeView1.Top Then
+                    minTop = Math.Max(minTop, sibling.Bottom + uiPx(6))
+                End If
+            Next
+
+            Return Math.Min(minTop, Math.Max(uiPx(20), treeBottom - uiPx(80)))
+        Catch
+            Return uiPx(120)
+        End Try
+    End Function
+
+    Private Sub applyTreeStartTop(ByVal requestedTop As Integer)
+        Try
+            If TreeView1 Is Nothing Then Exit Sub
+
+            Dim oldBottom As Integer = TreeView1.Bottom
+            Dim minTop As Integer = getMinimumTreeStartTop()
+            Dim maxTop As Integer = Math.Max(minTop, oldBottom - uiPx(80))
+            Dim newTop As Integer = Math.Max(minTop, Math.Min(requestedTop, maxTop))
+
+            TreeView1.SuspendLayout()
+            TreeView1.Top = newTop
+            TreeView1.Height = Math.Max(uiPx(80), oldBottom - newTop)
+            TreeView1.ResumeLayout()
+
+            userAdjustedTreeStart = True
+            positionTreeStartDragHandle()
+        Catch
+            Try
+                TreeView1.ResumeLayout()
+            Catch
+            End Try
+        End Try
+    End Sub
+
+    Private Sub treeStartDragHandle_MouseDown(sender As Object, e As MouseEventArgs) Handles treeStartDragHandle.MouseDown
+        If e.Button <> MouseButtons.Left Then Exit Sub
+
+        Try
+            treeStartDragInProgress = True
+            treeStartDragMouseOffsetY = e.Y
+            treeStartDragHandle.Capture = True
+            treeStartDragHandle.BackColor = SystemColors.Highlight
+        Catch
+        End Try
+    End Sub
+
+    Private Sub treeStartDragHandle_MouseMove(sender As Object, e As MouseEventArgs) Handles treeStartDragHandle.MouseMove
+        If Not treeStartDragInProgress Then Exit Sub
+
+        Try
+            Dim parentControl As Control = TreeView1.Parent
+            If parentControl Is Nothing Then parentControl = Me
+
+            Dim mouseParentPoint As Point = parentControl.PointToClient(Control.MousePosition)
+            Dim newHandleTop As Integer = mouseParentPoint.Y - treeStartDragMouseOffsetY
+            applyTreeStartTop(newHandleTop + treeStartDragHandle.Height)
+        Catch
+        End Try
+    End Sub
+
+    Private Sub treeStartDragHandle_MouseUp(sender As Object, e As MouseEventArgs) Handles treeStartDragHandle.MouseUp
+        Try
+            treeStartDragInProgress = False
+            treeStartDragHandle.Capture = False
+            treeStartDragHandle.BackColor = SystemColors.ControlDark
+            positionTreeStartDragHandle()
+        Catch
+        End Try
+    End Sub
+
+    Private Sub treeStartDragHandle_DoubleClick(sender As Object, e As EventArgs) Handles treeStartDragHandle.DoubleClick
+        Try
+            If treeStartDefaultTop >= 0 Then
+                userAdjustedTreeStart = False
+                applyTreeStartTop(treeStartDefaultTop)
+                userAdjustedTreeStart = False
+            End If
         Catch
         End Try
     End Sub
@@ -448,6 +712,7 @@ Public Class UserControl1
         normalRefreshTreeBackColor = butRefresh.BackColor
         setRefreshTreeButtonNormal()
         ensureSyncStatusButton()
+        ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
 
         liveChangeCheckTimer = New System.Windows.Forms.Timer()
@@ -464,6 +729,9 @@ Public Class UserControl1
     Private Sub UserControl1_Resize(sender As Object, e As EventArgs) Handles MyBase.Resize
         Try
             positionRefreshAndSyncButtonsBesideCommit()
+            positionOnlineCheckboxBesideVersion()
+            ensureTreeStartDragHandle()
+            If userAdjustedTreeStart Then positionTreeStartDragHandle()
         Catch
         End Try
     End Sub
@@ -748,6 +1016,7 @@ Public Class UserControl1
         ToolStripSplitButFolder.DropDown.AutoClose = True
 
         ensureSyncStatusButton()
+        ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
 
         If iSwApp.GetDocumentCount = 0 Then
@@ -1500,7 +1769,7 @@ Public Class UserControl1
         End If
     End Sub
 
-    Private Sub boxCheck_Check(sender As Object, e As EventArgs) Handles onlineCheckBox.CheckedChanged
+    Private Sub boxCheck_Check(sender As Object, e As EventArgs)
         If onlineCheckBox.Checked = False Then Exit Sub
         refreshAddIn()
     End Sub
@@ -1670,6 +1939,7 @@ Public Class UserControl1
         TreeView1.Nodes(0).Expand()
         'TreeView1.ExpandAll()
         TreeView1.Show()
+        ensureTreeStartDragHandle()
 
     End Sub
     Function findStoredTreeView(pathName As String, Optional bRetryWithRefresh As Boolean = True) As Integer

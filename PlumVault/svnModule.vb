@@ -49,7 +49,7 @@ Public Module svnModule
                 If Not My.Computer.FileSystem.FileExists(sSVNPath) Then
                     iSwApp.SendMsgToUser2("Error: " & sInstallDirectory & "\bin\svn.exe" & "does not exist.",
                                     swMessageBoxIcon_e.swMbStop, swMessageBoxBtn_e.swMbOk)
-                    myUserControlPass.onlineCheckBox.Checked = False
+                    setOnlineModeEnabledOnControl(myUserControlPass, False)
                 End If
             End If
         End If
@@ -62,7 +62,7 @@ Public Module svnModule
                 If Not My.Computer.FileSystem.FileExists(sTortPath) Then
                     iSwApp.SendMsgToUser2("Error: " & sInstallDirectory & "\bin\TortoiseProc.exe" & "does not exist.",
                                        swMessageBoxIcon_e.swMbStop, swMessageBoxBtn_e.swMbOk)
-                    myUserControlPass.onlineCheckBox.Checked = False
+                    setOnlineModeEnabledOnControl(myUserControlPass, False)
                 End If
             End If
         End If
@@ -72,6 +72,65 @@ Public Module svnModule
         statusOfAllOpenModels = statusOfAllOpenModelsPass
 
     End Sub
+
+    Private Function getOnlineCheckBoxFromControl(ByVal ctrl As Object) As System.Windows.Forms.CheckBox
+        If ctrl Is Nothing Then Return Nothing
+
+        Try
+            Dim ctrlType As Type = ctrl.GetType()
+
+            Dim fieldInfo As System.Reflection.FieldInfo = ctrlType.GetField(
+                "onlineCheckBox",
+                System.Reflection.BindingFlags.Instance Or System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.NonPublic
+            )
+
+            If fieldInfo IsNot Nothing Then
+                Dim fieldValue As Object = fieldInfo.GetValue(ctrl)
+                Dim checkBox As System.Windows.Forms.CheckBox = TryCast(fieldValue, System.Windows.Forms.CheckBox)
+                If checkBox IsNot Nothing Then Return checkBox
+            End If
+
+            Dim propInfo As System.Reflection.PropertyInfo = ctrlType.GetProperty(
+                "onlineCheckBox",
+                System.Reflection.BindingFlags.Instance Or System.Reflection.BindingFlags.Public Or System.Reflection.BindingFlags.NonPublic
+            )
+
+            If propInfo IsNot Nothing Then
+                Dim propValue As Object = propInfo.GetValue(ctrl, Nothing)
+                Dim checkBox As System.Windows.Forms.CheckBox = TryCast(propValue, System.Windows.Forms.CheckBox)
+                If checkBox IsNot Nothing Then Return checkBox
+            End If
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function isOnlineModeEnabled() As Boolean
+        Dim checkBox As System.Windows.Forms.CheckBox = getOnlineCheckBoxFromControl(myUserControl)
+        If checkBox Is Nothing Then Return False
+
+        Try
+            Return checkBox.Checked
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Sub setOnlineModeEnabled(ByVal enabled As Boolean)
+        setOnlineModeEnabledOnControl(myUserControl, enabled)
+    End Sub
+
+    Private Sub setOnlineModeEnabledOnControl(ByVal ctrl As Object, ByVal enabled As Boolean)
+        Dim checkBox As System.Windows.Forms.CheckBox = getOnlineCheckBoxFromControl(ctrl)
+        If checkBox Is Nothing Then Exit Sub
+
+        Try
+            checkBox.Checked = enabled
+        Catch
+        End Try
+    End Sub
+
     Public Function updateLockStatusPublic(Optional bRefreshAllTreeViews As Boolean = True) As Boolean
         updateLockStatusPublic = statusOfAllOpenModels.updateStatusLocally(iSwApp)
         rebuildStatusCacheFromStatus(statusOfAllOpenModels)
@@ -94,7 +153,7 @@ Public Module svnModule
         If iSwApp Is Nothing Then Return False
         If modDocArr Is Nothing Then Return False
         If modDocArr.Length = 0 Then Return False
-        If Not myUserControl.onlineCheckBox.Checked Then Return False
+        If Not isOnlineModeEnabled() Then Return False
 
         liveAssemblyChangeCheckInProgress = True
 
@@ -122,7 +181,7 @@ Public Module svnModule
     Public Function blockCloseIfOpenDocsUnsafe() As Boolean
         If iSwApp Is Nothing Then Return False
         If myUserControl Is Nothing Then Return False
-        If Not myUserControl.onlineCheckBox.Checked Then Return False
+        If Not isOnlineModeEnabled() Then Return False
 
         'If the user just chose "No = close anyway", allow duplicate close events through briefly.
         If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
@@ -210,7 +269,7 @@ Public Module svnModule
     Public Function blockCloseIfSingleDocUnsafe(ByVal closingDoc As ModelDoc2) As Boolean
         If iSwApp Is Nothing Then Return False
         If myUserControl Is Nothing Then Return False
-        If Not myUserControl.onlineCheckBox.Checked Then Return False
+        If Not isOnlineModeEnabled() Then Return False
 
         'If the user just chose "No = close anyway", allow duplicate close events through briefly.
         If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
@@ -1128,7 +1187,7 @@ Public Module svnModule
         If iSwApp Is Nothing Then Return False
         If sFilePathArr Is Nothing Then Return False
         If sFilePathArr.Length = 0 Then Return False
-        If Not myUserControl.onlineCheckBox.Checked Then Return False
+        If Not isOnlineModeEnabled() Then Return False
 
         Dim filteredPaths() As String = filterExistingCadFilePathsOnly(sFilePathArr)
 
@@ -2826,6 +2885,44 @@ Public Module svnModule
         Return output.ToArray()
     End Function
 
+    Private Function getOpenAssemblyDocsForCommitPaths(ByVal commitPaths() As String) As ModelDoc2()
+        If commitPaths Is Nothing Then Return Nothing
+
+        Dim output As New List(Of ModelDoc2)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each p As String In commitPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+            If Not p.EndsWith(".SLDASM", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+            Dim assyDoc As ModelDoc2 = getOpenModelByPathSafe(p)
+            If assyDoc Is Nothing Then Continue For
+
+            Try
+                If assyDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            Dim assyPath As String = ""
+            Try
+                assyPath = assyDoc.GetPathName()
+            Catch
+                assyPath = p
+            End Try
+
+            If String.IsNullOrWhiteSpace(assyPath) Then assyPath = p
+
+            If Not seen.Contains(assyPath) Then
+                seen.Add(assyPath)
+                output.Add(assyDoc)
+            End If
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
     Private Function prepareExternalReferencesForCommitPaths(ByRef commitPaths() As String) As Boolean
         If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return True
 
@@ -2834,7 +2931,10 @@ Public Module svnModule
 
         'Only assembly commits can change references. If external/vendor CAD must be copied/relinked,
         'the assembly itself has to be writable/locked, except for a brand-new first commit assembly.
-        If Not activeAssemblyMustBeLockedForReferenceChanges() Then Return False
+        'Reference changes must be protected by the assembly being committed, not necessarily the active/top-level assembly.
+        'This allows a locked subassembly (for example FINAL Swirl Pot Assembly) to process vendor/external children
+        'without requiring the top-level car assembly to be checked out.
+        If Not targetAssembliesMustBeLockedForReferenceChanges(getOpenAssemblyDocsForCommitPaths(commitPaths)) Then Return False
         If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Return False
 
         Dim merged As New List(Of String)()
@@ -3409,6 +3509,107 @@ Public Module svnModule
         Return False
     End Function
 
+    Private Function targetAssembliesMustBeLockedForReferenceChanges(ByVal assemblyDocs() As ModelDoc2) As Boolean
+        If assemblyDocs Is Nothing OrElse assemblyDocs.Length = 0 Then Return True
+
+        Dim docsThatNeedLocks As New List(Of ModelDoc2)()
+        Dim namesThatNeedLocks As New List(Of String)()
+
+        For Each doc As ModelDoc2 In assemblyDocs
+            If doc Is Nothing Then Continue For
+
+            Try
+                If doc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            Dim docPath As String = ""
+            Dim displayName As String = "<assembly>"
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                docPath = ""
+            End Try
+
+            Try
+                If Not String.IsNullOrWhiteSpace(docPath) Then
+                    displayName = Path.GetFileName(docPath)
+                Else
+                    displayName = doc.GetTitle()
+                End If
+            Catch
+            End Try
+
+            'Brand-new assemblies saved inside the SVN working copy cannot be locked yet,
+            'because they are not version controlled until the first commit.
+            'Allow them through so Commit can svn add + commit them.
+            If isNewUnversionedOrAddedFile(docPath) Then Continue For
+
+            docsThatNeedLocks.Add(doc)
+            namesThatNeedLocks.Add(displayName)
+        Next
+
+        If docsThatNeedLocks.Count = 0 Then Return True
+
+        Try
+            Dim lockCheckDocs() As ModelDoc2 = docsThatNeedLocks.ToArray()
+            Dim hasLocks As Boolean() = ensureUserHasLocks(lockCheckDocs, bRetry:=False)
+
+            Dim missingLocks As New List(Of String)()
+
+            For i As Integer = 0 To docsThatNeedLocks.Count - 1
+                Dim lockedByYou As Boolean = False
+
+                If hasLocks IsNot Nothing AndAlso i < hasLocks.Length Then
+                    lockedByYou = hasLocks(i)
+                End If
+
+                If Not lockedByYou Then
+                    If i < namesThatNeedLocks.Count Then
+                        missingLocks.Add(namesThatNeedLocks(i))
+                    Else
+                        missingLocks.Add("<assembly>")
+                    End If
+                End If
+            Next
+
+            If missingLocks.Count = 0 Then Return True
+
+            Dim msg As String = "Commit blocked." & vbCrLf & vbCrLf &
+                "The assembly being committed must be locked by you before external or vendor CAD can be added." & vbCrLf & vbCrLf &
+                "Why:" & vbCrLf &
+                "Adding vendor/external CAD changes assembly references, so the target assembly must be writable and locked first." & vbCrLf & vbCrLf &
+                "Assembly missing your lock:" & vbCrLf
+
+            For Each missingName As String In missingLocks
+                msg &= "- " & missingName & vbCrLf
+            Next
+
+            msg &= vbCrLf & "Please click Get Locks on the selected assembly, then try Commit again."
+
+            iSwApp.SendMsgToUser2(
+                msg,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+
+            Return False
+
+        Catch
+            iSwApp.SendMsgToUser2(
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "The plugin could not verify that the target assembly is locked by you before changing vendor/external references." & vbCrLf & vbCrLf &
+                "Please click Get Locks on the selected assembly, then try Commit again.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+
+            Return False
+        End Try
+    End Function
+
     Public Function prepareExternalReferencesForSvnAction(ByRef modDocArr() As ModelDoc2) As Boolean
         If modDocArr Is Nothing Then Return True
         If modDocArr.Length = 0 Then Return True
@@ -3937,7 +4138,8 @@ Public Module svnModule
             End Try
         End If
 
-        If Not activeAssemblyMustBeLockedForReferenceChanges() Then Exit Sub
+        'Reference changes must be protected by the selected/committed assembly, not necessarily the active/top-level assembly.
+        If Not targetAssembliesMustBeLockedForReferenceChanges(modDocArr) Then Exit Sub
 
         If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Exit Sub
 
@@ -5487,7 +5689,7 @@ Public Module svnModule
 
         sLocalPath = myUserControl.localRepoPath.Text
 
-        If Not myUserControl.onlineCheckBox.Checked Then Return False
+        If Not isOnlineModeEnabled() Then Return False
 
         'Check the file exists on the computer
         If bCheckLocalFolder Then
@@ -6089,7 +6291,7 @@ Public Module svnModule
     End Function
 
     Sub switchToOffline()
-        myUserControl.onlineCheckBox.Checked = False
+        setOnlineModeEnabled(False)
 
         clearMyTree("Offline. Click Checkbox at top of add-in to go online.")
 
