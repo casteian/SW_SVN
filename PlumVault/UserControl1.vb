@@ -35,6 +35,7 @@ Public Class UserControl1
     'Public allTreeViews As New List(Of TreeView())
 
     Private WithEvents liveChangeCheckTimer As System.Windows.Forms.Timer
+    Private WithEvents graphicalSelectionSyncTimer As System.Windows.Forms.Timer
     Private WithEvents butSyncStatus As Button
     Private WithEvents chkDebugIgnoreNaming As CheckBox
     Private syncProgressBar As ProgressBar
@@ -45,6 +46,14 @@ Public Class UserControl1
     Private refreshTreeNeedsUpdate As Boolean = False
     Private normalRefreshTreeBackColor As Color
     Private lastLiveCheckedActivePath As String = ""
+    Private lastGraphicalSelectionPath As String = ""
+    Private lastGraphicallyHighlightedTreeNode As TreeNode = Nothing
+    Private ReadOnly treeSelectionBackColor As Color = Color.FromArgb(0, 82, 180)
+    Private ReadOnly treeSelectionForeColor As Color = Color.White
+
+    Private Function normalTreeTextColor() As Color
+        Return Color.Black
+    End Function
 
     'Tracks whether the TreeView selection came from an actual user click.
     'WinForms/SolidWorks can leave the root node selected even when the user thinks
@@ -228,7 +237,9 @@ Public Class UserControl1
             If TreeView1 IsNot Nothing Then
                 TreeView1.Font = readableUiFont(False, 9.0!)
                 TreeView1.HideSelection = False
-                TreeView1.ItemHeight = Math.Max(TreeView1.ItemHeight, uiPx(20))
+                TreeView1.FullRowSelect = False
+                TreeView1.DrawMode = TreeViewDrawMode.OwnerDrawText
+                TreeView1.ItemHeight = Math.Max(TreeView1.ItemHeight, uiPx(21))
             End If
 
             If butRefresh IsNot Nothing Then setCompactSvnActionButtonStyle(butRefresh, "Refresh")
@@ -443,6 +454,10 @@ Public Class UserControl1
         liveChangeCheckTimer.Interval = 30000 '30 seconds
         liveChangeCheckTimer.Start()
 
+        graphicalSelectionSyncTimer = New System.Windows.Forms.Timer()
+        graphicalSelectionSyncTimer.Interval = 500 'Keep the add-in tree aligned to graphical selections without SVN/server work.
+        graphicalSelectionSyncTimer.Start()
+
 
     End Sub
 
@@ -472,6 +487,252 @@ Public Class UserControl1
             lastLiveCheckedActivePath = activePath
             setRefreshTreeButtonNormal()
         End If
+    End Sub
+
+    Private Sub graphicalSelectionSyncTimer_Tick(sender As Object, e As EventArgs) Handles graphicalSelectionSyncTimer.Tick
+        'Client-side visual sync only:
+        'If the user clicks a component in the SOLIDWORKS graphics/tree area, select the matching
+        'node in the SVN task-pane tree. This does not call SVN and does not resolve components.
+        Try
+            If iSwApp Is Nothing Then Exit Sub
+            If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing OrElse TreeView1.Nodes.Count = 0 Then Exit Sub
+
+            Dim selectedPath As String = getCurrentGraphicalSelectionCadPath()
+
+            If String.IsNullOrWhiteSpace(selectedPath) Then Exit Sub
+
+            Try
+                selectedPath = Path.GetFullPath(selectedPath)
+            Catch
+            End Try
+
+            If String.Equals(selectedPath, lastGraphicalSelectionPath, StringComparison.OrdinalIgnoreCase) Then Exit Sub
+            lastGraphicalSelectionPath = selectedPath
+
+            selectTreeNodeByCadPath(selectedPath)
+        Catch
+        End Try
+    End Sub
+
+    Private Function getCurrentGraphicalSelectionCadPath() As String
+        Try
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc Is Nothing Then Return ""
+
+            If activeDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then
+                Return activeDoc.GetPathName()
+            End If
+
+            Dim selMgr As SelectionMgr = activeDoc.SelectionManager
+            If selMgr Is Nothing Then Return ""
+
+            Dim selCount As Integer = selMgr.GetSelectedObjectCount2(-1)
+            If selCount <= 0 Then Return ""
+
+            For i As Integer = 1 To selCount
+                Dim comp As Component2 = Nothing
+
+                Try
+                    comp = selMgr.GetSelectedObjectsComponent4(i, -1)
+                Catch
+                    comp = Nothing
+                End Try
+
+                If comp Is Nothing Then Continue For
+
+                Dim compPath As String = ""
+
+                Try
+                    compPath = comp.GetPathName()
+                Catch
+                    compPath = ""
+                End Try
+
+                If Not String.IsNullOrWhiteSpace(compPath) AndAlso isCadPathForSync(compPath) Then
+                    Return compPath
+                End If
+            Next
+        Catch
+        End Try
+
+        Return ""
+    End Function
+
+    Private Sub selectTreeNodeByCadPath(ByVal filePath As String)
+        If String.IsNullOrWhiteSpace(filePath) Then Exit Sub
+
+        Dim normalizedTarget As String = normalizePathForNodeMatch(filePath)
+        If String.IsNullOrWhiteSpace(normalizedTarget) Then Exit Sub
+
+        Dim matchedNode As TreeNode = Nothing
+        Dim visitedCount As Integer = 0
+
+        Try
+            TreeView1.BeginUpdate()
+
+            For Each rootNode As TreeNode In TreeView1.Nodes
+                matchedNode = findTreeNodeByCadPathRecursive(rootNode, normalizedTarget, visitedCount, 750)
+                If matchedNode IsNot Nothing Then Exit For
+            Next
+
+            If matchedNode Is Nothing Then
+                clearGraphicalTreeHighlight()
+                Exit Sub
+            End If
+
+            expandParentsForTreeNode(matchedNode)
+            TreeView1.SelectedNode = matchedNode
+            matchedNode.EnsureVisible()
+            applyGraphicalTreeHighlight(matchedNode)
+
+            'Important:
+            'A graphics-area click is only a visual/tree alignment helper.
+            'Do not mark it as a deliberate Sync branch selection.
+            'If the user wants Sync to target this branch, they can click the node in the SVN tree.
+        Catch
+        Finally
+            Try
+                TreeView1.EndUpdate()
+            Catch
+            End Try
+        End Try
+    End Sub
+
+    Private Function findTreeNodeByCadPathRecursive(ByVal node As TreeNode,
+                                                     ByVal normalizedTarget As String,
+                                                     ByRef visitedCount As Integer,
+                                                     ByVal maxVisitedNodes As Integer) As TreeNode
+        If node Is Nothing Then Return Nothing
+
+        visitedCount += 1
+        If visitedCount > maxVisitedNodes Then Return Nothing
+
+        Try
+            Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
+            If nodePath <> "" AndAlso String.Equals(nodePath, normalizedTarget, StringComparison.OrdinalIgnoreCase) Then
+                Return node
+            End If
+        Catch
+        End Try
+
+        'If this is a lazy assembly node, load its immediate children only when the graphics
+        'selection changed and we are actively trying to find that one selected file.
+        'This avoids a server call and avoids resolving the whole car during normal idle time.
+        Try
+            If hasLazyPlaceholder(node) Then
+                loadImmediateChildrenForNode(node)
+            End If
+        Catch
+        End Try
+
+        Try
+            For Each childNode As TreeNode In node.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+
+                Dim found As TreeNode = findTreeNodeByCadPathRecursive(childNode, normalizedTarget, visitedCount, maxVisitedNodes)
+                If found IsNot Nothing Then Return found
+            Next
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Sub expandParentsForTreeNode(ByVal node As TreeNode)
+        Try
+            Dim parentNode As TreeNode = node.Parent
+
+            While parentNode IsNot Nothing
+                parentNode.Expand()
+                parentNode = parentNode.Parent
+            End While
+        Catch
+        End Try
+    End Sub
+
+    Private Sub clearGraphicalTreeHighlight()
+        Try
+            If lastGraphicallyHighlightedTreeNode Is Nothing Then Exit Sub
+
+            Dim oldNode As TreeNode = lastGraphicallyHighlightedTreeNode
+            lastGraphicallyHighlightedTreeNode = Nothing
+
+            If oldNode.TreeView IsNot Nothing Then
+                oldNode.Text = stripStatusSuffix(oldNode.Text)
+
+                'Important: graphical selection draws white text while selected/highlighted.
+                'When the user selects off, reset the stored node ForeColor back to normal black.
+                oldNode.ForeColor = normalTreeTextColor()
+                setNodeColorFromStatus(oldNode)
+                oldNode.TreeView.Invalidate(oldNode.Bounds)
+            End If
+        Catch
+            lastGraphicallyHighlightedTreeNode = Nothing
+        End Try
+    End Sub
+
+    Private Sub applyGraphicalTreeHighlight(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+
+        Try
+            If lastGraphicallyHighlightedTreeNode IsNot Nothing AndAlso Not Object.ReferenceEquals(lastGraphicallyHighlightedTreeNode, node) Then
+                clearGraphicalTreeHighlight()
+            End If
+
+            lastGraphicallyHighlightedTreeNode = node
+
+            'Use owner-draw for the dark highlight instead of permanently changing ForeColor.
+            'Permanently setting ForeColor to white causes the text to stay white after selecting off.
+            If node.TreeView IsNot Nothing Then node.TreeView.Invalidate(node.Bounds)
+        Catch
+        End Try
+    End Sub
+
+
+    Private Sub TreeView1_DrawNode(ByVal sender As Object, ByVal e As DrawTreeNodeEventArgs) Handles TreeView1.DrawNode
+        If e Is Nothing OrElse e.Node Is Nothing Then Exit Sub
+
+        Try
+            Dim tv As TreeView = TryCast(sender, TreeView)
+            If tv Is Nothing Then
+                e.DrawDefault = True
+                Exit Sub
+            End If
+
+            Dim isSelected As Boolean = ((e.State And TreeNodeStates.Selected) = TreeNodeStates.Selected)
+            Dim isGraphicalHighlight As Boolean = False
+
+            Try
+                isGraphicalHighlight = lastGraphicallyHighlightedTreeNode IsNot Nothing AndAlso Object.ReferenceEquals(e.Node, lastGraphicallyHighlightedTreeNode)
+            Catch
+                isGraphicalHighlight = False
+            End Try
+
+            Dim backColor As Color = e.Node.BackColor
+            Dim foreColor As Color = e.Node.ForeColor
+
+            If isSelected OrElse isGraphicalHighlight Then
+                backColor = treeSelectionBackColor
+                foreColor = treeSelectionForeColor
+            Else
+                'If a previous graphical/selected highlight left selection colors on the node,
+                'draw it with normal tree colors once it is no longer selected/highlighted.
+                If backColor = Color.Empty OrElse backColor = treeSelectionBackColor Then backColor = tv.BackColor
+                If foreColor = Color.Empty OrElse foreColor = treeSelectionForeColor Then foreColor = tv.ForeColor
+            End If
+
+            Dim textBounds As Rectangle = e.Bounds
+            If textBounds.Width < 1 Then textBounds.Width = Math.Max(1, tv.ClientSize.Width - textBounds.Left - uiPx(4))
+
+            Using b As New SolidBrush(backColor)
+                e.Graphics.FillRectangle(b, textBounds)
+            End Using
+
+            Dim flags As TextFormatFlags = TextFormatFlags.NoPrefix Or TextFormatFlags.VerticalCenter Or TextFormatFlags.SingleLine Or TextFormatFlags.NoPadding
+            TextRenderer.DrawText(e.Graphics, e.Node.Text, tv.Font, textBounds, foreColor, backColor, flags)
+        Catch
+            e.DrawDefault = True
+        End Try
     End Sub
 
     Friend Sub myInitialize(ByRef swAppin As SldWorks)
@@ -894,6 +1155,12 @@ Public Class UserControl1
             'If the user simply clicks Sync, that used to behave like Level 0 was selected
             'and would sync the root assembly too. Treat an auto-selected root as
             '"nothing selected" so default Sync remains Level 1 only.
+            If lastGraphicallyHighlightedTreeNode IsNot Nothing AndAlso
+               Object.ReferenceEquals(selectedNode, lastGraphicallyHighlightedTreeNode) AndAlso
+               Not Object.ReferenceEquals(selectedNode, lastUserClickedTreeNodeForSync) Then
+                Return Nothing
+            End If
+
             If selectedNode.Parent Is Nothing Then
                 If lastUserClickedTreeNodeForSync Is Nothing Then Return Nothing
                 If Not Object.ReferenceEquals(selectedNode, lastUserClickedTreeNodeForSync) Then Return Nothing
@@ -1296,6 +1563,7 @@ Public Class UserControl1
 
         Try
             If e IsNot Nothing AndAlso e.Node IsNot Nothing Then
+                clearGraphicalTreeHighlight()
                 TreeView1.SelectedNode = e.Node
                 lastUserClickedTreeNodeForSync = e.Node
             End If
@@ -2758,6 +3026,10 @@ Public Class UserControl1
 
         Dim baseNodeText As String = stripStatusSuffix(rootNode.Text)
         rootNode.Text = baseNodeText
+
+        'Reset normal text color every time status is reapplied.
+        'Selected/highlighted nodes still draw white through TreeView1_DrawNode.
+        rootNode.ForeColor = normalTreeTextColor()
 
         If modDoc IsNot Nothing Then
             status1 = findStatusForFile(modDoc.GetPathName())
