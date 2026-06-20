@@ -42,6 +42,8 @@ Public Class UserControl1
     Private syncProgressBar As ProgressBar
     Private syncProgressLabel As Label
     Private syncStatusContextMenu As ContextMenuStrip
+    Private WithEvents syncDebugTimingMenuItem As ToolStripMenuItem
+    Private syncDebugTimingEnabled As Boolean = False
     Private Const LAZY_LOAD_PLACEHOLDER_TEXT As String = "<load children>"
     Private syncStatusInProgress As Boolean = False
     Private refreshTreeNeedsUpdate As Boolean = False
@@ -56,6 +58,8 @@ Public Class UserControl1
     Private treeStartDragMouseOffsetY As Integer = 0
     Private treeStartDefaultTop As Integer = -1
     Private userAdjustedTreeStart As Boolean = False
+    Private batchSelectedTreeNodes As New List(Of TreeNode)()
+    Private lastBatchAnchorTreeNode As TreeNode = Nothing
 
     Private Function normalTreeTextColor() As Color
         Return Color.Black
@@ -124,6 +128,24 @@ Public Class UserControl1
         ensureSyncProgressControls(parentControl)
 
         positionRefreshAndSyncButtonsBesideCommit()
+        removeGetLatestAllMenuItem()
+    End Sub
+
+    Private Sub removeGetLatestAllMenuItem()
+        Try
+            If dropDownGetLatestAll IsNot Nothing Then
+                dropDownGetLatestAll.Visible = False
+                dropDownGetLatestAll.Enabled = False
+            End If
+
+            If ToolStripDropDownButGetLatest IsNot Nothing AndAlso dropDownGetLatestAll IsNot Nothing Then
+                Try
+                    ToolStripDropDownButGetLatest.DropDownItems.Remove(dropDownGetLatestAll)
+                Catch
+                End Try
+            End If
+        Catch
+        End Try
     End Sub
 
 
@@ -374,6 +396,7 @@ Public Class UserControl1
 
             ensureTreeStartDragHandle()
             positionRefreshAndSyncButtonsBesideCommit()
+            removeGetLatestAllMenuItem()
             ensureOnlineCheckbox()
             positionOnlineCheckboxBesideVersion()
         Catch
@@ -576,8 +599,19 @@ Public Class UserControl1
             Dim syncBranchItem As New ToolStripMenuItem("Sync Selected Branch", Nothing, AddressOf syncSelectedBranchMenuItem_Click)
             Dim syncWholeCarItem As New ToolStripMenuItem("Sync Whole Car Status (slow)", Nothing, AddressOf syncWholeCarMenuItem_Click)
 
+            syncDebugTimingMenuItem = New ToolStripMenuItem("Debug Timing Popups")
+            syncDebugTimingMenuItem.CheckOnClick = True
+            syncDebugTimingMenuItem.Checked = syncDebugTimingEnabled
+            AddHandler syncDebugTimingMenuItem.CheckedChanged, AddressOf syncDebugTimingMenuItem_CheckedChanged
+
             syncStatusContextMenu.Items.Add(syncBranchItem)
             syncStatusContextMenu.Items.Add(syncWholeCarItem)
+            syncStatusContextMenu.Items.Add(New ToolStripSeparator())
+            syncStatusContextMenu.Items.Add(syncDebugTimingMenuItem)
+        Else
+            If syncDebugTimingMenuItem IsNot Nothing Then
+                syncDebugTimingMenuItem.Checked = syncDebugTimingEnabled
+            End If
         End If
 
         butSyncStatus.ContextMenuStrip = syncStatusContextMenu
@@ -585,6 +619,271 @@ Public Class UserControl1
         butSyncStatus.AutoEllipsis = True
         butSyncStatus.UseVisualStyleBackColor = True
     End Sub
+
+    Private Sub syncDebugTimingMenuItem_CheckedChanged(sender As Object, e As EventArgs)
+        Try
+            If syncDebugTimingMenuItem IsNot Nothing Then
+                syncDebugTimingEnabled = syncDebugTimingMenuItem.Checked
+            End If
+        Catch
+            syncDebugTimingEnabled = False
+        End Try
+    End Sub
+
+    Public Function debugTimingEnabledPublic() As Boolean
+        Try
+            Return syncDebugTimingEnabled
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function syncDebugEnabled() As Boolean
+        Return debugTimingEnabledPublic()
+    End Function
+
+    Public Function syncStatusInProgressPublic() As Boolean
+        Try
+            Return syncStatusInProgress
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Sub showSyncDebugWindow(ByVal title As String,
+                                    ByVal syncPaths() As String,
+                                    ByVal preSyncTimingLog As String,
+                                    ByVal backgroundTimingLog As String,
+                                    ByVal totalElapsedMs As Long,
+                                    ByVal errorMessage As String)
+        Try
+            If Not syncDebugEnabled() Then Exit Sub
+
+            Dim msg As New System.Text.StringBuilder()
+
+            msg.AppendLine(title)
+            msg.AppendLine()
+
+            If syncPaths IsNot Nothing Then
+                msg.AppendLine("Files queued: " & syncPaths.Length.ToString())
+            Else
+                msg.AppendLine("Files queued: 0")
+            End If
+
+            If totalElapsedMs >= 0 Then
+                msg.AppendLine("Total elapsed after background start: " & totalElapsedMs.ToString() & " ms")
+            End If
+
+            If Not String.IsNullOrWhiteSpace(preSyncTimingLog) Then
+                msg.AppendLine()
+                msg.AppendLine("UI / tree collection timing:")
+                msg.AppendLine(preSyncTimingLog)
+            End If
+
+            If Not String.IsNullOrWhiteSpace(backgroundTimingLog) Then
+                msg.AppendLine()
+                msg.AppendLine("SVN background timing:")
+                msg.AppendLine(backgroundTimingLog)
+            End If
+
+            If Not String.IsNullOrWhiteSpace(errorMessage) Then
+                msg.AppendLine()
+                msg.AppendLine("Error:")
+                msg.AppendLine(errorMessage)
+            End If
+
+            If syncPaths IsNot Nothing AndAlso syncPaths.Length > 0 Then
+                msg.AppendLine()
+                msg.AppendLine("First queued paths:")
+
+                Dim maxPathsToShow As Integer = Math.Min(syncPaths.Length, 8)
+
+                For i As Integer = 0 To maxPathsToShow - 1
+                    msg.AppendLine("- " & syncPaths(i))
+                Next
+
+                If syncPaths.Length > maxPathsToShow Then
+                    msg.AppendLine("... +" & (syncPaths.Length - maxPathsToShow).ToString() & " more")
+                End If
+            End If
+
+            System.Windows.Forms.MessageBox.Show(
+                msg.ToString(),
+                "SVN Sync Debug",
+                System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Information
+            )
+        Catch
+        End Try
+    End Sub
+
+    Private Function isTreeNodeBatchSelected(ByVal node As TreeNode) As Boolean
+        If node Is Nothing Then Return False
+
+        Try
+            For Each selectedNode As TreeNode In batchSelectedTreeNodes
+                If Object.ReferenceEquals(selectedNode, node) Then Return True
+            Next
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Private Sub clearBatchTreeSelection(Optional ByVal invalidateTree As Boolean = True)
+        Try
+            batchSelectedTreeNodes.Clear()
+            lastBatchAnchorTreeNode = Nothing
+            If invalidateTree AndAlso TreeView1 IsNot Nothing Then TreeView1.Invalidate()
+        Catch
+        End Try
+    End Sub
+
+    Private Sub addBatchTreeNode(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+        If isLazyPlaceholderNode(node) Then Exit Sub
+
+        Try
+            If Not isTreeNodeBatchSelected(node) Then batchSelectedTreeNodes.Add(node)
+        Catch
+        End Try
+    End Sub
+
+    Private Sub toggleBatchTreeNode(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+        If isLazyPlaceholderNode(node) Then Exit Sub
+
+        Try
+            For i As Integer = batchSelectedTreeNodes.Count - 1 To 0 Step -1
+                If Object.ReferenceEquals(batchSelectedTreeNodes(i), node) Then
+                    batchSelectedTreeNodes.RemoveAt(i)
+                    If TreeView1 IsNot Nothing Then TreeView1.Invalidate()
+                    Exit Sub
+                End If
+            Next
+
+            batchSelectedTreeNodes.Add(node)
+            lastBatchAnchorTreeNode = node
+            If TreeView1 IsNot Nothing Then TreeView1.Invalidate()
+        Catch
+        End Try
+    End Sub
+
+    Private Function getVisibleTreeNodesFlat() As List(Of TreeNode)
+        Dim output As New List(Of TreeNode)()
+
+        Try
+            If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing Then Return output
+
+            For Each node As TreeNode In TreeView1.Nodes
+                addVisibleTreeNodeFlatRecursive(node, output)
+            Next
+        Catch
+        End Try
+
+        Return output
+    End Function
+
+    Private Sub addVisibleTreeNodeFlatRecursive(ByVal node As TreeNode, ByVal output As List(Of TreeNode))
+        If node Is Nothing Then Exit Sub
+        If output Is Nothing Then Exit Sub
+
+        output.Add(node)
+
+        Try
+            If Not node.IsExpanded Then Exit Sub
+
+            For Each childNode As TreeNode In node.Nodes
+                addVisibleTreeNodeFlatRecursive(childNode, output)
+            Next
+        Catch
+        End Try
+    End Sub
+
+    Private Sub selectBatchTreeRange(ByVal endNode As TreeNode)
+        If endNode Is Nothing Then Exit Sub
+
+        Try
+            If lastBatchAnchorTreeNode Is Nothing Then lastBatchAnchorTreeNode = endNode
+
+            Dim visibleNodes As List(Of TreeNode) = getVisibleTreeNodesFlat()
+            Dim anchorIndex As Integer = -1
+            Dim endIndex As Integer = -1
+
+            For i As Integer = 0 To visibleNodes.Count - 1
+                If Object.ReferenceEquals(visibleNodes(i), lastBatchAnchorTreeNode) Then anchorIndex = i
+                If Object.ReferenceEquals(visibleNodes(i), endNode) Then endIndex = i
+            Next
+
+            If anchorIndex < 0 OrElse endIndex < 0 Then
+                clearBatchTreeSelection(False)
+                addBatchTreeNode(endNode)
+                lastBatchAnchorTreeNode = endNode
+                If TreeView1 IsNot Nothing Then TreeView1.Invalidate()
+                Exit Sub
+            End If
+
+            Dim firstIndex As Integer = Math.Min(anchorIndex, endIndex)
+            Dim lastIndex As Integer = Math.Max(anchorIndex, endIndex)
+
+            clearBatchTreeSelection(False)
+
+            For i As Integer = firstIndex To lastIndex
+                addBatchTreeNode(visibleNodes(i))
+            Next
+
+            If TreeView1 IsNot Nothing Then TreeView1.Invalidate()
+        Catch
+        End Try
+    End Sub
+
+    Private Function getBatchSelectedTreeCadPathsForAction(Optional ByVal includeSingleSelectedNode As Boolean = True) As String()
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            If batchSelectedTreeNodes IsNot Nothing AndAlso batchSelectedTreeNodes.Count > 0 Then
+                For Each node As TreeNode In batchSelectedTreeNodes
+                    addTreeNodePathToBatchActionList(node, seen, output)
+                Next
+            ElseIf includeSingleSelectedNode AndAlso TreeView1 IsNot Nothing AndAlso TreeView1.SelectedNode IsNot Nothing Then
+                'Only use the single tree selection for file actions if the user actually clicked it.
+                'This avoids acting on an automatically-selected root node after refresh.
+                If lastUserClickedTreeNodeForSync IsNot Nothing AndAlso Object.ReferenceEquals(TreeView1.SelectedNode, lastUserClickedTreeNodeForSync) Then
+                    addTreeNodePathToBatchActionList(TreeView1.SelectedNode, seen, output)
+                End If
+            End If
+        Catch
+        End Try
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Sub addTreeNodePathToBatchActionList(ByVal node As TreeNode,
+                                                 ByVal seen As HashSet(Of String),
+                                                 ByVal output As List(Of String))
+        If node Is Nothing Then Exit Sub
+        If isLazyPlaceholderNode(node) Then Exit Sub
+        If seen Is Nothing OrElse output Is Nothing Then Exit Sub
+
+        Dim nodePath As String = getCadPathFromTreeNode(node)
+        If Not isCadPathForSync(nodePath) Then Exit Sub
+
+        Try
+            nodePath = Path.GetFullPath(nodePath)
+        Catch
+        End Try
+
+        If seen.Contains(nodePath) Then Exit Sub
+
+        seen.Add(nodePath)
+        output.Add(nodePath)
+    End Sub
+
+    Public Function getBatchSelectedTreeCadPathsForActionPublic(Optional ByVal includeSingleSelectedNode As Boolean = True) As String()
+        Return getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode)
+    End Function
 
     Private Sub syncSelectedBranchMenuItem_Click(sender As Object, e As EventArgs)
         performSyncStatus()
@@ -712,6 +1011,7 @@ Public Class UserControl1
         normalRefreshTreeBackColor = butRefresh.BackColor
         setRefreshTreeButtonNormal()
         ensureSyncStatusButton()
+        removeGetLatestAllMenuItem()
         ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
 
@@ -729,6 +1029,7 @@ Public Class UserControl1
     Private Sub UserControl1_Resize(sender As Object, e As EventArgs) Handles MyBase.Resize
         Try
             positionRefreshAndSyncButtonsBesideCommit()
+            removeGetLatestAllMenuItem()
             positionOnlineCheckboxBesideVersion()
             ensureTreeStartDragHandle()
             If userAdjustedTreeStart Then positionTreeStartDragHandle()
@@ -969,6 +1270,7 @@ Public Class UserControl1
 
             Dim isSelected As Boolean = ((e.State And TreeNodeStates.Selected) = TreeNodeStates.Selected)
             Dim isGraphicalHighlight As Boolean = False
+            Dim isBatchSelected As Boolean = False
 
             Try
                 isGraphicalHighlight = lastGraphicallyHighlightedTreeNode IsNot Nothing AndAlso Object.ReferenceEquals(e.Node, lastGraphicallyHighlightedTreeNode)
@@ -976,10 +1278,16 @@ Public Class UserControl1
                 isGraphicalHighlight = False
             End Try
 
+            Try
+                isBatchSelected = isTreeNodeBatchSelected(e.Node)
+            Catch
+                isBatchSelected = False
+            End Try
+
             Dim backColor As Color = e.Node.BackColor
             Dim foreColor As Color = e.Node.ForeColor
 
-            If isSelected OrElse isGraphicalHighlight Then
+            If isSelected OrElse isGraphicalHighlight OrElse isBatchSelected Then
                 backColor = treeSelectionBackColor
                 foreColor = treeSelectionForeColor
             Else
@@ -1016,6 +1324,7 @@ Public Class UserControl1
         ToolStripSplitButFolder.DropDown.AutoClose = True
 
         ensureSyncStatusButton()
+        removeGetLatestAllMenuItem()
         ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
 
@@ -1143,27 +1452,47 @@ Public Class UserControl1
 
     ' ### Unlock
     Private Sub ToolStripDropDownButUnlock_ButtonClick(sender As Object, e As EventArgs) Handles ToolStripDropDownButUnlock.ButtonClick
-        unlockDocs(GetSelectedModDocList(iSwApp))
+        Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
+
+        If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
+            unlockPathsLockedOnly(selectedTreePaths)
+        Else
+            unlockDocs(GetSelectedModDocList(iSwApp))
+        End If
+
         updateStatusStrip()
     End Sub
     Private Sub dropDownUnlockWithDependents_Click(sender As Object, e As EventArgs) Handles dropDownUnlockWithDependents.Click
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
+
+        'Optimized path: build the dependent candidate list, then the backend filters to files you actually locked.
         unlockDocs(getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp)))
         updateStatusStrip()
     End Sub
     Private Sub dropDownUnlockAll_Click(sender As Object, e As EventArgs) Handles dropDownUnlockAll.Click
-        unlockDocs()
+        iSwApp.SendMsgToUser2(
+            "Release Locks All has been disabled for safety." & vbCrLf & vbCrLf &
+            "Select the file(s) in the SVN tree, or use Unlock && Revert > With Dependents. The backend will only unlock/revert files you actually have locked.",
+            swMessageBoxIcon_e.swMbInformation,
+            swMessageBoxBtn_e.swMbOk
+        )
         updateStatusStrip()
     End Sub
 
     ' ### Get Latest
     Private Sub ToolStripDropDownButGetLatest_ButtonClick(sender As Object, e As EventArgs) Handles ToolStripDropDownButGetLatest.ButtonClick
-        Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
-        If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
+        Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
 
-        myGetLatestOrRevert(GetSelectedModDocList(iSwApp),, bVerbose:=True)
-        'myGetLatestOpenOnly()
+        If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
+            myGetLatestOrRevertPaths(selectedTreePaths, getLatestType.update, bVerbose:=True)
+        Else
+            Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
+            If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
+
+            myGetLatestOrRevert(GetSelectedModDocList(iSwApp),, bVerbose:=True)
+        End If
+
         updateStatusStrip()
     End Sub
     Private Sub dropDownGetLatestAllOpenFiles_Click(sender As Object, e As EventArgs) Handles dropDownGetLatestAllOpenFiles.Click
@@ -1172,24 +1501,16 @@ Public Class UserControl1
         saveAllOpenFiles(bShowError:=True)
 
         myGetLatestOrRevert(modDocArr,, bVerbose:=True)
-        'myGetLatestOpenOnly()
         updateStatusStrip()
     End Sub
     Private Sub dropDownGetLatestAll_Click(sender As Object, e As EventArgs) Handles dropDownGetLatestAll.Click
-        Dim response As Integer = iSwApp.SendMsgToUser2(
-            "You are about to run Get Latest on the whole SVN working copy / whole car." & vbCrLf & vbCrLf &
-            "This can take a long time and is not recommended for large assemblies unless you really need the entire car updated." & vbCrLf & vbCrLf &
-            "Continue?",
-            swMessageBoxIcon_e.swMbWarning,
-            swMessageBoxBtn_e.swMbYesNo
+        iSwApp.SendMsgToUser2(
+            "Get Latest All has been disabled." & vbCrLf & vbCrLf &
+            "Use Sync first, then select the specific out-of-date file(s) in the SVN tree and click Get Latest." & vbCrLf &
+            "Tip: Ctrl-click toggles multiple tree files. Shift-click selects a visible range.",
+            swMessageBoxIcon_e.swMbInformation,
+            swMessageBoxBtn_e.swMbOk
         )
-
-        If response <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
-
-        saveAllOpenFiles(bShowError:=True)
-        myGetLatestOrRevert(,, bVerbose:=True)
-        updateStatusStrip()
-        'myGetLatestAllRepo()
     End Sub
     Private Sub butFindComponent_Click(sender As Object, e As EventArgs) Handles butFindComponent.Click
         Dim modDocArr As ModelDoc() = GetSelectedModDocList(iSwApp)
@@ -1224,6 +1545,13 @@ Public Class UserControl1
         'Collect/load tree paths on the SolidWorks/UI thread, then run SVN server checks in the background.
         'This keeps SolidWorks usable while SVN talks to the server.
 
+        Dim debugWatch As System.Diagnostics.Stopwatch = Nothing
+        Dim debugNotes As New List(Of String)()
+
+        If syncDebugEnabled() Then
+            debugWatch = System.Diagnostics.Stopwatch.StartNew()
+        End If
+
         If iSwApp.GetDocumentCount() = 0 Then
             iSwApp.SendMsgToUser2("No open SolidWorks documents to sync status for.",
                 swMessageBoxIcon_e.swMbInformation,
@@ -1240,21 +1568,35 @@ Public Class UserControl1
 
         Dim selectedNode As TreeNode = getSelectedTreeNodeForSync()
         Dim syncPaths() As String = Nothing
+        Dim phaseStartMs As Long = 0
 
         If selectedNode Is Nothing Then
             'No tree node selected:
             'Default to Level 1 only under the active/root assembly.
             Dim rootNode As TreeNode = getRootTreeNodeForSync()
 
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
             If rootNode IsNot Nothing Then
                 loadImmediateChildrenForNode(rootNode)
                 syncPaths = collectImmediateChildCadPathsForSync(rootNode)
             End If
+
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Default Level-1 load/collect: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            End If
         Else
             'Selected Level 0 -> sync selected node + Level 1.
             'Selected Level 1 -> sync selected node + Level 2.
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
             loadImmediateChildrenForNode(selectedNode)
             syncPaths = collectSelectedBranchCadPathsForSync(selectedNode)
+
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Selected branch load/collect: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                debugNotes.Add("Selected node: " & selectedNode.Text)
+            End If
         End If
 
         If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then
@@ -1264,12 +1606,23 @@ Public Class UserControl1
             Exit Sub
         End If
 
-        startAsyncSyncStatus(syncPaths, "Syncing...")
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Pre-background total: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+        End If
+
+        startAsyncSyncStatus(syncPaths, "Syncing...", String.Join(vbCrLf, debugNotes.ToArray()))
     End Sub
 
     Private Sub performSyncStatusWholeCar()
         'Explicit slow operation. This recursively loads the visible active assembly tree
         'and server-checks every CAD path it can find. It does NOT download geometry.
+
+        Dim debugWatch As System.Diagnostics.Stopwatch = Nothing
+        Dim debugNotes As New List(Of String)()
+
+        If syncDebugEnabled() Then
+            debugWatch = System.Diagnostics.Stopwatch.StartNew()
+        End If
 
         Dim response As Integer = iSwApp.SendMsgToUser2(
             "You are about to Sync Status for the whole visible car / active assembly tree." & vbCrLf & vbCrLf &
@@ -1297,7 +1650,11 @@ Public Class UserControl1
             Exit Sub
         End If
 
+        Dim phaseStartMs As Long = 0
+
         Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
             If TreeView1 IsNot Nothing AndAlso TreeView1.Nodes IsNot Nothing Then
                 TreeView1.BeginUpdate()
                 Try
@@ -1308,10 +1665,20 @@ Public Class UserControl1
                     TreeView1.EndUpdate()
                 End Try
             End If
+
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Whole-car lazy tree load: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            End If
         Catch
         End Try
 
+        If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
         Dim syncPaths() As String = collectCurrentTreeCadPaths()
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Whole-car path collection: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        End If
 
         If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then
             iSwApp.SendMsgToUser2("No CAD file paths were found in the current tree to sync.",
@@ -1320,10 +1687,16 @@ Public Class UserControl1
             Exit Sub
         End If
 
-        startAsyncSyncStatus(syncPaths, "Syncing whole car...")
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Pre-background total: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+        End If
+
+        startAsyncSyncStatus(syncPaths, "Syncing whole car...", String.Join(vbCrLf, debugNotes.ToArray()))
     End Sub
 
-    Private Sub startAsyncSyncStatus(ByVal syncPaths() As String, Optional ByVal pendingText As String = "Syncing...")
+    Private Sub startAsyncSyncStatus(ByVal syncPaths() As String,
+                                     Optional ByVal pendingText As String = "Syncing...",
+                                     Optional ByVal preSyncTimingLog As String = "")
         If syncPaths Is Nothing OrElse syncPaths.Length = 0 Then Exit Sub
 
         If syncStatusInProgress Then
@@ -1335,6 +1708,11 @@ Public Class UserControl1
 
         Dim pathsForBackground As String() = CType(syncPaths.Clone(), String())
         Dim savedPathForBackground As String = savedPATH
+        Dim overallWatch As System.Diagnostics.Stopwatch = Nothing
+
+        If syncDebugEnabled() Then
+            overallWatch = System.Diagnostics.Stopwatch.StartNew()
+        End If
 
         syncStatusInProgress = True
         markSyncPendingForFilePathsPublic(pathsForBackground, True, pendingText)
@@ -1344,6 +1722,11 @@ Public Class UserControl1
                                             Dim errorMessage As String = ""
                                             Dim timingLog As String = ""
                                             Dim serverStatus As SVNStatus = Nothing
+                                            Dim backgroundWatch As System.Diagnostics.Stopwatch = Nothing
+
+                                            If syncDebugEnabled() Then
+                                                backgroundWatch = System.Diagnostics.Stopwatch.StartNew()
+                                            End If
 
                                             Try
                                                 serverStatus = svnModule.getServerStatusForFilePathsBackgroundPublic(pathsForBackground, savedPathForBackground, errorMessage, timingLog)
@@ -1351,9 +1734,23 @@ Public Class UserControl1
                                                 errorMessage = ex.Message
                                             End Try
 
+                                            If backgroundWatch IsNot Nothing Then
+                                                Try
+                                                    If Not String.IsNullOrWhiteSpace(timingLog) Then timingLog &= vbCrLf
+                                                    timingLog &= "Background SVN status call: " & backgroundWatch.ElapsedMilliseconds.ToString() & " ms"
+                                                Catch
+                                                End Try
+                                            End If
+
                                             Try
                                                 If Me.IsHandleCreated Then
-                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage)))
+                                                    Dim totalElapsedMs As Long = -1
+
+                                                    If overallWatch IsNot Nothing Then
+                                                        totalElapsedMs = overallWatch.ElapsedMilliseconds
+                                                    End If
+
+                                                    Me.BeginInvoke(New MethodInvoker(Sub() finishAsyncSyncStatus(pathsForBackground, serverStatus, errorMessage, timingLog, totalElapsedMs, preSyncTimingLog)))
                                                 Else
                                                     syncStatusInProgress = False
                                                 End If
@@ -1365,7 +1762,10 @@ Public Class UserControl1
 
     Private Sub finishAsyncSyncStatus(ByVal syncPaths() As String,
                                       ByVal serverStatus As SVNStatus,
-                                      ByVal errorMessage As String)
+                                      ByVal errorMessage As String,
+                                      Optional ByVal timingLog As String = "",
+                                      Optional ByVal totalElapsedMs As Long = -1,
+                                      Optional ByVal preSyncTimingLog As String = "")
         Try
             markSyncPendingForFilePathsPublic(syncPaths, False)
         Catch
@@ -1379,6 +1779,11 @@ Public Class UserControl1
         syncStatusInProgress = False
 
         If Not String.IsNullOrWhiteSpace(errorMessage) Then
+            Try
+                showSyncDebugWindow("Sync Status failed.", syncPaths, preSyncTimingLog, timingLog, totalElapsedMs, errorMessage)
+            Catch
+            End Try
+
             iSwApp.SendMsgToUser2("Sync Status failed." & vbCrLf & vbCrLf & errorMessage,
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk)
@@ -1386,6 +1791,11 @@ Public Class UserControl1
         End If
 
         If serverStatus Is Nothing Then
+            Try
+                showSyncDebugWindow("Sync Status failed. No SVN status was returned.", syncPaths, preSyncTimingLog, timingLog, totalElapsedMs, "")
+            Catch
+            End Try
+
             iSwApp.SendMsgToUser2("Sync Status failed. No SVN status was returned.",
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk)
@@ -1408,6 +1818,11 @@ Public Class UserControl1
 
         Try
             setRefreshTreeButtonNormal()
+        Catch
+        End Try
+
+        Try
+            showSyncDebugWindow("Sync Status finished.", syncPaths, preSyncTimingLog, timingLog, totalElapsedMs, "")
         Catch
         End Try
     End Sub
@@ -1733,8 +2148,7 @@ Public Class UserControl1
 
     ' ### Clean Up
     Private Sub butCleanup_Click(sender As Object, e As EventArgs) Handles butCleanup.Click
-        iSwApp.SendMsgToUser("This unfortunately can't be run with SolidWorks Files open. Close all open files, then in Windows Explorer, right click > TortoiseSVN > Cleanup")
-        'myCleanup()
+        myCleanup()
     End Sub
 
     ' ### Folder
@@ -1835,6 +2249,15 @@ Public Class UserControl1
                 clearGraphicalTreeHighlight()
                 TreeView1.SelectedNode = e.Node
                 lastUserClickedTreeNodeForSync = e.Node
+
+                If (ModifierKeys And Keys.Control) = Keys.Control Then
+                    toggleBatchTreeNode(e.Node)
+                ElseIf (ModifierKeys And Keys.Shift) = Keys.Shift Then
+                    selectBatchTreeRange(e.Node)
+                Else
+                    clearBatchTreeSelection()
+                    lastBatchAnchorTreeNode = e.Node
+                End If
             End If
         Catch
         End Try
@@ -1934,6 +2357,7 @@ Public Class UserControl1
 
         Dim clonedNode As TreeNode = CType(treeNodeTemp.Clone(), TreeNode)
 
+        clearBatchTreeSelection(False)
         TreeView1.Nodes.Clear()
         TreeView1.Nodes.Insert(0, clonedNode)
         TreeView1.Nodes(0).Expand()

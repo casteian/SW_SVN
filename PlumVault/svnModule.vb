@@ -17,6 +17,12 @@ Public Module svnModule
         Public Property fileName As String
     End Class
 
+    Private Class SyncStatusChunkResult
+        Public Entries As New List(Of SVNStatus.filePpty)()
+        Public ErrorMessage As String = ""
+        Public TimingLog As String = ""
+    End Class
+
     Dim myUserControl As UserControl1
     Dim iSwApp As SldWorks
     Dim statusOfAllOpenModels As SVNStatus
@@ -29,6 +35,7 @@ Public Module svnModule
     Private statusCacheByNormalizedPath As New Dictionary(Of String, SVNStatus.filePpty)(StringComparer.OrdinalIgnoreCase)
     Private asyncGetLocksInProgress As Boolean = False
     Private asyncCommitInProgress As Boolean = False
+    Private asyncCleanupInProgress As Boolean = False
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -130,6 +137,280 @@ Public Module svnModule
         Catch
         End Try
     End Sub
+    Private Function debugTimingEnabled() As Boolean
+        Try
+            If myUserControl Is Nothing Then Return False
+            Return myUserControl.debugTimingEnabledPublic()
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function syncStatusInProgressOnControl() As Boolean
+        Try
+            If myUserControl Is Nothing Then Return False
+            Return myUserControl.syncStatusInProgressPublic()
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Sub showSvnTimingDebugWindow(ByVal title As String, ByVal debugNotes As List(Of String))
+        Try
+            If Not debugTimingEnabled() Then Exit Sub
+
+            Dim msg As New System.Text.StringBuilder()
+            msg.AppendLine(title)
+            msg.AppendLine()
+
+            If debugNotes IsNot Nothing Then
+                For Each line As String In debugNotes
+                    msg.AppendLine(line)
+                Next
+            End If
+
+            System.Windows.Forms.MessageBox.Show(
+                msg.ToString(),
+                "SVN Timing Debug",
+                System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Information
+            )
+        Catch
+        End Try
+    End Sub
+
+    Private Function countStringArrayItems(ByVal values() As String) As Integer
+        If values Is Nothing Then Return 0
+
+        Dim count As Integer = 0
+
+        For Each value As String In values
+            If Not String.IsNullOrWhiteSpace(value) Then count += 1
+        Next
+
+        Return count
+    End Function
+
+    Private Function compactNonBlankStringArray(ByVal values() As String) As String()
+        If values Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+
+        For Each value As String In values
+            If String.IsNullOrWhiteSpace(value) Then Continue For
+            output.Add(value)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function distinctExistingCadFilePaths(ByVal inputPaths() As String) As String()
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(inputPaths)
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each filePath As String In filteredPaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Dim normalizedPath As String = filePath
+
+            Try
+                normalizedPath = Path.GetFullPath(filePath)
+            Catch
+            End Try
+
+            If seen.Contains(normalizedPath) Then Continue For
+            seen.Add(normalizedPath)
+            output.Add(normalizedPath)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function userAcceptsLossOfChangesPaths(ByVal filePaths() As String, Optional ByVal msg As String = "") As Boolean
+        Dim filteredPaths() As String = distinctExistingCadFilePaths(filePaths)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No valid CAD file paths were selected.", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            Return False
+        End If
+
+        Dim userPickMsg As swMessageBoxResult_e
+        userPickMsg = iSwApp.SendMsgToUser2(msg & vbCrLf &
+                                            "WARNING: Changes to the selected files will be lost!" & vbCrLf &
+                                            stringArrToSingleStringWithNewLines(filteredPaths, bTrimFileNames:=True, iLimit:=10),
+                              Icon:=swMessageBoxIcon_e.swMbWarning, Buttons:=swMessageBoxBtn_e.swMbOkCancel)
+
+        Return userPickMsg = swMessageBoxResult_e.swMbHitOk
+    End Function
+
+    Private Sub attachOpenDocsToStatusPaths(ByRef status As SVNStatus)
+        If status Is Nothing Then Exit Sub
+        If status.fp Is Nothing Then Exit Sub
+        If iSwApp Is Nothing Then Exit Sub
+
+        Try
+            For i As Integer = 0 To UBound(status.fp)
+                Dim filePath As String = status.fp(i).filename
+                If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+                Try
+                    status.fp(i).modDoc = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+                Catch
+                    status.fp(i).modDoc = Nothing
+                End Try
+            Next
+        Catch
+        End Try
+    End Sub
+
+    Private Function getCachedServerStatusForExactPaths(ByVal filePaths() As String,
+                                                        Optional ByVal requireEveryPathCached As Boolean = True) As SVNStatus
+        Dim filteredPaths() As String = distinctExistingCadFilePaths(filePaths)
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return Nothing
+
+        Dim entries As New List(Of SVNStatus.filePpty)()
+        Dim missingCount As Integer = 0
+
+        For Each filePath As String In filteredPaths
+            Dim cached As SVNStatus.filePpty = Nothing
+            Dim found As Boolean = False
+
+            Try
+                found = tryFindCachedStatusProperty(filePath, cached)
+            Catch
+                found = False
+            End Try
+
+            If Not found Then
+                missingCount += 1
+                If requireEveryPathCached Then Return Nothing
+                Continue For
+            End If
+
+            'Only trust cached data for Get Latest if it came from a server-aware Sync.
+            'Local-only status has upToDate9 = NoUpdate and cannot safely decide whether Get Latest is needed.
+            If String.IsNullOrWhiteSpace(cached.upToDate9) OrElse String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then
+                missingCount += 1
+                If requireEveryPathCached Then Return Nothing
+                Continue For
+            End If
+
+            cached.filename = filePath
+            cached.modDoc = Nothing
+            Try
+                cached.modDoc = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+            Catch
+                cached.modDoc = Nothing
+            End Try
+
+            entries.Add(cached)
+        Next
+
+        If entries.Count = 0 Then Return Nothing
+
+        Dim cachedStatus As New SVNStatus()
+        cachedStatus.fp = entries.ToArray()
+        Return cachedStatus
+    End Function
+
+    Private Function getLockedPathsFromStatus(ByVal status As SVNStatus) As String()
+        If status Is Nothing OrElse status.fp Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            For i As Integer = 0 To UBound(status.fp)
+                If status.fp(i).lock6 <> "K" Then Continue For
+                Dim filePath As String = status.fp(i).filename
+                If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+                Try
+                    filePath = Path.GetFullPath(filePath)
+                Catch
+                End Try
+
+                If seen.Contains(filePath) Then Continue For
+                seen.Add(filePath)
+                output.Add(filePath)
+            Next
+        Catch
+        End Try
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function getLockedModifiedPathsFromStatus(ByVal status As SVNStatus) As String()
+        If status Is Nothing OrElse status.fp Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            For i As Integer = 0 To UBound(status.fp)
+                If status.fp(i).lock6 <> "K" Then Continue For
+                If status.fp(i).addDelChg1 <> "M" Then Continue For
+
+                Dim filePath As String = status.fp(i).filename
+                If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+                Try
+                    filePath = Path.GetFullPath(filePath)
+                Catch
+                End Try
+
+                If seen.Contains(filePath) Then Continue For
+                seen.Add(filePath)
+                output.Add(filePath)
+            Next
+        Catch
+        End Try
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function getExistingCadFilePathsFromDocs(ByVal modDocArr() As ModelDoc2) As String()
+        If modDocArr Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each doc As ModelDoc2 In modDocArr
+            If doc Is Nothing Then Continue For
+
+            Dim docPath As String = ""
+
+            Try
+                docPath = doc.GetPathName()
+            Catch
+                docPath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(docPath) Then Continue For
+            If Not File.Exists(docPath) Then Continue For
+            If Not isCadFilePath(docPath) Then Continue For
+
+            Try
+                docPath = Path.GetFullPath(docPath)
+            Catch
+            End Try
+
+            If seen.Contains(docPath) Then Continue For
+            seen.Add(docPath)
+            output.Add(docPath)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
 
     Public Function updateLockStatusPublic(Optional bRefreshAllTreeViews As Boolean = True) As Boolean
         updateLockStatusPublic = statusOfAllOpenModels.updateStatusLocally(iSwApp)
@@ -1237,64 +1518,85 @@ Public Module svnModule
             Return Nothing
         End If
 
+        Dim overallWatch As Stopwatch = Stopwatch.StartNew()
+        Dim timingNotes As New List(Of String)()
+
         Try
             Dim allEntries As New List(Of SVNStatus.filePpty)()
 
-            For Each chunk As String() In chunkFilePathsForBackground(filteredPaths, 50)
-                Dim ownersByPath As Dictionary(Of String, String) = getSvnLockOwnersForPathsBackground(chunk, savedPathForBackground)
-                Dim releaseByPath As Dictionary(Of String, String) = getReleasePropertiesForPathsBackground(chunk, savedPathForBackground)
+            'Optimization:
+            'Do not ask SVN for 35+ files in one huge serial call and do not fetch lock owners for every file.
+            'Split into smaller chunks, run chunks in parallel, and only run the expensive lock-owner XML check
+            'for files that the first status call says are actually locked by someone else.
+            Dim chunks As List(Of String()) = chunkFilePathsForBackground(filteredPaths, 12)
+            Dim maxParallelChunks As Integer = Math.Min(4, Math.Max(1, chunks.Count))
+            Dim parallelGate As New System.Threading.SemaphoreSlim(maxParallelChunks)
+            Dim tasks As New List(Of Task(Of SyncStatusChunkResult))()
+            Dim chunkNumber As Integer = 0
 
-                Dim args As String = "status -vu --non-interactive " & quoteFilePathArgs(chunk)
-                Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(sSVNPath, args, savedPathForBackground)
+            timingNotes.Add("Optimized Sync Status path")
+            timingNotes.Add("Files checked: " & filteredPaths.Length.ToString())
+            timingNotes.Add("Chunk size: 12")
+            timingNotes.Add("Chunks: " & chunks.Count.ToString())
+            timingNotes.Add("Max parallel chunks: " & maxParallelChunks.ToString())
 
-                If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
-                    errorMessage = statusResult.outputError.Trim()
+            For Each chunk As String() In chunks
+                chunkNumber += 1
+                Dim chunkForTask As String() = CType(chunk.Clone(), String())
+                Dim chunkIndexForTask As Integer = chunkNumber
+
+                tasks.Add(Task.Run(Function()
+                                       parallelGate.Wait()
+                                       Try
+                                           Return getServerStatusChunkOptimized(chunkForTask, savedPathForBackground, chunkIndexForTask)
+                                       Finally
+                                           Try
+                                               parallelGate.Release()
+                                           Catch
+                                           End Try
+                                       End Try
+                                   End Function))
+            Next
+
+            Try
+                Task.WaitAll(tasks.ToArray())
+            Catch ex As Exception
+                errorMessage = ex.Message
+                timingNotes.Add("Parallel chunk wait failed: " & ex.Message)
+                timingLog = String.Join(vbCrLf, timingNotes.ToArray())
+                Return Nothing
+            Finally
+                Try
+                    parallelGate.Dispose()
+                Catch
+                End Try
+            End Try
+
+            For Each taskResult As Task(Of SyncStatusChunkResult) In tasks
+                Dim chunkResult As SyncStatusChunkResult = Nothing
+
+                Try
+                    chunkResult = taskResult.Result
+                Catch ex As Exception
+                    errorMessage = ex.Message
+                    Continue For
+                End Try
+
+                If chunkResult Is Nothing Then Continue For
+
+                If Not String.IsNullOrWhiteSpace(chunkResult.TimingLog) Then
+                    timingNotes.Add(chunkResult.TimingLog)
+                End If
+
+                If Not String.IsNullOrWhiteSpace(chunkResult.ErrorMessage) Then
+                    errorMessage = chunkResult.ErrorMessage
+                    timingLog = String.Join(vbCrLf, timingNotes.ToArray())
                     Return Nothing
                 End If
 
-                If statusResult.output Is Nothing Then Continue For
-
-                Dim lines() As String = statusResult.output.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
-
-                For Each line As String In lines
-                    If String.IsNullOrWhiteSpace(line) Then Continue For
-                    If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
-
-                    Dim matchedPath As String = findMatchingTargetPathInStatusLine(line, chunk)
-                    If String.IsNullOrWhiteSpace(matchedPath) Then Continue For
-
-                    Dim fp As New SVNStatus.filePpty()
-                    fp.filename = matchedPath
-                    fp.modDoc = Nothing
-                    fp.bReconnect = False
-                    fp.revertUpdate = getLatestType.none
-                    fp.addDelChg1 = getStatusColumn(line, 0)
-                    fp.pptyMods2 = getStatusColumn(line, 1)
-                    fp.workingDirLock3 = getStatusColumn(line, 2)
-                    fp.addWithHist4 = getStatusColumn(line, 3)
-                    fp.switchWParent5 = getStatusColumn(line, 4)
-                    fp.lock6 = getStatusColumn(line, 5)
-                    fp.tree7 = getStatusColumn(line, 6)
-                    fp.upToDate9 = getStatusColumn(line, 8)
-                    fp.lockOwner = ""
-                    fp.released = ""
-
-                    If ownersByPath IsNot Nothing Then
-                        Dim owner As String = ""
-                        If ownersByPath.TryGetValue(normalizeSvnPath(matchedPath), owner) Then
-                            fp.lockOwner = owner
-                        End If
-                    End If
-
-                    If releaseByPath IsNot Nothing Then
-                        Dim releaseState As String = ""
-                        If releaseByPath.TryGetValue(normalizeSvnPath(matchedPath), releaseState) Then
-                            fp.released = releaseState
-                        End If
-                    End If
-
-                    allEntries.Add(fp)
-                Next
+                If chunkResult.Entries IsNot Nothing AndAlso chunkResult.Entries.Count > 0 Then
+                    allEntries.AddRange(chunkResult.Entries)
+                End If
             Next
 
             Dim serverStatus As New SVNStatus()
@@ -1305,11 +1607,159 @@ Public Module svnModule
                 serverStatus.fp = allEntries.ToArray()
             End If
 
+            timingNotes.Add("Total optimized background status: " & overallWatch.ElapsedMilliseconds.ToString() & " ms")
+            timingLog = String.Join(vbCrLf, timingNotes.ToArray())
+
             Return serverStatus
 
         Catch ex As Exception
             errorMessage = ex.Message
+            Try
+                timingNotes.Add("Total optimized background status before error: " & overallWatch.ElapsedMilliseconds.ToString() & " ms")
+                timingLog = String.Join(vbCrLf, timingNotes.ToArray())
+            Catch
+            End Try
             Return Nothing
+        End Try
+    End Function
+
+    Private Function getServerStatusChunkOptimized(ByVal chunk() As String,
+                                                   ByVal savedPathForBackground As String,
+                                                   ByVal chunkIndex As Integer) As SyncStatusChunkResult
+        Dim result As New SyncStatusChunkResult()
+        Dim chunkWatch As Stopwatch = Stopwatch.StartNew()
+        Dim phaseStartMs As Long = 0
+        Dim statusMs As Long = 0
+        Dim ownerMs As Long = 0
+        Dim releaseMs As Long = 0
+        Dim parseMs As Long = 0
+
+        Try
+            If chunk Is Nothing OrElse chunk.Length = 0 Then Return result
+
+            phaseStartMs = chunkWatch.ElapsedMilliseconds
+
+            Dim args As String = "status -vu --non-interactive " & quoteFilePathArgs(chunk)
+            Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(sSVNPath, args, savedPathForBackground)
+
+            statusMs = chunkWatch.ElapsedMilliseconds - phaseStartMs
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                result.ErrorMessage = statusResult.outputError.Trim()
+                result.TimingLog = "Chunk " & chunkIndex.ToString() & " failed during status -vu after " & statusMs.ToString() & " ms"
+                Return result
+            End If
+
+            If statusResult.output Is Nothing Then
+                result.TimingLog = "Chunk " & chunkIndex.ToString() & " returned no status output after " & statusMs.ToString() & " ms"
+                Return result
+            End If
+
+            phaseStartMs = chunkWatch.ElapsedMilliseconds
+
+            Dim parsedEntries As New List(Of SVNStatus.filePpty)()
+            Dim pathsNeedingOwner As New List(Of String)()
+            Dim releaseCandidatePaths As New List(Of String)()
+
+            Dim lines() As String = statusResult.output.Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries)
+
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+                If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+                Dim matchedPath As String = findMatchingTargetPathInStatusLine(line, chunk)
+                If String.IsNullOrWhiteSpace(matchedPath) Then Continue For
+
+                Dim fp As New SVNStatus.filePpty()
+                fp.filename = matchedPath
+                fp.modDoc = Nothing
+                fp.bReconnect = False
+                fp.revertUpdate = getLatestType.none
+                fp.addDelChg1 = getStatusColumn(line, 0)
+                fp.pptyMods2 = getStatusColumn(line, 1)
+                fp.workingDirLock3 = getStatusColumn(line, 2)
+                fp.addWithHist4 = getStatusColumn(line, 3)
+                fp.switchWParent5 = getStatusColumn(line, 4)
+                fp.lock6 = getStatusColumn(line, 5)
+                fp.tree7 = getStatusColumn(line, 6)
+                fp.upToDate9 = getStatusColumn(line, 8)
+                fp.lockOwner = ""
+                fp.released = ""
+
+                'Optimization from the older fast build:
+                'Only ask SVN for the remote lock owner when the status row says there is a remote lock.
+                'For clean/unlocked files and files locked by you, owner lookup is wasted server work.
+                If Not String.IsNullOrWhiteSpace(fp.lock6) AndAlso fp.lock6 <> " " AndAlso fp.lock6 <> "K" Then
+                    pathsNeedingOwner.Add(matchedPath)
+                End If
+
+                'Release state only matters after out-of-date/local-change/lock states have been ruled out.
+                'This keeps release propget targeted instead of hitting every possible status row.
+                If fp.addDelChg1 = " " AndAlso fp.lock6 = " " AndAlso fp.upToDate9 <> "*" Then
+                    releaseCandidatePaths.Add(matchedPath)
+                End If
+
+                parsedEntries.Add(fp)
+            Next
+
+            parseMs = chunkWatch.ElapsedMilliseconds - phaseStartMs
+
+            Dim ownersByPath As Dictionary(Of String, String) = Nothing
+            Dim releaseByPath As Dictionary(Of String, String) = Nothing
+
+            If pathsNeedingOwner.Count > 0 Then
+                phaseStartMs = chunkWatch.ElapsedMilliseconds
+                ownersByPath = getSvnLockOwnersForPathsBackground(pathsNeedingOwner.ToArray(), savedPathForBackground)
+                ownerMs = chunkWatch.ElapsedMilliseconds - phaseStartMs
+            Else
+                ownersByPath = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+                ownerMs = 0
+            End If
+
+            If releaseCandidatePaths.Count > 0 Then
+                phaseStartMs = chunkWatch.ElapsedMilliseconds
+                releaseByPath = getReleasePropertiesForPathsBackground(releaseCandidatePaths.ToArray(), savedPathForBackground)
+                releaseMs = chunkWatch.ElapsedMilliseconds - phaseStartMs
+            Else
+                releaseByPath = New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+                releaseMs = 0
+            End If
+
+            For i As Integer = 0 To parsedEntries.Count - 1
+                Dim fp As SVNStatus.filePpty = parsedEntries(i)
+                Dim normalizedPath As String = normalizeSvnPath(fp.filename)
+
+                If ownersByPath IsNot Nothing Then
+                    Dim owner As String = ""
+                    If ownersByPath.TryGetValue(normalizedPath, owner) Then
+                        fp.lockOwner = owner
+                    End If
+                End If
+
+                If releaseByPath IsNot Nothing Then
+                    Dim releaseState As String = ""
+                    If releaseByPath.TryGetValue(normalizedPath, releaseState) Then
+                        fp.released = releaseState
+                    End If
+                End If
+
+                result.Entries.Add(fp)
+            Next
+
+            result.TimingLog =
+                "Chunk " & chunkIndex.ToString() & " (" & chunk.Length.ToString() & " files): " &
+                "status -vu " & statusMs.ToString() & " ms; " &
+                "parse " & parseMs.ToString() & " ms; " &
+                "owner check " & If(pathsNeedingOwner.Count > 0, ownerMs.ToString() & " ms for " & pathsNeedingOwner.Count.ToString() & " locked files", "skipped") & "; " &
+                "release propget " & If(releaseCandidatePaths.Count > 0, releaseMs.ToString() & " ms for " & releaseCandidatePaths.Count.ToString() & " candidates", "skipped") & "; " &
+                "total " & chunkWatch.ElapsedMilliseconds.ToString() & " ms"
+
+            Return result
+
+        Catch ex As Exception
+            result.ErrorMessage = ex.Message
+            result.TimingLog = "Chunk " & chunkIndex.ToString() & " failed after " & chunkWatch.ElapsedMilliseconds.ToString() & " ms: " & ex.Message
+            Return result
         End Try
     End Function
 
@@ -1331,11 +1781,11 @@ Public Module svnModule
     End Sub
 
     Private Function chunkFilePathsForBackground(ByVal filePaths() As String,
-                                                 Optional ByVal chunkSize As Integer = 50) As List(Of String())
+                                                 Optional ByVal chunkSize As Integer = 12) As List(Of String())
         Dim chunks As New List(Of String())()
 
         If filePaths Is Nothing Then Return chunks
-        If chunkSize <= 0 Then chunkSize = 50
+        If chunkSize <= 0 Then chunkSize = 12
 
         Dim current As New List(Of String)()
 
@@ -3919,45 +4369,299 @@ Public Module svnModule
         Return True
     End Function
 
-    Sub unlockDocs(Optional ByRef modDocArr() As ModelDoc2 = Nothing)
-        Dim bSuccess As Boolean
-        Dim Status As SVNStatus
+    Public Sub unlockPathsLockedOnly(ByVal selectedPaths() As String)
+        Dim bSuccess As Boolean = True
+        Dim status As SVNStatus = Nothing
+        Dim debugWatch As Stopwatch = Nothing
+        Dim debugNotes As New List(Of String)()
+        Dim phaseStartMs As Long = 0
 
-        If Not userAcceptsLossOfChanges(modDocArr, "Release Locks, and revert changes to vault version?") Then Exit Sub
-        saveAllOpenFiles(bShowError:=True)
-
-        If IsNothing(modDocArr) Then
-            If Not verifyLocalRepoPath() Then Exit Sub
-            bSuccess = runTortoiseProcexeWithMonitor("/command:unlock /path:""" & myUserControl.localRepoPath.Text.TrimEnd("\\") & """ /closeonend:3")
-        ElseIf UBound(modDocArr) = -1 Then
-            Exit Sub
-        Else
-            Status = getFileSVNStatus(bCheckServer:=True, modDocArr)
-            If IsNothing(Status) Then Exit Sub
-
-            Dim sFilePaths() As String = sGetFileNames(Status.statusFilter(sFiltLock6:="K"))
-
-            If IsNothing(sFilePaths) Then
-                iSwApp.SendMsgToUser2("No Selected Items were locked", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
-                Exit Sub
-            End If
-
-            bSuccess = runTortoiseProcexeWithMonitor("/command:unlock /path:" &
-                                             formatFilePathArrForProc(
-                                                sFilePaths) & " /closeonend:3")
-
-            'for each moddoc in moddocarr
-            '    'manually reattach to file system
-            '    moddoc.reloadorreplace(readonly:=true, replacefilename:=false, discardchanges:=false)
-            'next
-
+        If debugTimingEnabled() Then
+            debugWatch = Stopwatch.StartNew()
         End If
+
+        Dim filteredPaths() As String = distinctExistingCadFilePaths(selectedPaths)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No valid selected CAD file paths were found for Release Locks.", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If Not userAcceptsLossOfChangesPaths(filteredPaths, "Release Locks, and revert changes to vault version?") Then Exit Sub
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            saveAllOpenFiles(bShowError:=True)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Save open files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+            saveAllOpenFiles(bShowError:=True)
+        End Try
+
+        If debugWatch IsNot Nothing Then debugNotes.Add("Selected path candidates: " & filteredPaths.Length.ToString())
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+            status = getFileSVNStatus(
+                bCheckServer:=False,
+                modDocArr:=Nothing,
+                bUpdateStatusOfAllOpenModels:=False,
+                sDirectFilePathArr:=filteredPaths
+            )
+
+            attachOpenDocsToStatusPaths(status)
+
+            If debugWatch IsNot Nothing Then debugNotes.Add("Local SVN status for selected paths: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+            status = Nothing
+        End Try
+
+        If IsNothing(status) Then
+            iSwApp.SendMsgToUser2("Release Locks failed. Could not read local SVN status.", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim lockedPaths() As String = Nothing
+        Dim modifiedPaths() As String = Nothing
+
+        Try
+            lockedPaths = getLockedPathsFromStatus(status)
+        Catch
+            lockedPaths = Nothing
+        End Try
+
+        Try
+            modifiedPaths = getLockedModifiedPathsFromStatus(status)
+        Catch
+            modifiedPaths = Nothing
+        End Try
+
+        If lockedPaths Is Nothing OrElse lockedPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No Selected Items were locked", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Locked files found: 0")
+                debugNotes.Add("Total Release Locks time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+                showSvnTimingDebugWindow("Release Locks finished - nothing locked.", debugNotes)
+            End If
+            Exit Sub
+        End If
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Locked files found: " & lockedPaths.Length.ToString())
+            debugNotes.Add("Locked+modified files needing revert: " & countStringArrayItems(modifiedPaths).ToString())
+        End If
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            bSuccess = runTortoiseProcexeWithMonitor("/command:unlock /path:" & formatFilePathArrForProc(lockedPaths) & " /closeonend:3")
+            If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN unlock locked selected files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+            bSuccess = False
+        End Try
 
         If Not bSuccess Then iSwApp.SendMsgToUserv("Releasing Locks Failed.")
 
-        myGetLatestOrRevert(modDocArr, getLatestType.revert)
+        If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, New Integer() {-1})
+                If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles before revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
 
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:revert /path:" & formatFilePathArrForProc(modifiedPaths) & " /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN revert locked modified files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+                If Not bSuccess Then iSwApp.SendMsgToUserv("Revert Files Failed.")
+            Catch
+            End Try
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                status.reattachDocsToFileSystem(New Integer() {-1}, iSwApp)
+                If debugWatch IsNot Nothing Then debugNotes.Add("Reattach docs after revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
+        End If
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            updateLockStatusPublic(bRefreshAllTreeViews:=False)
+            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Local status/tree refresh: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+        End Try
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Total Release Locks time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+            showSvnTimingDebugWindow("Release Locks finished.", debugNotes)
+        End If
     End Sub
+
+    Sub unlockDocs(Optional ByRef modDocArr() As ModelDoc2 = Nothing)
+        Dim bSuccess As Boolean = True
+        Dim status As SVNStatus = Nothing
+        Dim debugWatch As Stopwatch = Nothing
+        Dim debugNotes As New List(Of String)()
+        Dim phaseStartMs As Long = 0
+
+        If debugTimingEnabled() Then
+            debugWatch = Stopwatch.StartNew()
+        End If
+
+        If Not userAcceptsLossOfChanges(modDocArr, "Release Locks, and revert changes to vault version?") Then Exit Sub
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            saveAllOpenFiles(bShowError:=True)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Save open files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+            saveAllOpenFiles(bShowError:=True)
+        End Try
+
+        If IsNothing(modDocArr) Then
+            If Not verifyLocalRepoPath() Then Exit Sub
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:unlock /path:""" & myUserControl.localRepoPath.Text.TrimEnd("\"c) & """ /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN unlock whole working copy: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+                bSuccess = False
+            End Try
+
+            If Not bSuccess Then iSwApp.SendMsgToUserv("Releasing Locks Failed.")
+
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            myGetLatestOrRevert(modDocArr, getLatestType.revert)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Whole working-copy revert path: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Total Release Locks time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+                showSvnTimingDebugWindow("Release Locks finished.", debugNotes)
+            End If
+
+            Exit Sub
+        ElseIf UBound(modDocArr) = -1 Then
+            Exit Sub
+        End If
+
+        Dim selectedPaths() As String = getExistingCadFilePathsFromDocs(modDocArr)
+
+        If selectedPaths Is Nothing OrElse selectedPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No valid selected CAD file paths were found for Release Locks.", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If debugWatch IsNot Nothing Then debugNotes.Add("Selected files: " & selectedPaths.Length.ToString())
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+            'Speed fix: releasing your own locks does not need an SVN server status check.
+            'The local working copy already knows whether you have a lock token (K).
+            status = getFileSVNStatus(
+                bCheckServer:=False,
+                modDocArr:=modDocArr,
+                bUpdateStatusOfAllOpenModels:=False
+            )
+
+            If debugWatch IsNot Nothing Then debugNotes.Add("Local SVN status for selected files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+            status = Nothing
+        End Try
+
+        If IsNothing(status) Then
+            iSwApp.SendMsgToUser2("Release Locks failed. Could not read local SVN status.", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim lockedPaths() As String = Nothing
+        Dim modifiedPaths() As String = Nothing
+
+        Try
+            lockedPaths = getLockedPathsFromStatus(status)
+        Catch
+            lockedPaths = Nothing
+        End Try
+
+        Try
+            'Only revert files you actually had locked.
+            'This keeps Unlock && Revert With Dependents from checking/reverting every dependent.
+            modifiedPaths = getLockedModifiedPathsFromStatus(status)
+        Catch
+            modifiedPaths = Nothing
+        End Try
+
+        If lockedPaths Is Nothing OrElse lockedPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No Selected Items were locked", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Locked files found: 0")
+                debugNotes.Add("Total Release Locks time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+                showSvnTimingDebugWindow("Release Locks finished - nothing locked.", debugNotes)
+            End If
+            Exit Sub
+        End If
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Locked files found: " & lockedPaths.Length.ToString())
+            debugNotes.Add("Modified files needing revert: " & countStringArrayItems(modifiedPaths).ToString())
+        End If
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            bSuccess = runTortoiseProcexeWithMonitor("/command:unlock /path:" & formatFilePathArrForProc(lockedPaths) & " /closeonend:3")
+            If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN unlock selected files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+            bSuccess = False
+        End Try
+
+        If Not bSuccess Then iSwApp.SendMsgToUserv("Releasing Locks Failed.")
+
+        If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+                'Use the same local status object to detach/reconnect files before Tortoise overwrites them.
+                status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, New Integer() {-1})
+
+                If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles before revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:revert /path:" & formatFilePathArrForProc(modifiedPaths) & " /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN revert modified files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+                If Not bSuccess Then iSwApp.SendMsgToUserv("Revert Files Failed.")
+            Catch
+            End Try
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                status.reattachDocsToFileSystem(New Integer() {-1}, iSwApp)
+                If debugWatch IsNot Nothing Then debugNotes.Add("Reattach docs after revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
+        End If
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            updateLockStatusPublic(bRefreshAllTreeViews:=False)
+            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Local status/tree refresh: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+        End Try
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Total Release Locks time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+            showSvnTimingDebugWindow("Release Locks finished.", debugNotes)
+        End If
+    End Sub
+
     Private Function isFirstCommitCandidatePath(ByVal filePath As String) As Boolean
         If String.IsNullOrWhiteSpace(filePath) Then Return False
         If Not File.Exists(filePath) Then Return False
@@ -4933,43 +5637,196 @@ Public Module svnModule
         If Not bSuccess Then iSwApp.SendMsgToUser("Status Check Failed.")
     End Sub
     Sub myCleanup()
-        'Dim bSuccessStatus As Boolean
-        Dim bSuccessCleanup As Boolean
+        If asyncCleanupInProgress Then
+            iSwApp.SendMsgToUser2(
+                "SVN cleanup is already running in the background." & vbCrLf & vbCrLf &
+                "Wait for it to finish before starting another cleanup.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Exit Sub
+        End If
 
-        Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
+        If asyncGetLocksInProgress OrElse asyncCommitInProgress Then
+            iSwApp.SendMsgToUser2(
+                "Another SVN operation is already running." & vbCrLf & vbCrLf &
+                "Wait for Get Locks / Commit to finish before running Cleanup.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Exit Sub
+        End If
 
-        If modDoc Is Nothing Then
-        Else
-            iSwApp.SendMsgToUser("This unfortunately can't be run with SolidWorks Files open. Close all open files, then in Windows Explorer, right click > TortoiseSVN > Cleanup")
+        If syncStatusInProgressOnControl() Then
+            iSwApp.SendMsgToUser2(
+                "Sync Status is currently running." & vbCrLf & vbCrLf &
+                "Wait for Sync to finish before running Cleanup.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
             Exit Sub
         End If
 
         If Not verifyLocalRepoPath(bCheckServer:=False) Then Exit Sub
 
-        If Not iSwApp.SendMsgToUser2("Unsaved changes will be discarded. Continue?",
-                                swMessageBoxIcon_e.swMbWarning,
-                                swMessageBoxBtn_e.swMbYesNo) = swMessageBoxResult_e.swMbHitYes Then
+        Dim repoRootPath As String = ""
+        Dim savedPathForBackground As String = ""
+
+        Try
+            repoRootPath = myUserControl.localRepoPath.Text.TrimEnd("\"c)
+        Catch
+            repoRootPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(repoRootPath) OrElse Not Directory.Exists(repoRootPath) Then
+            iSwApp.SendMsgToUser2(
+                "Cleanup blocked." & vbCrLf & vbCrLf &
+                "The local SVN folder path is missing or invalid.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
             Exit Sub
         End If
 
-        iSwApp.SendMsgToUser2("Running cleanup from the Add-in has a poor success rate due to Windows only allowing " &
-                              "a single program to edit a file at once. If this fails, close SolidWorks, 
-                              and run cleanup from tortoiseSVN in Windows Explorer." & vbCrLf & vbCrLf &
-                              "If you need to save files, but are unable without a lock, In Windows Explorer, Right click > Properties, and un-check Read-Only. " &
-                              "This may create conflicts if another user is working on the file, so is typically not recommended.",
-                                swMessageBoxIcon_e.swMbWarning,
-                                swMessageBoxBtn_e.swMbOk)
+        Try
+            savedPathForBackground = myUserControl.savedPATH
+        Catch
+            savedPathForBackground = ""
+        End Try
 
-        'bSuccessStatus = updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=True)
+        Dim openDocCount As Integer = 0
 
-        bSuccessCleanup = runTortoiseProcexeWithMonitor("/command:cleanup /cleanup /path:""" & myUserControl.localRepoPath.Text & """")
+        Try
+            If iSwApp IsNot Nothing Then openDocCount = iSwApp.GetDocumentCount()
+        Catch
+            openDocCount = 0
+        End Try
 
-        If Not bSuccessCleanup Then
-            iSwApp.SendMsgToUser("Cleanup Failed. This is often because the SVN server is attempting " &
-                    "to open a file that SolidWorks is currently accessing. This occurs even when the file is read only. " &
-                    "Try closing all open files and trying again. Or close SolidWorks and use ToroiseSVN to clean up. ")
+        Dim cleanupMessage As String =
+            "Run SVN cleanup in the background on:" & vbCrLf &
+            repoRootPath & vbCrLf & vbCrLf &
+            "This uses command-line svn cleanup, not the TortoiseSVN popup." & vbCrLf &
+            "It should not revert, delete, or commit CAD changes." & vbCrLf & vbCrLf &
+            "You can keep using SolidWorks while it runs. If cleanup fails because Windows/SolidWorks is holding a file handle, close open CAD files and run cleanup again."
+
+        If openDocCount > 0 Then
+            cleanupMessage &= vbCrLf & vbCrLf &
+                "Note: SolidWorks currently has " & openDocCount.ToString() & " document(s) open. Cleanup may still work, but file-handle errors are more likely."
+        End If
+
+        If iSwApp.SendMsgToUser2(
+            cleanupMessage & vbCrLf & vbCrLf & "Continue?",
+            swMessageBoxIcon_e.swMbQuestion,
+            swMessageBoxBtn_e.swMbYesNo
+        ) <> swMessageBoxResult_e.swMbHitYes Then
+            Exit Sub
+        End If
+
+        asyncCleanupInProgress = True
+
+        Try
+            iSwApp.SendMsgToUser2(
+                "SVN cleanup started in the background." & vbCrLf & vbCrLf &
+                "You can keep using SolidWorks. You will get a message when it finishes.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+        Catch
+        End Try
+
+        Task.Run(Sub()
+                     Dim cleanupWatch As Stopwatch = Stopwatch.StartNew()
+                     Dim cleanupResult As New rawProcessReturn()
+                     Dim errorMessage As String = ""
+                     Dim success As Boolean = False
+
+                     Try
+                         cleanupResult = runSvnProcessBackgroundNoUi(
+                             sSVNPath,
+                             "cleanup --non-interactive """ & repoRootPath & """",
+                             savedPathForBackground
+                         )
+
+                         If cleanupResult.outputError IsNot Nothing AndAlso cleanupResult.outputError.Trim() <> "" Then
+                             errorMessage = cleanupResult.outputError.Trim()
+                         Else
+                             success = True
+                         End If
+                     Catch ex As Exception
+                         errorMessage = ex.Message
+                     End Try
+
+                     cleanupWatch.Stop()
+
+                     Try
+                         If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                             myUserControl.BeginInvoke(New System.Windows.Forms.MethodInvoker(
+                                 Sub()
+                                     finishAsyncCleanup(success, cleanupResult, errorMessage, cleanupWatch.ElapsedMilliseconds)
+                                 End Sub
+                             ))
+                         Else
+                             asyncCleanupInProgress = False
+                         End If
+                     Catch
+                         asyncCleanupInProgress = False
+                     End Try
+                 End Sub)
+    End Sub
+
+    Private Sub finishAsyncCleanup(ByVal success As Boolean,
+                                   ByVal cleanupResult As rawProcessReturn,
+                                   ByVal errorMessage As String,
+                                   ByVal elapsedMs As Long)
+        asyncCleanupInProgress = False
+
+        Dim debugNotes As New List(Of String)()
+        debugNotes.Add("Cleanup path: " & myUserControl.localRepoPath.Text)
+        debugNotes.Add("Elapsed: " & elapsedMs.ToString() & " ms")
+
+        Try
+            If cleanupResult.output IsNot Nothing AndAlso cleanupResult.output.Trim() <> "" Then
+                debugNotes.Add("stdout:")
+                debugNotes.Add(cleanupResult.output.Trim())
+            End If
+
+            If cleanupResult.outputError IsNot Nothing AndAlso cleanupResult.outputError.Trim() <> "" Then
+                debugNotes.Add("stderr:")
+                debugNotes.Add(cleanupResult.outputError.Trim())
+            End If
+        Catch
+        End Try
+
+        If success Then
+            Try
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+                refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+            Catch
+            End Try
+
+            showSvnTimingDebugWindow("SVN cleanup finished.", debugNotes)
+
+            iSwApp.SendMsgToUser2(
+                "SVN cleanup finished successfully." & vbCrLf & vbCrLf &
+                "Elapsed: " & elapsedMs.ToString() & " ms",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+        Else
+            If String.IsNullOrWhiteSpace(errorMessage) Then errorMessage = "Unknown cleanup failure."
+
+            showSvnTimingDebugWindow("SVN cleanup failed.", debugNotes)
+
+            iSwApp.SendMsgToUser2(
+                "SVN cleanup failed." & vbCrLf & vbCrLf &
+                errorMessage & vbCrLf & vbCrLf &
+                "If this mentions a locked file or access denied, close open CAD files and try again. If it still fails, close SolidWorks and run TortoiseSVN Cleanup from Windows Explorer.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
         End If
     End Sub
+
     Public Sub addtoRepoFunc(ByRef modDocArr() As ModelDoc2)
 
         If Not verifyLocalRepoPath() Then Exit Sub
@@ -6085,96 +6942,353 @@ Public Module svnModule
         runTortoiseProcexeWithMonitor("/command:log /path:""" & sFilePath & """")
     End Sub
 
-    Sub myGetLatestOrRevert(Optional ByRef modDocArr As ModelDoc2() = Nothing,
-                        Optional ByRef myGetType As getLatestType = getLatestType.update,
-                            Optional ByRef bVerbose As Boolean = False)
-        'Dim modDocTemp As ModelDoc2
+    Public Sub myGetLatestOrRevertPaths(ByVal selectedPaths() As String,
+                                        Optional ByVal myGetType As getLatestType = getLatestType.update,
+                                        Optional ByVal bVerbose As Boolean = False)
         Dim i As Integer
         Dim j As Integer = 0
-        Dim status As SVNStatus
-        Dim bSuccess As Boolean
+        Dim status As SVNStatus = Nothing
+        Dim bSuccess As Boolean = True
         Dim sw As New Stopwatch
+        Dim debugWatch As Stopwatch = Nothing
+        Dim debugNotes As New List(Of String)()
+        Dim phaseStartMs As Long = 0
 
-        If ((myGetType = getLatestType.both) Or (myGetType = getLatestType.update)) Then
-            If Not userAcceptsLossOfChanges(modDocArr, "Update the following Files to latest vault version?") Then Exit Sub
+        If debugTimingEnabled() Then
+            debugWatch = Stopwatch.StartNew()
         End If
 
-        'Update to use getFileSVNStatus so its only the
-        If IsNothing(modDocArr) Then
-            updateStatusOfAllModelsVariable()
-            status = statusOfAllOpenModels
+        Dim filteredPaths() As String = distinctExistingCadFilePaths(selectedPaths)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then
+            iSwApp.SendMsgToUser2("No valid selected CAD file paths were found for Get Latest.", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+        If ((myGetType = getLatestType.both) OrElse (myGetType = getLatestType.update)) Then
+            'Optimized selected Get Latest path:
+            'Trust the last explicit Sync result. This avoids another slow server status call.
+            'If the user has not synced this selection yet, ask them to Sync first.
+            status = getCachedServerStatusForExactPaths(filteredPaths, requireEveryPathCached:=True)
+
+            If debugWatch IsNot Nothing Then debugNotes.Add("Cached Sync status lookup: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            If status Is Nothing OrElse status.fp Is Nothing Then
+                iSwApp.SendMsgToUser2(
+                    "Get Latest selected files needs a recent Sync result first." & vbCrLf & vbCrLf &
+                    "Run Sync on the branch, select the out-of-date item(s) in the SVN tree, then click Get Latest." & vbCrLf & vbCrLf &
+                    "Tip: Ctrl-click toggles multiple files. Shift-click selects a visible range.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk
+                )
+
+                If debugWatch IsNot Nothing Then
+                    debugNotes.Add("Selected paths: " & filteredPaths.Length.ToString())
+                    debugNotes.Add("No usable cached server status. No update attempted.")
+                    debugNotes.Add("Total selected Get Latest time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+                    showSvnTimingDebugWindow("Get Latest selected stopped - Sync needed.", debugNotes)
+                End If
+
+                Exit Sub
+            End If
         Else
-            status = getFileSVNStatus(bCheckServer:=True, modDocArr)
+            status = getFileSVNStatus(
+                bCheckServer:=False,
+                modDocArr:=Nothing,
+                bUpdateStatusOfAllOpenModels:=False,
+                sDirectFilePathArr:=filteredPaths
+            )
+
+            If debugWatch IsNot Nothing Then debugNotes.Add("Local SVN status for selected paths: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
         End If
+
+        attachOpenDocsToStatusPaths(status)
+
         If IsNothing(status) Then Exit Sub
+        If status.fp Is Nothing Then Exit Sub
 
         Dim sFileList(UBound(status.fp)) As String
 
+        If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
         For i = 0 To UBound(status.fp)
-            'modDocTemp = iSwApp.GetOpenDocumentByName(mySVNStatus.fp(i).filename)
-            If status.fp(i).modDoc Is Nothing Then Continue For 'modDocTemp
-            'modDocArr(m) = modDocTemp : m += 1
-            If (status.fp(i).upToDate9 = "*") And ((myGetType = getLatestType.update) Or (myGetType = getLatestType.both)) Then
-                ' File is out of date
-                'sFileListToUpdate(j) = mySVNStatus.fp(i).filename : 
+            If String.IsNullOrWhiteSpace(status.fp(i).filename) Then Continue For
+
+            If (status.fp(i).upToDate9 = "*") AndAlso ((myGetType = getLatestType.update) OrElse (myGetType = getLatestType.both)) Then
                 status.fp(i).revertUpdate = getLatestType.update
                 sFileList(j) = status.fp(i).filename
-                'status.fp(i).bReconnect = True 'Should be set in releaseFileSystemAccessToRevertOrUpdateModels
                 j += 1
-            ElseIf (status.fp(i).addDelChg1 = "M") And (myGetType = getLatestType.revert) And (statusOfAllOpenModels.fp(i).lock6 <> "K") Then
-                ' Local copy has been modified
-                ' Note out of date files will go into FileListToUpdate and will be skipped over by revert.
-                'sFileListToRevert(n) = mySVNStatus.fp(i).filename : n += 1
+
+            ElseIf (status.fp(i).addDelChg1 = "M") AndAlso ((myGetType = getLatestType.revert) OrElse (myGetType = getLatestType.both)) Then
                 status.fp(i).revertUpdate = getLatestType.revert
                 sFileList(j) = status.fp(i).filename
                 j += 1
             End If
         Next
 
-        status.setReadWriteFromLockStatus()
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Filter selected files needing update/revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            debugNotes.Add("Selected files checked: " & filteredPaths.Length.ToString())
+            debugNotes.Add("Files needing action: " & j.ToString())
+        End If
+
+        If j = 0 Then
+            If bVerbose Then
+                iSwApp.SendMsgToUser2(
+                    "Selected file(s) are not marked out-of-date by the last Sync." & vbCrLf & vbCrLf &
+                    "Run Sync again if you expected an update.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            End If
+
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Total selected Get Latest time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+                showSvnTimingDebugWindow("Get Latest selected finished - nothing to update.", debugNotes)
+            End If
+
+            Exit Sub
+        End If
+
+        Dim pathsNeedingAction() As String = compactNonBlankStringArray(sFileList)
+        If Not userAcceptsLossOfChangesPaths(pathsNeedingAction, "Update/revert the following selected file(s) to vault version?") Then Exit Sub
+
+        sw.Start()
+        System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.WaitCursor
+
+        Try
+            Dim indexOfFilestoRevert As Integer() = status.indexFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
+
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, indexOfFilestoRevert)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for selected revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            sFileList = status.sFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
+
+            If (Not sFileList Is Nothing) AndAlso ((myGetType = getLatestType.revert) OrElse (myGetType = getLatestType.both)) Then
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:revert /path:" & formatFilePathArrForProc(sFileList) & " /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN selected revert call: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                If Not bSuccess Then iSwApp.SendMsgToUserv("Revert Files Failed.")
+            End If
+
+            Dim indexOfFilestoUpdate As Integer() = status.indexFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
+
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, indexOfFilestoUpdate)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for selected update: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            sFileList = status.sFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
+
+            If (Not sFileList Is Nothing) AndAlso ((myGetType = getLatestType.update) OrElse (myGetType = getLatestType.both)) Then
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:update /path:" & formatFilePathArrForProc(sFileList) & " /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN selected update call: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                If Not bSuccess Then iSwApp.SendMsgToUserv("Updating Files Failed.")
+            End If
+
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.reattachDocsToFileSystem(indexOfFilestoRevert, iSwApp)
+            status.reattachDocsToFileSystem(indexOfFilestoUpdate, iSwApp)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Reattach selected docs to filesystem: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+                refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+                If debugWatch IsNot Nothing Then debugNotes.Add("Post-selected-action local status/tree refresh: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
+
+        Finally
+            System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
+        End Try
+
+        sw.Stop()
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Total selected Get Latest time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+            showSvnTimingDebugWindow("Get Latest selected finished.", debugNotes)
+        End If
+
+        Debug.WriteLine("myGetLatestOrRevertPaths Time Taken: " + sw.Elapsed.TotalMilliseconds.ToString("#,##0.00 'milliseconds'"))
+    End Sub
+
+    Sub myGetLatestOrRevert(Optional ByRef modDocArr As ModelDoc2() = Nothing,
+                        Optional ByRef myGetType As getLatestType = getLatestType.update,
+                        Optional ByRef bVerbose As Boolean = False)
+        Dim i As Integer
+        Dim j As Integer = 0
+        Dim status As SVNStatus
+        Dim bSuccess As Boolean = True
+        Dim sw As New Stopwatch
+        Dim debugWatch As Stopwatch = Nothing
+        Dim debugNotes As New List(Of String)()
+        Dim phaseStartMs As Long = 0
+        Dim needsServerCheck As Boolean = ((myGetType = getLatestType.both) OrElse (myGetType = getLatestType.update))
+
+        If debugTimingEnabled() Then
+            debugWatch = Stopwatch.StartNew()
+        End If
+
+        If ((myGetType = getLatestType.both) Or (myGetType = getLatestType.update)) Then
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            If Not userAcceptsLossOfChanges(modDocArr, "Update the following Files to latest vault version?") Then Exit Sub
+            If debugWatch IsNot Nothing Then debugNotes.Add("User confirm / local-change safety check: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        End If
+
+        If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+        'Speed fix:
+        'Update/Get Latest must contact the server to know what is out of date.
+        'Revert does not need a server check; local SVN status is enough and is much faster.
+        If IsNothing(modDocArr) Then
+            If needsServerCheck Then
+                updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False)
+            Else
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+            End If
+
+            status = statusOfAllOpenModels
+        Else
+            status = getFileSVNStatus(
+                bCheckServer:=needsServerCheck,
+                modDocArr:=modDocArr,
+                bUpdateStatusOfAllOpenModels:=False
+            )
+        End If
+
+        If debugWatch IsNot Nothing Then
+            If needsServerCheck Then
+                debugNotes.Add("SVN status pre-check (server): " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Else
+                debugNotes.Add("SVN status pre-check (local only): " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            End If
+        End If
+
+        If IsNothing(status) Then Exit Sub
+        If status.fp Is Nothing Then Exit Sub
+
+        Dim sFileList(UBound(status.fp)) As String
+
+        If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+        For i = 0 To UBound(status.fp)
+            If status.fp(i).modDoc Is Nothing Then Continue For
+
+            If (status.fp(i).upToDate9 = "*") And ((myGetType = getLatestType.update) Or (myGetType = getLatestType.both)) Then
+                status.fp(i).revertUpdate = getLatestType.update
+                sFileList(j) = status.fp(i).filename
+                j += 1
+
+            ElseIf (status.fp(i).addDelChg1 = "M") And ((myGetType = getLatestType.revert) Or (myGetType = getLatestType.both)) Then
+                status.fp(i).revertUpdate = getLatestType.revert
+                sFileList(j) = status.fp(i).filename
+                j += 1
+            End If
+        Next
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Filter files needing update/revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            debugNotes.Add("Files needing action: " & j.ToString())
+        End If
+
+        Try
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.setReadWriteFromLockStatus()
+            If debugWatch IsNot Nothing Then debugNotes.Add("Set read/write from lock status: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+        Catch
+        End Try
 
         If j = 0 Then
             If bVerbose Then iSwApp.SendMsgToUser("All Files Checked Are Up to Date!")
-            If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False) Then
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+                'Speed fix: no second server status call when nothing changed.
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
                 refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+
+                If debugWatch IsNot Nothing Then debugNotes.Add("Post no-op local status/tree refresh: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
+
+            If debugWatch IsNot Nothing Then
+                debugNotes.Add("Total Get Latest/Revert time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+                showSvnTimingDebugWindow("Get Latest/Revert finished - nothing to update.", debugNotes)
             End If
+
             Exit Sub
         End If
 
         sw.Start()
         System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.WaitCursor
 
+        Try
+            Dim indexOfFilestoRevert As Integer() = status.indexFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
 
-        Dim indexOfFilestoRevert As Integer() = status.indexFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
-        status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, indexOfFilestoRevert) 'This should be setting bReconnect to 
-        sFileList = status.sFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
-        If (Not sFileList Is Nothing) And ((myGetType = getLatestType.revert) Or (myGetType = getLatestType.both)) Then
-            bSuccess = runTortoiseProcexeWithMonitor("/command:revert /path:" &
-                                          formatFilePathArrForProc(sFileList) & " /closeonend:3")
-            If Not bSuccess Then iSwApp.SendMsgToUserv("Revert Files Failed.")
-        End If
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, indexOfFilestoRevert)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
 
-        Dim indexOfFilestoUpdate As Integer() = status.indexFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
-        status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, indexOfFilestoUpdate)
-        sFileList = status.sFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
-        If (Not sFileList Is Nothing) And ((myGetType = getLatestType.update) Or (myGetType = getLatestType.both)) Then
-            bSuccess = runTortoiseProcexeWithMonitor("/command:update /path:" & formatFilePathArrForProc(sFileList) & " /closeonend:3")
-            If Not bSuccess Then iSwApp.SendMsgToUserv("Updating Files Failed.")
-        End If
+            sFileList = status.sFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
 
-        'What happens if user cancels any items in tortoise window??? Or if tortoiseSVN fails, such as needing clean up
+            If (Not sFileList Is Nothing) And ((myGetType = getLatestType.revert) Or (myGetType = getLatestType.both)) Then
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:revert /path:" & formatFilePathArrForProc(sFileList) & " /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN revert call: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                If Not bSuccess Then iSwApp.SendMsgToUserv("Revert Files Failed.")
+            End If
 
-        status.reattachDocsToFileSystem(indexOfFilestoRevert, iSwApp)
-        status.reattachDocsToFileSystem(indexOfFilestoUpdate, iSwApp)
+            Dim indexOfFilestoUpdate As Integer() = status.indexFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
 
-        If updateStatusOfAllModelsVariable(bRefreshAllTreeViews:=False) Then
-            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
-        End If
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.releaseFileSystemAccessToRevertOrUpdateModels(iSwApp, indexOfFilestoUpdate)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for update: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
 
-        System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
+            sFileList = status.sFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
+
+            If (Not sFileList Is Nothing) And ((myGetType = getLatestType.update) Or (myGetType = getLatestType.both)) Then
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                bSuccess = runTortoiseProcexeWithMonitor("/command:update /path:" & formatFilePathArrForProc(sFileList) & " /closeonend:3")
+                If debugWatch IsNot Nothing Then debugNotes.Add("TortoiseSVN update call: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                If Not bSuccess Then iSwApp.SendMsgToUserv("Updating Files Failed.")
+            End If
+
+            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+            status.reattachDocsToFileSystem(indexOfFilestoRevert, iSwApp)
+            status.reattachDocsToFileSystem(indexOfFilestoUpdate, iSwApp)
+            If debugWatch IsNot Nothing Then debugNotes.Add("Reattach docs to filesystem: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+
+                'Speed fix: after Tortoise completes, do a local status/tree refresh only.
+                'The expensive server re-check belongs under explicit Sync Status, not every Get Latest / Revert finish.
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+                refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+
+                If debugWatch IsNot Nothing Then debugNotes.Add("Post-action local status/tree refresh: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+            End Try
+
+        Finally
+            System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
+        End Try
+
         sw.Stop()
+
+        If debugWatch IsNot Nothing Then
+            debugNotes.Add("Total Get Latest/Revert time: " & debugWatch.ElapsedMilliseconds.ToString() & " ms")
+            showSvnTimingDebugWindow("Get Latest/Revert finished.", debugNotes)
+        End If
+
         Debug.WriteLine("myGetLatestOrRevert Time Taken: " + sw.Elapsed.TotalMilliseconds.ToString("#,##0.00 'milliseconds'"))
     End Sub
+
     Public Enum getLatestType
         undefined = -1
         none = 0
