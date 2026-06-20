@@ -44,6 +44,9 @@ Public Class UserControl1
     Private syncStatusContextMenu As ContextMenuStrip
     Private WithEvents syncDebugTimingMenuItem As ToolStripMenuItem
     Private syncDebugTimingEnabled As Boolean = False
+    Private WithEvents butCleanupQuick As Button
+    Private cacheAgeLabel As Label
+    Private WithEvents cacheAgeTimer As System.Windows.Forms.Timer
     Private Const LAZY_LOAD_PLACEHOLDER_TEXT As String = "<load children>"
     Private syncStatusInProgress As Boolean = False
     Private refreshTreeNeedsUpdate As Boolean = False
@@ -125,9 +128,12 @@ Public Class UserControl1
         setCompactSvnActionButtonStyle(butSyncStatus, "Sync")
         setupSyncStatusContextMenu()
         ensureDebugIgnoreNamingCheckbox(parentControl)
+        ensureCleanupQuickButton(parentControl)
+        ensureCacheAgeLabel(parentControl)
         ensureSyncProgressControls(parentControl)
 
         positionRefreshAndSyncButtonsBesideCommit()
+        updateCacheAgeIndicatorPublic()
         removeGetLatestAllMenuItem()
     End Sub
 
@@ -274,6 +280,84 @@ Public Class UserControl1
         End If
     End Sub
 
+    Private Sub ensureCleanupQuickButton(ByVal parentControl As Control)
+        If parentControl Is Nothing Then parentControl = Me
+
+        If butCleanupQuick Is Nothing Then
+            butCleanupQuick = New Button()
+            butCleanupQuick.Name = "butCleanupQuick"
+            butCleanupQuick.TabIndex = If(butRefresh IsNot Nothing, butRefresh.TabIndex + 6, 60)
+            parentControl.Controls.Add(butCleanupQuick)
+        ElseIf butCleanupQuick.Parent Is Nothing Then
+            parentControl.Controls.Add(butCleanupQuick)
+        End If
+
+        setCompactSvnActionButtonStyle(butCleanupQuick, "Cleanup")
+        butCleanupQuick.Visible = True
+        butCleanupQuick.Enabled = True
+        butCleanupQuick.BringToFront()
+    End Sub
+
+    Private Sub ensureCacheAgeLabel(ByVal parentControl As Control)
+        If parentControl Is Nothing Then parentControl = Me
+
+        If cacheAgeLabel Is Nothing Then
+            cacheAgeLabel = New Label()
+            cacheAgeLabel.Name = "cacheAgeLabel"
+            cacheAgeLabel.AutoSize = True
+            cacheAgeLabel.Font = readableUiFont(False, 8.25!)
+            cacheAgeLabel.BackColor = SystemColors.Control
+            cacheAgeLabel.Text = "Cache: none"
+            cacheAgeLabel.Visible = True
+            cacheAgeLabel.TabIndex = If(butRefresh IsNot Nothing, butRefresh.TabIndex + 7, 61)
+            parentControl.Controls.Add(cacheAgeLabel)
+        ElseIf cacheAgeLabel.Parent Is Nothing Then
+            parentControl.Controls.Add(cacheAgeLabel)
+        End If
+
+        cacheAgeLabel.Font = readableUiFont(False, 8.25!)
+        cacheAgeLabel.AutoSize = True
+        cacheAgeLabel.Visible = True
+
+        If cacheAgeTimer Is Nothing Then
+            cacheAgeTimer = New System.Windows.Forms.Timer()
+            cacheAgeTimer.Interval = 15000
+            cacheAgeTimer.Start()
+        End If
+    End Sub
+
+    Private Sub butCleanupQuick_Click(sender As Object, e As EventArgs) Handles butCleanupQuick.Click
+        myCleanup()
+    End Sub
+
+    Private Sub cacheAgeTimer_Tick(sender As Object, e As EventArgs) Handles cacheAgeTimer.Tick
+        updateCacheAgeIndicatorPublic()
+    End Sub
+
+    Public Sub updateCacheAgeIndicatorPublic()
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(Sub() updateCacheAgeIndicatorPublic()))
+                Exit Sub
+            End If
+
+            If cacheAgeLabel Is Nothing Then Exit Sub
+
+            Dim cacheText As String = "none"
+
+            Try
+                cacheText = svnModule.getStatusCacheAgeDisplayTextPublic()
+            Catch
+                cacheText = "unknown"
+            End Try
+
+            cacheAgeLabel.Text = "Cache: " & cacheText
+            cacheAgeLabel.BringToFront()
+            positionRefreshAndSyncButtonsBesideCommit()
+        Catch
+        End Try
+    End Sub
+
     Private Sub ensureSyncProgressControls(ByVal parentControl As Control)
         If parentControl Is Nothing Then parentControl = Me
 
@@ -378,6 +462,12 @@ Public Class UserControl1
 
             If butRefresh IsNot Nothing Then setCompactSvnActionButtonStyle(butRefresh, "Refresh")
             If butSyncStatus IsNot Nothing Then setCompactSvnActionButtonStyle(butSyncStatus, "Sync")
+            If butCleanupQuick IsNot Nothing Then setCompactSvnActionButtonStyle(butCleanupQuick, "Cleanup")
+
+            If cacheAgeLabel IsNot Nothing Then
+                cacheAgeLabel.Font = readableUiFont(False, 8.25!)
+                cacheAgeLabel.AutoSize = True
+            End If
 
             If chkDebugIgnoreNaming IsNot Nothing Then
                 chkDebugIgnoreNaming.Font = readableUiFont(False, 8.5!)
@@ -885,6 +975,102 @@ Public Class UserControl1
         Return getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode)
     End Function
 
+    Public Function getAssemblyCommitGuardPathsForPathsPublic(ByVal selectedCommitPaths() As String) As String()
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            If selectedCommitPaths Is Nothing OrElse selectedCommitPaths.Length = 0 Then Return Nothing
+
+            Dim selectedSet As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+            For Each selectedPath As String In selectedCommitPaths
+                If String.IsNullOrWhiteSpace(selectedPath) Then Continue For
+
+                Try
+                    selectedPath = Path.GetFullPath(selectedPath)
+                Catch
+                End Try
+
+                selectedSet.Add(selectedPath)
+                addPathToGuardList(selectedPath, seen, output)
+            Next
+
+            If TreeView1 IsNot Nothing AndAlso TreeView1.Nodes IsNot Nothing Then
+                For Each rootNode As TreeNode In TreeView1.Nodes
+                    collectAssemblyCommitGuardPathsFromTree(rootNode, selectedSet, seen, output)
+                Next
+            End If
+        Catch
+        End Try
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Sub collectAssemblyCommitGuardPathsFromTree(ByVal node As TreeNode,
+                                                        ByVal selectedSet As HashSet(Of String),
+                                                        ByVal seen As HashSet(Of String),
+                                                        ByVal output As List(Of String))
+        If node Is Nothing Then Exit Sub
+        If selectedSet Is Nothing OrElse seen Is Nothing OrElse output Is Nothing Then Exit Sub
+        If isLazyPlaceholderNode(node) Then Exit Sub
+
+        Dim nodePath As String = getCadPathFromTreeNode(node)
+
+        Try
+            If Not String.IsNullOrWhiteSpace(nodePath) Then nodePath = Path.GetFullPath(nodePath)
+        Catch
+        End Try
+
+        If selectedSet.Contains(nodePath) AndAlso isTreeNodeAssembly(node) Then
+            collectLoadedDescendantCadPathsForCommitGuard(node, seen, output)
+            Exit Sub
+        End If
+
+        Try
+            For Each childNode As TreeNode In node.Nodes
+                collectAssemblyCommitGuardPathsFromTree(childNode, selectedSet, seen, output)
+            Next
+        Catch
+        End Try
+    End Sub
+
+    Private Sub collectLoadedDescendantCadPathsForCommitGuard(ByVal node As TreeNode,
+                                                              ByVal seen As HashSet(Of String),
+                                                              ByVal output As List(Of String))
+        If node Is Nothing Then Exit Sub
+        If seen Is Nothing OrElse output Is Nothing Then Exit Sub
+        If isLazyPlaceholderNode(node) Then Exit Sub
+
+        Dim nodePath As String = getCadPathFromTreeNode(node)
+        addPathToGuardList(nodePath, seen, output)
+
+        Try
+            For Each childNode As TreeNode In node.Nodes
+                If isLazyPlaceholderNode(childNode) Then Continue For
+                collectLoadedDescendantCadPathsForCommitGuard(childNode, seen, output)
+            Next
+        Catch
+        End Try
+    End Sub
+
+    Private Sub addPathToGuardList(ByVal filePath As String,
+                                   ByVal seen As HashSet(Of String),
+                                   ByVal output As List(Of String))
+        If seen Is Nothing OrElse output Is Nothing Then Exit Sub
+        If Not isCadPathForSync(filePath) Then Exit Sub
+
+        Try
+            filePath = Path.GetFullPath(filePath)
+        Catch
+        End Try
+
+        If seen.Contains(filePath) Then Exit Sub
+        seen.Add(filePath)
+        output.Add(filePath)
+    End Sub
+
     Private Sub syncSelectedBranchMenuItem_Click(sender As Object, e As EventArgs)
         performSyncStatus()
     End Sub
@@ -932,7 +1118,7 @@ Public Class UserControl1
             Dim x As Integer = Math.Max(minLeft, Math.Min(startPoint.X, maxLeft))
             Dim y As Integer = Math.Max(0, startPoint.Y)
 
-            'Prefer putting both buttons beside Commit. If the task pane is too narrow,
+            'Prefer putting Refresh/Sync beside Commit. If the task pane is too narrow,
             'stack Sync below Refresh so they do not get clipped at the bottom of the pane.
             If x + butRefresh.Width + gap + butSyncStatus.Width <= parentControl.ClientSize.Width - 2 Then
                 butRefresh.Location = New Point(x, y)
@@ -942,14 +1128,72 @@ Public Class UserControl1
                 butSyncStatus.Location = New Point(x, y + butRefresh.Height + gap)
             End If
 
+            'New Cleanup button: prefer beside the Release dropdown so users can run SVN cleanup
+            'without going through the folder menu and without closing SOLIDWORKS.
+            If butCleanupQuick IsNot Nothing Then
+                Dim cleanupPlaced As Boolean = False
+
+                Try
+                    If ToolStripDropDownButReleases IsNot Nothing AndAlso ToolStripDropDownButReleases.Owner IsNot Nothing Then
+                        Dim releaseOwner As Control = TryCast(ToolStripDropDownButReleases.Owner, Control)
+                        If releaseOwner IsNot Nothing Then
+                            Dim releaseBounds As Rectangle = ToolStripDropDownButReleases.Bounds
+                            Dim releaseScreen As Point = releaseOwner.PointToScreen(New Point(releaseBounds.Right + 8, releaseBounds.Top + 2))
+                            Dim releasePoint As Point = parentControl.PointToClient(releaseScreen)
+
+                            Dim cleanupX As Integer = Math.Max(minLeft, releasePoint.X)
+                            Dim cleanupY As Integer = Math.Max(0, releasePoint.Y)
+
+                            If cleanupX + butCleanupQuick.Width <= parentControl.ClientSize.Width - uiPx(2) Then
+                                butCleanupQuick.Location = New Point(cleanupX, cleanupY)
+                            Else
+                                butCleanupQuick.Location = New Point(Math.Max(minLeft, parentControl.ClientSize.Width - butCleanupQuick.Width - uiPx(4)), cleanupY + butCleanupQuick.Height + gap)
+                            End If
+
+                            cleanupPlaced = True
+                        End If
+                    End If
+                Catch
+                    cleanupPlaced = False
+                End Try
+
+                If Not cleanupPlaced Then
+                    butCleanupQuick.Location = New Point(butSyncStatus.Right + gap, butSyncStatus.Top)
+                    If butCleanupQuick.Right > parentControl.ClientSize.Width - uiPx(2) Then
+                        butCleanupQuick.Location = New Point(butRefresh.Left, Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + gap)
+                    End If
+                End If
+
+                butCleanupQuick.BringToFront()
+            End If
+
+            Dim actionBottom As Integer = Math.Max(butRefresh.Bottom, butSyncStatus.Bottom)
+            If butCleanupQuick IsNot Nothing Then actionBottom = Math.Max(actionBottom, butCleanupQuick.Bottom)
+
             If chkDebugIgnoreNaming IsNot Nothing Then
-                chkDebugIgnoreNaming.Location = New Point(butRefresh.Left, Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2)
+                chkDebugIgnoreNaming.Location = New Point(butRefresh.Left, actionBottom + 2)
                 chkDebugIgnoreNaming.BringToFront()
             End If
 
+            If cacheAgeLabel IsNot Nothing Then
+                If chkDebugIgnoreNaming IsNot Nothing Then
+                    cacheAgeLabel.Location = New Point(chkDebugIgnoreNaming.Right + uiPx(10), chkDebugIgnoreNaming.Top + Math.Max(0, CInt((chkDebugIgnoreNaming.Height - cacheAgeLabel.Height) / 2)))
+                Else
+                    cacheAgeLabel.Location = New Point(butRefresh.Left, actionBottom + 2)
+                End If
+
+                If cacheAgeLabel.Right > parentControl.ClientSize.Width - uiPx(4) Then
+                    cacheAgeLabel.Location = New Point(butRefresh.Left, If(chkDebugIgnoreNaming IsNot Nothing, chkDebugIgnoreNaming.Bottom + 1, actionBottom + 2))
+                End If
+
+                cacheAgeLabel.BringToFront()
+            End If
+
             If syncProgressLabel IsNot Nothing AndAlso syncProgressBar IsNot Nothing Then
-                Dim progressTop As Integer = Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2
-                If chkDebugIgnoreNaming IsNot Nothing Then progressTop = chkDebugIgnoreNaming.Bottom + 2
+                Dim progressTop As Integer = actionBottom + 2
+                If chkDebugIgnoreNaming IsNot Nothing Then progressTop = Math.Max(progressTop, chkDebugIgnoreNaming.Bottom + 2)
+                If cacheAgeLabel IsNot Nothing Then progressTop = Math.Max(progressTop, cacheAgeLabel.Bottom + 2)
+
                 syncProgressLabel.Location = New Point(butRefresh.Left, progressTop)
                 syncProgressBar.Location = New Point(butRefresh.Left, syncProgressLabel.Bottom + 1)
                 syncProgressBar.Width = Math.Max(uiPx(140), Math.Min(uiPx(220), parentControl.ClientSize.Width - butRefresh.Left - uiPx(8)))
@@ -963,14 +1207,36 @@ Public Class UserControl1
             butRefresh.Location = New Point(Math.Max(4, butRefresh.Left), fallbackTop)
             butSyncStatus.Location = New Point(butRefresh.Right + 4, fallbackTop)
 
+            If butCleanupQuick IsNot Nothing Then
+                butCleanupQuick.Location = New Point(butSyncStatus.Right + 4, fallbackTop)
+                If butCleanupQuick.Right > parentControl.ClientSize.Width - uiPx(2) Then
+                    butCleanupQuick.Location = New Point(butRefresh.Left, Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 4)
+                End If
+                butCleanupQuick.BringToFront()
+            End If
+
+            Dim actionBottom As Integer = Math.Max(butRefresh.Bottom, butSyncStatus.Bottom)
+            If butCleanupQuick IsNot Nothing Then actionBottom = Math.Max(actionBottom, butCleanupQuick.Bottom)
+
             If chkDebugIgnoreNaming IsNot Nothing Then
-                chkDebugIgnoreNaming.Location = New Point(butRefresh.Left, Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2)
+                chkDebugIgnoreNaming.Location = New Point(butRefresh.Left, actionBottom + 2)
                 chkDebugIgnoreNaming.BringToFront()
             End If
 
+            If cacheAgeLabel IsNot Nothing Then
+                If chkDebugIgnoreNaming IsNot Nothing Then
+                    cacheAgeLabel.Location = New Point(chkDebugIgnoreNaming.Right + uiPx(10), chkDebugIgnoreNaming.Top)
+                Else
+                    cacheAgeLabel.Location = New Point(butRefresh.Left, actionBottom + 2)
+                End If
+                cacheAgeLabel.BringToFront()
+            End If
+
             If syncProgressLabel IsNot Nothing AndAlso syncProgressBar IsNot Nothing Then
-                Dim progressTop As Integer = Math.Max(butRefresh.Bottom, butSyncStatus.Bottom) + 2
-                If chkDebugIgnoreNaming IsNot Nothing Then progressTop = chkDebugIgnoreNaming.Bottom + 2
+                Dim progressTop As Integer = actionBottom + 2
+                If chkDebugIgnoreNaming IsNot Nothing Then progressTop = Math.Max(progressTop, chkDebugIgnoreNaming.Bottom + 2)
+                If cacheAgeLabel IsNot Nothing Then progressTop = Math.Max(progressTop, cacheAgeLabel.Bottom + 2)
+
                 syncProgressLabel.Location = New Point(butRefresh.Left, progressTop)
                 syncProgressBar.Location = New Point(butRefresh.Left, syncProgressLabel.Bottom + 1)
                 syncProgressBar.Width = Math.Max(uiPx(140), Math.Min(uiPx(220), parentControl.ClientSize.Width - butRefresh.Left - uiPx(8)))
@@ -1578,19 +1844,20 @@ Public Class UserControl1
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
 
             If rootNode IsNot Nothing Then
-                loadImmediateChildrenForNode(rootNode)
+                loadOneExtraLazyLevelForSync(rootNode)
                 syncPaths = collectImmediateChildCadPathsForSync(rootNode)
             End If
 
             If debugWatch IsNot Nothing Then
-                debugNotes.Add("Default Level-1 load/collect: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                debugNotes.Add("Default Level-1/Level-2 load/collect: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
             End If
         Else
-            'Selected Level 0 -> sync selected node + Level 1.
-            'Selected Level 1 -> sync selected node + Level 2.
+            'Selected Level 0 -> sync selected node + Level 1 + Level 2.
+            'Selected Level 1 -> sync selected node + Level 2 + Level 3.
+            'This deliberately loads only one extra lazy level below the old behavior, not the whole tree.
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
 
-            loadImmediateChildrenForNode(selectedNode)
+            loadOneExtraLazyLevelForSync(selectedNode)
             syncPaths = collectSelectedBranchCadPathsForSync(selectedNode)
 
             If debugWatch IsNot Nothing Then
@@ -1876,17 +2143,25 @@ Public Class UserControl1
         Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         If selectedNode IsNot Nothing Then
+            'Selected branch sync is intentionally bounded:
+            'selected node + loaded direct children + loaded grandchildren only.
+            'It does not recurse forever, so it will not accidentally become whole-car sync.
             addTreeNodePathToSyncList(selectedNode, seen, output)
 
             For Each childNode As TreeNode In selectedNode.Nodes
                 If isLazyPlaceholderNode(childNode) Then Continue For
                 addTreeNodePathToSyncList(childNode, seen, output)
+
+                For Each grandChildNode As TreeNode In childNode.Nodes
+                    If isLazyPlaceholderNode(grandChildNode) Then Continue For
+                    addTreeNodePathToSyncList(grandChildNode, seen, output)
+                Next
             Next
         End If
 
         'Never fall back to collectCurrentTreeCadPaths() here.
         'That fallback turns a failed/empty selected-branch sync into a whole loaded-tree sync,
-        'which breaks the Level 0 / Level 1 / Level 2 controls.
+        'which breaks the controlled Level 0 / Level 1 / Level 2 / Level 3 sync behavior.
         If output.Count = 0 Then Return Nothing
 
         Return output.ToArray()
@@ -1896,9 +2171,17 @@ Public Class UserControl1
         Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         If parentNode IsNot Nothing Then
+            'Default/no-selection sync stays bounded to one level lower than before:
+            'direct children + loaded grandchildren only. It does not include the root node
+            'and it does not recurse through the whole car.
             For Each childNode As TreeNode In parentNode.Nodes
                 If isLazyPlaceholderNode(childNode) Then Continue For
                 addTreeNodePathToSyncList(childNode, seen, output)
+
+                For Each grandChildNode As TreeNode In childNode.Nodes
+                    If isLazyPlaceholderNode(grandChildNode) Then Continue For
+                    addTreeNodePathToSyncList(grandChildNode, seen, output)
+                Next
             Next
         End If
 
@@ -3144,6 +3427,20 @@ Public Class UserControl1
             node.TreeView.Sort()
         Catch
         End Try
+    End Sub
+
+    Private Sub loadOneExtraLazyLevelForSync(ByVal parentNode As TreeNode)
+        If parentNode Is Nothing Then Exit Sub
+
+        'This is intentionally not recursive.
+        'It loads the selected/root node's immediate children, then loads one more level
+        'under those children so normal Sync has cache data for one level lower.
+        loadImmediateChildrenForNode(parentNode)
+
+        For Each childNode As TreeNode In parentNode.Nodes
+            If isLazyPlaceholderNode(childNode) Then Continue For
+            loadImmediateChildrenForNode(childNode)
+        Next
     End Sub
 
     Private Sub loadEntireLazyTree(ByVal node As TreeNode)

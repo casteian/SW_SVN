@@ -33,6 +33,8 @@ Public Module svnModule
     Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
     Private unsafeForceCloseApprovedUntil As DateTime = DateTime.MinValue
     Private statusCacheByNormalizedPath As New Dictionary(Of String, SVNStatus.filePpty)(StringComparer.OrdinalIgnoreCase)
+    Private statusCacheLastWriteUtc As DateTime = DateTime.MinValue
+    Private statusCacheLastServerAwareUtc As DateTime = DateTime.MinValue
     Private asyncGetLocksInProgress As Boolean = False
     Private asyncCommitInProgress As Boolean = False
     Private asyncCleanupInProgress As Boolean = False
@@ -969,12 +971,125 @@ Public Module svnModule
     End Function
 
 
+    Private Function statusContainsServerAwareData(ByVal statusToCheck As SVNStatus) As Boolean
+        Try
+            If statusToCheck Is Nothing OrElse statusToCheck.fp Is Nothing Then Return False
+
+            For i As Integer = 0 To UBound(statusToCheck.fp)
+                Dim updateColumn As String = statusToCheck.fp(i).upToDate9
+
+                If updateColumn IsNot Nothing AndAlso
+                   Not String.Equals(updateColumn, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then
+                    Return True
+                End If
+            Next
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Private Function cacheEntryHasServerAwareData(ByVal entry As SVNStatus.filePpty) As Boolean
+        Try
+            Return entry.upToDate9 IsNot Nothing AndAlso
+                   Not String.Equals(entry.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Sub notifyStatusCacheChanged()
+        Try
+            If myUserControl Is Nothing Then Exit Sub
+
+            If myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(New System.Windows.Forms.MethodInvoker(
+                    Sub()
+                        Try
+                            myUserControl.updateCacheAgeIndicatorPublic()
+                        Catch
+                        End Try
+                    End Sub
+                ))
+            End If
+        Catch
+            Try
+                myUserControl.updateCacheAgeIndicatorPublic()
+            Catch
+            End Try
+        End Try
+    End Sub
+
+    Public Function getStatusCacheAgeDisplayTextPublic() As String
+        Try
+            If statusCacheByNormalizedPath Is Nothing OrElse statusCacheByNormalizedPath.Count = 0 Then Return "none"
+            If statusCacheLastWriteUtc = DateTime.MinValue Then Return "unknown"
+
+            Dim age As TimeSpan = DateTime.UtcNow - statusCacheLastWriteUtc
+            If age.TotalSeconds < 0 Then age = TimeSpan.Zero
+
+            Dim ageText As String
+
+            If age.TotalSeconds < 60 Then
+                ageText = "now"
+            ElseIf age.TotalMinutes < 60 Then
+                ageText = CInt(Math.Floor(age.TotalMinutes)).ToString() & "m"
+            ElseIf age.TotalHours < 24 Then
+                ageText = CInt(Math.Floor(age.TotalHours)).ToString() & "h"
+            Else
+                ageText = CInt(Math.Floor(age.TotalDays)).ToString() & "d"
+            End If
+
+            If statusCacheLastServerAwareUtc = DateTime.MinValue Then
+                Return ageText & " local"
+            End If
+
+            Dim serverAge As TimeSpan = DateTime.UtcNow - statusCacheLastServerAwareUtc
+            If serverAge.TotalSeconds < 0 Then serverAge = TimeSpan.Zero
+
+            Dim serverText As String
+            If serverAge.TotalSeconds < 60 Then
+                serverText = "sync now"
+            ElseIf serverAge.TotalMinutes < 60 Then
+                serverText = "sync " & CInt(Math.Floor(serverAge.TotalMinutes)).ToString() & "m"
+            ElseIf serverAge.TotalHours < 24 Then
+                serverText = "sync " & CInt(Math.Floor(serverAge.TotalHours)).ToString() & "h"
+            Else
+                serverText = "sync " & CInt(Math.Floor(serverAge.TotalDays)).ToString() & "d"
+            End If
+
+            If Math.Abs((statusCacheLastWriteUtc - statusCacheLastServerAwareUtc).TotalSeconds) < 2 Then
+                Return serverText
+            End If
+
+            Return ageText & " / " & serverText
+        Catch
+            Return "unknown"
+        End Try
+    End Function
+
+    Private Sub markStatusCacheWritten(ByVal serverAwareWrite As Boolean)
+        statusCacheLastWriteUtc = DateTime.UtcNow
+
+        If serverAwareWrite Then
+            statusCacheLastServerAwareUtc = statusCacheLastWriteUtc
+        End If
+
+        notifyStatusCacheChanged()
+    End Sub
+
     Private Sub rebuildStatusCacheFromStatus(ByVal statusToCache As SVNStatus)
         Try
-            statusCacheByNormalizedPath.Clear()
+            If statusToCache Is Nothing OrElse statusToCache.fp Is Nothing Then Exit Sub
 
-            If statusToCache Is Nothing Then Exit Sub
-            If statusToCache.fp Is Nothing Then Exit Sub
+            Dim serverAwareWrite As Boolean = statusContainsServerAwareData(statusToCache)
+
+            'Server-aware Sync/status results replace the cache.
+            'Local-only refreshes merge into the existing cache so they do not destroy the
+            'last known up-to-date/out-of-date server column used by cached Get Latest.
+            If serverAwareWrite Then
+                statusCacheByNormalizedPath.Clear()
+            End If
 
             For i As Integer = 0 To UBound(statusToCache.fp)
                 Dim filePath As String = statusToCache.fp(i).filename
@@ -983,13 +1098,96 @@ Public Module svnModule
                 Dim normalizedPath As String = normalizeSvnPath(filePath)
                 If String.IsNullOrWhiteSpace(normalizedPath) Then Continue For
 
-                statusCacheByNormalizedPath(normalizedPath) = statusToCache.fp(i)
+                Dim entryToStore As SVNStatus.filePpty = statusToCache.fp(i)
+
+                If Not serverAwareWrite AndAlso statusCacheByNormalizedPath.ContainsKey(normalizedPath) Then
+                    Dim previousEntry As SVNStatus.filePpty = statusCacheByNormalizedPath(normalizedPath)
+
+                    If cacheEntryHasServerAwareData(previousEntry) AndAlso
+                       (entryToStore.upToDate9 Is Nothing OrElse String.Equals(entryToStore.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase)) Then
+                        entryToStore.upToDate9 = previousEntry.upToDate9
+                    End If
+                End If
+
+                statusCacheByNormalizedPath(normalizedPath) = entryToStore
             Next
+
+            markStatusCacheWritten(serverAwareWrite)
         Catch
             Try
-                statusCacheByNormalizedPath.Clear()
+                If statusCacheByNormalizedPath Is Nothing Then
+                    statusCacheByNormalizedPath = New Dictionary(Of String, SVNStatus.filePpty)(StringComparer.OrdinalIgnoreCase)
+                End If
             Catch
             End Try
+        End Try
+    End Sub
+
+    Private Sub updateStatusCacheForKnownPaths(ByVal filePaths() As String,
+                                                Optional ByVal forceAddDelChg1 As String = Nothing,
+                                                Optional ByVal forceLock6 As String = Nothing,
+                                                Optional ByVal forceUpToDate9 As String = Nothing,
+                                                Optional ByVal forceReleased As String = Nothing)
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(filePaths)
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Exit Sub
+
+        Try
+            For Each filePathInput As String In filteredPaths
+                If String.IsNullOrWhiteSpace(filePathInput) Then Continue For
+
+                Dim filePath As String = filePathInput
+
+                Try
+                    filePath = Path.GetFullPath(filePathInput)
+                Catch
+                End Try
+
+                Dim normalizedPath As String = normalizeSvnPath(filePath)
+                If String.IsNullOrWhiteSpace(normalizedPath) Then Continue For
+
+                Dim entry As SVNStatus.filePpty
+
+                If statusCacheByNormalizedPath.ContainsKey(normalizedPath) Then
+                    entry = statusCacheByNormalizedPath(normalizedPath)
+                Else
+                    entry = New SVNStatus.filePpty()
+                    entry.filename = filePath
+                    entry.modDoc = Nothing
+                    entry.bReconnect = False
+                    entry.revertUpdate = getLatestType.none
+                    entry.addDelChg1 = " "
+                    entry.pptyMods2 = " "
+                    entry.workingDirLock3 = " "
+                    entry.addWithHist4 = " "
+                    entry.switchWParent5 = " "
+                    entry.lock6 = " "
+                    entry.lockOwner = ""
+                    entry.tree7 = " "
+                    entry.upToDate9 = "NoUpdate"
+                    entry.released = ""
+                    entry.iTemp = 0
+                End If
+
+                entry.filename = filePath
+
+                Try
+                    entry.modDoc = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+                Catch
+                    entry.modDoc = Nothing
+                End Try
+
+                If forceAddDelChg1 IsNot Nothing Then entry.addDelChg1 = forceAddDelChg1
+                If forceLock6 IsNot Nothing Then entry.lock6 = forceLock6
+                If forceUpToDate9 IsNot Nothing Then entry.upToDate9 = forceUpToDate9
+                If forceReleased IsNot Nothing Then entry.released = forceReleased
+
+                statusCacheByNormalizedPath(normalizedPath) = entry
+            Next
+
+            markStatusCacheWritten(False)
+        Catch
         End Try
     End Sub
 
@@ -2252,6 +2450,22 @@ Public Module svnModule
                 iSwApp.SendMsgToUser2("Failed to Commit " & componentAndDrawingModDoc(1).GetTitle, swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
             End If
         End If
+
+        Try
+            Dim releaseCachePaths As New List(Of String)()
+
+            If componentAndDrawingModDoc(0) IsNot Nothing Then releaseCachePaths.Add(componentAndDrawingModDoc(0).GetPathName())
+            If componentAndDrawingModDoc(1) IsNot Nothing Then releaseCachePaths.Add(componentAndDrawingModDoc(1).GetPathName())
+
+            If releaseCachePaths.Count > 0 Then
+                If bSuccess1 OrElse bSuccess2 Then
+                    updateStatusCacheForKnownPaths(releaseCachePaths.ToArray(), forceAddDelChg1:=" ", forceLock6:=" ", forceUpToDate9:=" ", forceReleased:="||RELEASED||")
+                Else
+                    updateStatusCacheForKnownPaths(releaseCachePaths.ToArray(), forceReleased:="||EDIT||")
+                End If
+            End If
+        Catch
+        End Try
 
         refreshActiveTreeAfterSvnAction()
 
@@ -4487,6 +4701,14 @@ Public Module svnModule
         End If
 
         Try
+            updateStatusCacheForKnownPaths(lockedPaths, forceLock6:=" ")
+            If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
+                updateStatusCacheForKnownPaths(modifiedPaths, forceAddDelChg1:=" ")
+            End If
+        Catch
+        End Try
+
+        Try
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
             updateLockStatusPublic(bRefreshAllTreeViews:=False)
             refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
@@ -4647,6 +4869,14 @@ Public Module svnModule
             Catch
             End Try
         End If
+
+        Try
+            updateStatusCacheForKnownPaths(lockedPaths, forceLock6:=" ")
+            If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
+                updateStatusCacheForKnownPaths(modifiedPaths, forceAddDelChg1:=" ")
+            End If
+        Catch
+        End Try
 
         Try
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
@@ -5058,6 +5288,7 @@ Public Module svnModule
         If Not validateCadPathNamesBeforeCommit(sModDocPathArr) Then Exit Sub
         If Not validateNoDuplicateCadFileNamesForPaths(sModDocPathArr) Then Exit Sub
         If Not commitPathsAllowedOnlyIfUpToDate(sModDocPathArr) Then Exit Sub
+        If Not commitAssemblyChildrenAllowedOnlyIfCachedUpToDate(sModDocPathArr) Then Exit Sub
 
         makeFirstCommitCandidatePathsWritable(sModDocPathArr)
 
@@ -5171,6 +5402,98 @@ Public Module svnModule
 
         filePaths = filterCommitPathsInsideRepoOnly(filePaths)
         Return filePaths IsNot Nothing AndAlso filePaths.Length > 0
+    End Function
+
+    Private Function commitAssemblyChildrenAllowedOnlyIfCachedUpToDate(ByVal commitPaths() As String) As Boolean
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        Dim hasAssembly As Boolean = False
+
+        Try
+            For Each commitPath As String In commitPaths
+                If String.IsNullOrWhiteSpace(commitPath) Then Continue For
+                If String.Equals(Path.GetExtension(commitPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then
+                    hasAssembly = True
+                    Exit For
+                End If
+            Next
+        Catch
+            hasAssembly = False
+        End Try
+
+        If Not hasAssembly Then Return True
+
+        'No extra SVN/server request here:
+        'Use the already-loaded tree plus the last Sync cache. If the cache is missing,
+        'block and ask for Sync because we cannot prove the children are current.
+        Dim guardPaths() As String = Nothing
+
+        Try
+            If myUserControl IsNot Nothing Then
+                guardPaths = myUserControl.getAssemblyCommitGuardPathsForPathsPublic(commitPaths)
+            End If
+        Catch
+            guardPaths = Nothing
+        End Try
+
+        If guardPaths Is Nothing OrElse guardPaths.Length = 0 Then
+            guardPaths = commitPaths
+        End If
+
+        Dim outOfDatePaths As New List(Of String)()
+        Dim missingCachePaths As New List(Of String)()
+
+        For Each guardPath As String In guardPaths
+            If String.IsNullOrWhiteSpace(guardPath) Then Continue For
+            If Not File.Exists(guardPath) Then Continue For
+            If Not isCadFilePath(guardPath) Then Continue For
+
+            Dim cached As SVNStatus.filePpty = Nothing
+            Dim found As Boolean = False
+
+            Try
+                found = tryFindCachedStatusProperty(guardPath, cached)
+            Catch
+                found = False
+            End Try
+
+            If Not found OrElse cached.upToDate9 Is Nothing OrElse String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then
+                missingCachePaths.Add(guardPath)
+                Continue For
+            End If
+
+            If cached.upToDate9 = "*" Then
+                outOfDatePaths.Add(guardPath)
+            End If
+        Next
+
+        If outOfDatePaths.Count > 0 Then
+            iSwApp.SendMsgToUser2(
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "This assembly has one or more loaded children marked out of date by the last Sync cache." & vbCrLf & vbCrLf &
+                "Out-of-date child/related files:" & vbCrLf &
+                stringArrToSingleStringWithNewLines(outOfDatePaths.ToArray(), bTrimFileNames:=True, iLimit:=10) & vbCrLf &
+                "Use Get Latest, verify the assembly, then commit again.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return False
+        End If
+
+        If missingCachePaths.Count > 0 Then
+            iSwApp.SendMsgToUser2(
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "This assembly commit needs a recent Sync cache for the assembly branch before it can verify child freshness." & vbCrLf & vbCrLf &
+                "Run Sync on the assembly branch, then commit again." & vbCrLf & vbCrLf &
+                "Files without usable cached server status:" & vbCrLf &
+                stringArrToSingleStringWithNewLines(missingCachePaths.ToArray(), bTrimFileNames:=True, iLimit:=10),
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return False
+        End If
+
+        Return True
     End Function
 
     Private Function commitPathsAllowedOnlyIfUpToDate(ByVal commitPaths() As String) As Boolean
@@ -5446,6 +5769,12 @@ Public Module svnModule
 
         Try
             myUserControl.markCommitResultForFilePathsPublic(commitPaths, True)
+        Catch
+        End Try
+
+        Try
+            updateStatusCacheForKnownPaths(commitPaths, forceAddDelChg1:=" ", forceLock6:=" ", forceUpToDate9:=" ")
+            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
         Catch
         End Try
 
@@ -6207,6 +6536,7 @@ Public Module svnModule
             If result IsNot Nothing AndAlso result.LockedPaths IsNot Nothing AndAlso result.LockedPaths.Length > 0 Then
                 myUserControl.forceWriteAccessForLockedFilePathsPublic(result.LockedPaths)
                 myUserControl.markLockResultForFilePathsPublic(result.LockedPaths, True, "Locked by you")
+                updateStatusCacheForKnownPaths(result.LockedPaths, forceLock6:="K", forceReleased:="||EDIT||")
             End If
         Catch
         End Try
@@ -6367,7 +6697,7 @@ Public Module svnModule
         Dim bSuccess As Boolean = False
         Dim sCatMessage As String = ""
         Dim sFilter As String
-        Dim bEachSuccess() As Boolean
+        Dim bEachSuccess() As Boolean = Nothing
 
         'Speed fix:
         'Normal Get Locks only checks/locks the files passed in.
@@ -6465,6 +6795,15 @@ Public Module svnModule
 
             svnPropset(boolFilter(sDocPathsToCheckout, bEachSuccess), "addin:release_state", "||EDIT||")
         End If
+
+        Try
+            If bUseTortoise Then
+                updateStatusCacheForKnownPaths(sDocPathsToCheckout, forceLock6:="K", forceReleased:="||EDIT||")
+            ElseIf bEachSuccess IsNot Nothing Then
+                updateStatusCacheForKnownPaths(boolFilter(sDocPathsToCheckout, bEachSuccess), forceLock6:="K", forceReleased:="||EDIT||")
+            End If
+        Catch
+        End Try
 
         'Speed fix:
         'Do not rebuild every open tree after a lock. Rebuild only the active tree.
@@ -7010,6 +7349,8 @@ Public Module svnModule
         If status.fp Is Nothing Then Exit Sub
 
         Dim sFileList(UBound(status.fp)) As String
+        Dim selectedPathsRevertedForCache() As String = Nothing
+        Dim selectedPathsUpdatedForCache() As String = Nothing
 
         If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
 
@@ -7066,6 +7407,7 @@ Public Module svnModule
             If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for selected revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
 
             sFileList = status.sFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
+            selectedPathsRevertedForCache = sFileList
 
             If (Not sFileList Is Nothing) AndAlso ((myGetType = getLatestType.revert) OrElse (myGetType = getLatestType.both)) Then
                 If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
@@ -7081,6 +7423,7 @@ Public Module svnModule
             If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for selected update: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
 
             sFileList = status.sFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
+            selectedPathsUpdatedForCache = sFileList
 
             If (Not sFileList Is Nothing) AndAlso ((myGetType = getLatestType.update) OrElse (myGetType = getLatestType.both)) Then
                 If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
@@ -7093,6 +7436,17 @@ Public Module svnModule
             status.reattachDocsToFileSystem(indexOfFilestoRevert, iSwApp)
             status.reattachDocsToFileSystem(indexOfFilestoUpdate, iSwApp)
             If debugWatch IsNot Nothing Then debugNotes.Add("Reattach selected docs to filesystem: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            Try
+                If selectedPathsRevertedForCache IsNot Nothing Then
+                    updateStatusCacheForKnownPaths(selectedPathsRevertedForCache, forceAddDelChg1:=" ")
+                End If
+
+                If selectedPathsUpdatedForCache IsNot Nothing Then
+                    updateStatusCacheForKnownPaths(selectedPathsUpdatedForCache, forceAddDelChg1:=" ", forceUpToDate9:=" ")
+                End If
+            Catch
+            End Try
 
             Try
                 If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
@@ -7172,6 +7526,8 @@ Public Module svnModule
         If status.fp Is Nothing Then Exit Sub
 
         Dim sFileList(UBound(status.fp)) As String
+        Dim pathsRevertedForCache() As String = Nothing
+        Dim pathsUpdatedForCache() As String = Nothing
 
         If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
 
@@ -7235,6 +7591,7 @@ Public Module svnModule
             If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for revert: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
 
             sFileList = status.sFilterGetLatestType(getLatestType.revert, bIgnoreUpdate:=False)
+            pathsRevertedForCache = sFileList
 
             If (Not sFileList Is Nothing) And ((myGetType = getLatestType.revert) Or (myGetType = getLatestType.both)) Then
                 If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
@@ -7250,6 +7607,7 @@ Public Module svnModule
             If debugWatch IsNot Nothing Then debugNotes.Add("Release SolidWorks file handles for update: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
 
             sFileList = status.sFilterGetLatestType(getLatestType.update, bIgnoreUpdate:=False)
+            pathsUpdatedForCache = sFileList
 
             If (Not sFileList Is Nothing) And ((myGetType = getLatestType.update) Or (myGetType = getLatestType.both)) Then
                 If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
@@ -7262,6 +7620,17 @@ Public Module svnModule
             status.reattachDocsToFileSystem(indexOfFilestoRevert, iSwApp)
             status.reattachDocsToFileSystem(indexOfFilestoUpdate, iSwApp)
             If debugWatch IsNot Nothing Then debugNotes.Add("Reattach docs to filesystem: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+
+            Try
+                If pathsRevertedForCache IsNot Nothing Then
+                    updateStatusCacheForKnownPaths(pathsRevertedForCache, forceAddDelChg1:=" ")
+                End If
+
+                If pathsUpdatedForCache IsNot Nothing Then
+                    updateStatusCacheForKnownPaths(pathsUpdatedForCache, forceAddDelChg1:=" ", forceUpToDate9:=" ")
+                End If
+            Catch
+            End Try
 
             Try
                 If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
