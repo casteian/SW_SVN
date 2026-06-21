@@ -1615,10 +1615,20 @@ Public Class UserControl1
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
 
-        'Fast normal Get Locks:
-        'Tree selection wins. If a child part is selected in the add-in tree, lock that file only.
-        'Do not let SOLIDWORKS edit-context make us accidentally target the parent assembly.
-        Dim selectedTreePaths() As String = getSelectedTreeCadPathsForFileAction()
+        'Fast Get Locks behavior:
+        'Normal click = exact single tree file.
+        'Shift-click = every file currently batch-selected in the SVN tree.
+        'Both paths go directly to the asynchronous path-first lock workflow, so this does not
+        'resolve the assembly or invoke the slower "With Dependents" code.
+        Dim selectedTreePaths() As String = Nothing
+        Dim useBatchSelection As Boolean = (ModifierKeys And Keys.Shift) = Keys.Shift
+
+        If useBatchSelection Then
+            selectedTreePaths = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
+        Else
+            selectedTreePaths = getSelectedTreeCadPathsForFileAction()
+        End If
+
         If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
             getLocksOfPathsAsync(selectedTreePaths)
         Else
@@ -1666,10 +1676,19 @@ Public Class UserControl1
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
 
-        'Fast normal Commit:
-        'Tree selection wins. This lets a user commit a locked child part without needing
-        'the parent assembly checked out, unless the parent itself was actually changed.
-        Dim selectedTreePaths() As String = getSelectedTreeCadPathsForFileAction()
+        'Fast Commit behavior:
+        'Normal click = exact single tree file.
+        'Shift-click = every file currently batch-selected in the SVN tree.
+        'Both paths use the asynchronous path-first commit workflow and do not expand dependents.
+        Dim selectedTreePaths() As String = Nothing
+        Dim useBatchSelection As Boolean = (ModifierKeys And Keys.Shift) = Keys.Shift
+
+        If useBatchSelection Then
+            selectedTreePaths = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
+        Else
+            selectedTreePaths = getSelectedTreeCadPathsForFileAction()
+        End If
+
         If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
             tortCommitPathsAsync(selectedTreePaths)
         Else
