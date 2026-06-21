@@ -1615,19 +1615,12 @@ Public Class UserControl1
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
 
-        'Fast Get Locks behavior:
-        'Normal click = exact single tree file.
-        'Shift-click = every file currently batch-selected in the SVN tree.
-        'Both paths go directly to the asynchronous path-first lock workflow, so this does not
-        'resolve the assembly or invoke the slower "With Dependents" code.
-        Dim selectedTreePaths() As String = Nothing
-        Dim useBatchSelection As Boolean = (ModifierKeys And Keys.Shift) = Keys.Shift
-
-        If useBatchSelection Then
-            selectedTreePaths = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
-        Else
-            selectedTreePaths = getSelectedTreeCadPathsForFileAction()
-        End If
+        'Fast path-first Get Locks behavior:
+        'Ctrl-click and Shift-click build the blue batch selection in the SVN tree.
+        'When Get Locks is clicked afterward, always use that stored batch selection.
+        'The user does NOT need to keep Ctrl or Shift held while clicking Get Locks.
+        'If there is no batch selection, this helper falls back to the exact single tree node.
+        Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
 
         If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
             getLocksOfPathsAsync(selectedTreePaths)
@@ -1676,18 +1669,12 @@ Public Class UserControl1
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
 
-        'Fast Commit behavior:
-        'Normal click = exact single tree file.
-        'Shift-click = every file currently batch-selected in the SVN tree.
-        'Both paths use the asynchronous path-first commit workflow and do not expand dependents.
-        Dim selectedTreePaths() As String = Nothing
-        Dim useBatchSelection As Boolean = (ModifierKeys And Keys.Shift) = Keys.Shift
-
-        If useBatchSelection Then
-            selectedTreePaths = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
-        Else
-            selectedTreePaths = getSelectedTreeCadPathsForFileAction()
-        End If
+        'Fast path-first Commit behavior:
+        'Ctrl-click and Shift-click build the blue batch selection in the SVN tree.
+        'When Commit is clicked afterward, always use that stored batch selection.
+        'The user does NOT need to keep Ctrl or Shift held while clicking Commit.
+        'If there is no batch selection, this helper falls back to the exact single tree node.
+        Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
 
         If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
             tortCommitPathsAsync(selectedTreePaths)
