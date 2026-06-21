@@ -5511,19 +5511,14 @@ Public Module svnModule
         If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
 
         Dim hasAssembly As Boolean = False
-        Dim directCommitPathSet As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         Try
             For Each commitPath As String In commitPaths
                 If String.IsNullOrWhiteSpace(commitPath) Then Continue For
 
-                Dim normalizedCommitPath As String = normalizeSvnPath(commitPath)
-                If Not String.IsNullOrWhiteSpace(normalizedCommitPath) Then
-                    directCommitPathSet.Add(normalizedCommitPath)
-                End If
-
                 If String.Equals(Path.GetExtension(commitPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then
                     hasAssembly = True
+                    Exit For
                 End If
             Next
         Catch
@@ -5532,9 +5527,21 @@ Public Module svnModule
 
         If Not hasAssembly Then Return True
 
-        'No SVN/server request here.
-        'Use the already-loaded tree plus the last server-aware Sync cache.  This preserves the
-        'assembly child freshness protection without freezing large assemblies during Commit.
+        'Fast cache-only assembly safety check.
+        '
+        'Important behavior:
+        '  1. Never contact the SVN server from Commit.
+        '  2. Check only paths already present in the lazily loaded tree.
+        '  3. Block any loaded child that the most recent Sync cache positively marks as out of date.
+        '  4. Do NOT block merely because a child has no cache entry.
+        '
+        'The previous implementation required usable server-aware cache data for every loaded child.
+        'That created false commit blocks after adding/relinking a new vendor part because:
+        '  - the new vendor file has no server revision yet, and
+        '  - other lazily loaded children may not have been included in the last bounded branch Sync.
+        '
+        'SVN itself still prevents an out-of-date direct commit target from being committed, while this
+        'guard preserves the useful early warning for any child that Sync has already proven is stale.
         Dim guardPaths() As String = Nothing
 
         Try
@@ -5550,7 +5557,6 @@ Public Module svnModule
         End If
 
         Dim outOfDatePaths As New List(Of String)()
-        Dim missingCachePaths As New List(Of String)()
         Dim checkedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         For Each guardPath As String In guardPaths
@@ -5558,8 +5564,8 @@ Public Module svnModule
             If Not File.Exists(guardPath) Then Continue For
             If Not isCadFilePath(guardPath) Then Continue For
 
-            'Old external paths can remain visible in a tree briefly after a vendor relink.
-            'They cannot have SVN cache data and must not block the commit after the relink was verified.
+            'Old external paths can remain visible in the tree briefly after a vendor relink.
+            'They are outside the working copy and are irrelevant to SVN freshness checking.
             If Not isPathInsideLocalRepo(guardPath) Then Continue For
 
             Dim normalizedGuardPath As String = normalizeSvnPath(guardPath)
@@ -5568,7 +5574,7 @@ Public Module svnModule
             checkedPaths.Add(normalizedGuardPath)
 
             'Newly copied vendor/external files are intentionally part of this first commit.
-            'They have no server revision and therefore no server-aware cache yet.
+            'They have no server revision and therefore cannot have server-aware cache data yet.
             Dim isPendingExternalFirstCommit As Boolean = False
 
             Try
@@ -5595,31 +5601,18 @@ Public Module svnModule
                 found = False
             End Try
 
-            If found Then
-                'A/? files are first-commit candidates.  They cannot be server-checked yet.
-                If cached.addDelChg1 = "?" OrElse cached.addDelChg1 = "A" Then Continue For
+            'No cache entry is not proof that the file is stale.  Ignore it and preserve lazy Sync.
+            If Not found Then Continue For
 
-                If cached.upToDate9 IsNot Nothing AndAlso
-                   Not String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then
+            'A/? files are first-commit candidates and cannot be stale against a server revision.
+            If cached.addDelChg1 = "?" OrElse cached.addDelChg1 = "A" Then Continue For
 
-                    If cached.upToDate9 = "*" Then
-                        outOfDatePaths.Add(guardPath)
-                    End If
-
-                    Continue For
-                End If
+            'Only a positive remote "*" marker from a server-aware Sync blocks the assembly commit.
+            If cached.upToDate9 IsNot Nothing AndAlso
+               Not String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) AndAlso
+               cached.upToDate9 = "*" Then
+                outOfDatePaths.Add(guardPath)
             End If
-
-            'Only direct commit targets are eligible for a one-time local first-commit test.
-            'This local svn status call is never run across every assembly child.
-            If directCommitPathSet.Contains(normalizedGuardPath) Then
-                Try
-                    If isFirstCommitCandidatePath(guardPath) Then Continue For
-                Catch
-                End Try
-            End If
-
-            missingCachePaths.Add(guardPath)
         Next
 
         If outOfDatePaths.Count > 0 Then
@@ -5630,19 +5623,6 @@ Public Module svnModule
                 stringArrToSingleStringWithNewLines(outOfDatePaths.ToArray(), bTrimFileNames:=True, iLimit:=10) & vbCrLf &
                 "Use Get Latest, verify the assembly, then commit again.",
                 swMessageBoxIcon_e.swMbStop,
-                swMessageBoxBtn_e.swMbOk
-            )
-            Return False
-        End If
-
-        If missingCachePaths.Count > 0 Then
-            iSwApp.SendMsgToUser2(
-                "Commit blocked." & vbCrLf & vbCrLf &
-                "This assembly commit needs a recent Sync cache for the assembly branch before it can verify child freshness." & vbCrLf & vbCrLf &
-                "Run Sync on the assembly branch, then commit again." & vbCrLf & vbCrLf &
-                "Files without usable cached server status:" & vbCrLf &
-                stringArrToSingleStringWithNewLines(missingCachePaths.ToArray(), bTrimFileNames:=True, iLimit:=10),
-                swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
             Return False
