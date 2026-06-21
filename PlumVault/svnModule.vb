@@ -3172,6 +3172,99 @@ Public Module svnModule
         Return externalRefs
     End Function
 
+    Private Function getExternalCadReferencesForCommitPathsFast(ByVal commitPaths() As String) As List(Of ExternalReferenceInfo)
+        Dim externalRefs As New List(Of ExternalReferenceInfo)()
+        Dim seenPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return externalRefs
+
+        'Fast normal-Commit scan:
+        'AssemblyDoc.GetComponents(False) gives component paths without recursively building a
+        'ModelDoc2 list or resolving every lightweight component.  The previous implementation
+        'called getComponentsOfAssemblyOptionalUpdateTree across the full assembly before every
+        'commit, which was very expensive on full-car assemblies.
+        For Each commitPath As String In commitPaths
+            If String.IsNullOrWhiteSpace(commitPath) Then Continue For
+            If Not String.Equals(Path.GetExtension(commitPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+            Dim assemblyModel As ModelDoc2 = getOpenModelByPathSafe(commitPath)
+            If assemblyModel Is Nothing Then Continue For
+
+            Try
+                If assemblyModel.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            Dim assemblyDoc As AssemblyDoc = Nothing
+            Dim componentsObject As Object = Nothing
+
+            Try
+                assemblyDoc = CType(assemblyModel, AssemblyDoc)
+                componentsObject = assemblyDoc.GetComponents(False)
+            Catch
+                assemblyDoc = Nothing
+                componentsObject = Nothing
+            End Try
+
+            If componentsObject Is Nothing Then Continue For
+
+            Dim components() As Object = Nothing
+
+            Try
+                components = CType(componentsObject, Object())
+            Catch
+                components = Nothing
+            End Try
+
+            If components Is Nothing Then Continue For
+
+            For Each componentObject As Object In components
+                Dim component As Component2 = TryCast(componentObject, Component2)
+                If component Is Nothing Then Continue For
+
+                Dim componentPath As String = ""
+
+                Try
+                    componentPath = component.GetPathName()
+                Catch
+                    componentPath = ""
+                End Try
+
+                If String.IsNullOrWhiteSpace(componentPath) Then Continue For
+
+                Dim normalizedPath As String = componentPath
+
+                Try
+                    normalizedPath = Path.GetFullPath(componentPath)
+                Catch
+                End Try
+
+                If seenPaths.Contains(normalizedPath) Then Continue For
+
+                If isSolidWorksTempOrVirtualPath(normalizedPath) Then
+                    seenPaths.Add(normalizedPath)
+                    externalRefs.Add(New ExternalReferenceInfo With {
+                        .oldPath = normalizedPath,
+                        .fileName = Path.GetFileName(normalizedPath)
+                    })
+                    Continue For
+                End If
+
+                If Not isCadFilePath(normalizedPath) Then Continue For
+                If isPathInsideLocalRepo(normalizedPath) Then Continue For
+
+                seenPaths.Add(normalizedPath)
+                externalRefs.Add(New ExternalReferenceInfo With {
+                    .oldPath = normalizedPath,
+                    .fileName = Path.GetFileName(normalizedPath)
+                })
+            Next
+        Next
+
+        Return externalRefs
+    End Function
+
     Private Function pickVaultDestinationFolder() As String
         Using fbd As New FolderBrowserDialog()
             fbd.Description = "Choose a folder inside the SVN working copy for the external CAD files."
@@ -3590,16 +3683,20 @@ Public Module svnModule
     Private Function prepareExternalReferencesForCommitPaths(ByRef commitPaths() As String) As Boolean
         If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return True
 
-        Dim docsForExternalRefCheck() As ModelDoc2 = getOpenAssemblyDependencyDocsForCommitPaths(commitPaths)
-        If docsForExternalRefCheck Is Nothing OrElse docsForExternalRefCheck.Length = 0 Then Return True
+        Dim targetAssemblyDocs() As ModelDoc2 = getOpenAssemblyDocsForCommitPaths(commitPaths)
+        If targetAssemblyDocs Is Nothing OrElse targetAssemblyDocs.Length = 0 Then Return True
+
+        'Fast path-only component scan.  This avoids recursively creating ModelDoc2 objects for
+        'every component in a large assembly just to discover whether an external/vendor path exists.
+        Dim externalRefs As List(Of ExternalReferenceInfo) = getExternalCadReferencesForCommitPathsFast(commitPaths)
+        If externalRefs Is Nothing OrElse externalRefs.Count = 0 Then Return True
 
         'Only assembly commits can change references. If external/vendor CAD must be copied/relinked,
         'the assembly itself has to be writable/locked, except for a brand-new first commit assembly.
-        'Reference changes must be protected by the assembly being committed, not necessarily the active/top-level assembly.
-        'This allows a locked subassembly (for example FINAL Swirl Pot Assembly) to process vendor/external children
-        'without requiring the top-level car assembly to be checked out.
-        If Not targetAssembliesMustBeLockedForReferenceChanges(getOpenAssemblyDocsForCommitPaths(commitPaths)) Then Return False
-        If Not prepareExternalReferencesForSvnAction(docsForExternalRefCheck) Then Return False
+        If Not targetAssembliesMustBeLockedForReferenceChanges(targetAssemblyDocs) Then Return False
+
+        Dim noDependencyDocs() As ModelDoc2 = Nothing
+        If Not prepareExternalReferencesForSvnActionInternal(noDependencyDocs, externalRefs) Then Return False
 
         Dim merged As New List(Of String)()
 
@@ -4275,14 +4372,26 @@ Public Module svnModule
     End Function
 
     Public Function prepareExternalReferencesForSvnAction(ByRef modDocArr() As ModelDoc2) As Boolean
-        If modDocArr Is Nothing Then Return True
-        If modDocArr.Length = 0 Then Return True
+        Return prepareExternalReferencesForSvnActionInternal(modDocArr, Nothing)
+    End Function
+
+    Private Function prepareExternalReferencesForSvnActionInternal(ByRef modDocArr() As ModelDoc2,
+                                                                    ByVal precomputedExternalRefs As List(Of ExternalReferenceInfo)) As Boolean
+        If precomputedExternalRefs Is Nothing Then
+            If modDocArr Is Nothing Then Return True
+            If modDocArr.Length = 0 Then Return True
+        End If
+
         pendingExternalRefCommitPaths.Clear()
         pendingExternalRefSkipNameCheckPaths.Clear()
 
-        Dim externalRefs As List(Of ExternalReferenceInfo) = getExternalCadReferences(modDocArr)
+        Dim externalRefs As List(Of ExternalReferenceInfo) = precomputedExternalRefs
 
-        If externalRefs.Count = 0 Then Return True
+        If externalRefs Is Nothing Then
+            externalRefs = getExternalCadReferences(modDocArr)
+        End If
+
+        If externalRefs Is Nothing OrElse externalRefs.Count = 0 Then Return True
 
         Dim virtualOrTempRefs As New List(Of ExternalReferenceInfo)
 
@@ -4524,60 +4633,54 @@ Public Module svnModule
         If modDocArr Is Nothing Then Return False
         If modDocArr.Length = 0 Then Return False
 
-        Dim modDocArrToCheckForLatest As ModelDoc2() = modDocArr
+        'Fast commit safety:
+        'Do not walk/resolve the assembly again and do not contact the SVN server here.
+        'Normal Commit and Commit With Dependents already provide the exact document paths that
+        'are being committed.  Use the existing Sync cache for those paths and, when an assembly
+        'is present, use the existing loaded-tree/cache guard for referenced geometry.
+        Dim commitPaths() As String = Nothing
 
-        If bIncludeDependents Then
-            Try
-                For Each docToCheck As ModelDoc2 In modDocArr
-                    If docToCheck Is Nothing Then Continue For
+        Try
+            commitPaths = getFilePathsFromModDocArr(modDocArr)
+        Catch
+            commitPaths = Nothing
+        End Try
 
-                    If docToCheck.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                        modDocArrToCheckForLatest = myUserControl.getComponentsOfAssemblyOptionalUpdateTree(
-                        modDocArr,
-                        bResolveLightweight:=True
-                    )
-                        Exit For
-                    End If
-                Next
-            Catch
-                modDocArrToCheckForLatest = modDocArr
-            End Try
-        End If
+        commitPaths = filterCommitPathsInsideRepoOnly(commitPaths)
 
-        If modDocArrToCheckForLatest Is Nothing Then modDocArrToCheckForLatest = modDocArr
-
-        Dim statusForCommitCheck As SVNStatus = getFileSVNStatus(
-        bCheckServer:=True,
-        modDocArr:=modDocArrToCheckForLatest
-    )
-
-        If statusForCommitCheck Is Nothing Then
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then
             iSwApp.SendMsgToUser2(
-            "Commit blocked. Could not verify latest SVN status.",
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "No valid SVN working-copy CAD paths were available for the freshness check.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
             Return False
         End If
 
-        Dim outOfDateFiles As String() = statusForCommitCheck.sFilterUpToDate9("*")
+        'This is cache-only.  It blocks files already known to be stale, but it never launches
+        'a fresh svn status -u process during Commit.
+        If Not commitPathsAllowedOnlyIfUpToDate(commitPaths) Then Return False
 
-        If outOfDateFiles IsNot Nothing Then
-            Dim msg As String =
-            "Commit blocked." & vbCrLf & vbCrLf &
-            "One or more files related to this commit are out of date." & vbCrLf & vbCrLf &
-            "To commit assemblies safely, all referenced geometry must be up to date." & vbCrLf & vbCrLf &
-            "Out-of-date files:" & vbCrLf &
-            stringArrToSingleStringWithNewLines(outOfDateFiles, bTrimFileNames:=True, iLimit:=10) & vbCrLf &
-            "Use Get Latest, confirm the assembly geometry, then commit again."
+        Dim hasAssembly As Boolean = False
 
-            iSwApp.SendMsgToUser2(
-            msg,
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
+        Try
+            For Each commitPath As String In commitPaths
+                If String.IsNullOrWhiteSpace(commitPath) Then Continue For
 
-            Return False
+                If String.Equals(Path.GetExtension(commitPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then
+                    hasAssembly = True
+                    Exit For
+                End If
+            Next
+        Catch
+            hasAssembly = False
+        End Try
+
+        If hasAssembly Then
+            'For assemblies, keep the stronger protection: every loaded child/related CAD path
+            'must have usable server-aware Sync cache data and none may be marked out of date.
+            Return commitAssemblyChildrenAllowedOnlyIfCachedUpToDate(commitPaths)
         End If
 
         Return True
@@ -5408,13 +5511,19 @@ Public Module svnModule
         If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
 
         Dim hasAssembly As Boolean = False
+        Dim directCommitPathSet As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         Try
             For Each commitPath As String In commitPaths
                 If String.IsNullOrWhiteSpace(commitPath) Then Continue For
+
+                Dim normalizedCommitPath As String = normalizeSvnPath(commitPath)
+                If Not String.IsNullOrWhiteSpace(normalizedCommitPath) Then
+                    directCommitPathSet.Add(normalizedCommitPath)
+                End If
+
                 If String.Equals(Path.GetExtension(commitPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then
                     hasAssembly = True
-                    Exit For
                 End If
             Next
         Catch
@@ -5423,9 +5532,9 @@ Public Module svnModule
 
         If Not hasAssembly Then Return True
 
-        'No extra SVN/server request here:
-        'Use the already-loaded tree plus the last Sync cache. If the cache is missing,
-        'block and ask for Sync because we cannot prove the children are current.
+        'No SVN/server request here.
+        'Use the already-loaded tree plus the last server-aware Sync cache.  This preserves the
+        'assembly child freshness protection without freezing large assemblies during Commit.
         Dim guardPaths() As String = Nothing
 
         Try
@@ -5442,11 +5551,40 @@ Public Module svnModule
 
         Dim outOfDatePaths As New List(Of String)()
         Dim missingCachePaths As New List(Of String)()
+        Dim checkedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         For Each guardPath As String In guardPaths
             If String.IsNullOrWhiteSpace(guardPath) Then Continue For
             If Not File.Exists(guardPath) Then Continue For
             If Not isCadFilePath(guardPath) Then Continue For
+
+            'Old external paths can remain visible in a tree briefly after a vendor relink.
+            'They cannot have SVN cache data and must not block the commit after the relink was verified.
+            If Not isPathInsideLocalRepo(guardPath) Then Continue For
+
+            Dim normalizedGuardPath As String = normalizeSvnPath(guardPath)
+            If String.IsNullOrWhiteSpace(normalizedGuardPath) Then Continue For
+            If checkedPaths.Contains(normalizedGuardPath) Then Continue For
+            checkedPaths.Add(normalizedGuardPath)
+
+            'Newly copied vendor/external files are intentionally part of this first commit.
+            'They have no server revision and therefore no server-aware cache yet.
+            Dim isPendingExternalFirstCommit As Boolean = False
+
+            Try
+                If pendingExternalRefCommitPaths IsNot Nothing Then
+                    For Each pendingPath As String In pendingExternalRefCommitPaths
+                        If pathsAreSame(pendingPath, guardPath) Then
+                            isPendingExternalFirstCommit = True
+                            Exit For
+                        End If
+                    Next
+                End If
+            Catch
+                isPendingExternalFirstCommit = False
+            End Try
+
+            If isPendingExternalFirstCommit Then Continue For
 
             Dim cached As SVNStatus.filePpty = Nothing
             Dim found As Boolean = False
@@ -5457,14 +5595,31 @@ Public Module svnModule
                 found = False
             End Try
 
-            If Not found OrElse cached.upToDate9 Is Nothing OrElse String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then
-                missingCachePaths.Add(guardPath)
-                Continue For
+            If found Then
+                'A/? files are first-commit candidates.  They cannot be server-checked yet.
+                If cached.addDelChg1 = "?" OrElse cached.addDelChg1 = "A" Then Continue For
+
+                If cached.upToDate9 IsNot Nothing AndAlso
+                   Not String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then
+
+                    If cached.upToDate9 = "*" Then
+                        outOfDatePaths.Add(guardPath)
+                    End If
+
+                    Continue For
+                End If
             End If
 
-            If cached.upToDate9 = "*" Then
-                outOfDatePaths.Add(guardPath)
+            'Only direct commit targets are eligible for a one-time local first-commit test.
+            'This local svn status call is never run across every assembly child.
+            If directCommitPathSet.Contains(normalizedGuardPath) Then
+                Try
+                    If isFirstCommitCandidatePath(guardPath) Then Continue For
+                Catch
+                End Try
             End If
+
+            missingCachePaths.Add(guardPath)
         Next
 
         If outOfDatePaths.Count > 0 Then
@@ -5499,51 +5654,54 @@ Public Module svnModule
     Private Function commitPathsAllowedOnlyIfUpToDate(ByVal commitPaths() As String) As Boolean
         If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
 
-        'Brand-new CAD files saved inside the SVN working copy have no server revision yet.
-        'Do not ask the server whether those paths are up to date; they will be svn add + committed.
-        Dim pathsToCheck As New List(Of String)()
+        'Fast path: never contact the SVN server from Commit.
+        'If the last Sync cache already says a selected path is stale, block it immediately.
+        'If a non-assembly file has no cache entry, let SVN enforce its own base-revision check
+        'during the actual commit.  Assembly children are handled by the stricter cache guard below.
+        Dim outOfDatePaths As New List(Of String)()
+        Dim checkedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
-        For Each p As String In commitPaths
-            If String.IsNullOrWhiteSpace(p) Then Continue For
-            If Directory.Exists(p) Then Continue For
-            If isFirstCommitCandidatePath(p) Then Continue For
-            pathsToCheck.Add(p)
+        For Each commitPath As String In commitPaths
+            If String.IsNullOrWhiteSpace(commitPath) Then Continue For
+            If Directory.Exists(commitPath) Then Continue For
+            If Not File.Exists(commitPath) Then Continue For
+            If Not isCadFilePath(commitPath) Then Continue For
+            If Not isPathInsideLocalRepo(commitPath) Then Continue For
+
+            Dim normalizedPath As String = normalizeSvnPath(commitPath)
+            If String.IsNullOrWhiteSpace(normalizedPath) Then Continue For
+            If checkedPaths.Contains(normalizedPath) Then Continue For
+            checkedPaths.Add(normalizedPath)
+
+            Dim cached As SVNStatus.filePpty = Nothing
+            Dim found As Boolean = False
+
+            Try
+                found = tryFindCachedStatusProperty(commitPath, cached)
+            Catch
+                found = False
+            End Try
+
+            If Not found Then Continue For
+            If cached.addDelChg1 = "?" OrElse cached.addDelChg1 = "A" Then Continue For
+            If cached.upToDate9 Is Nothing Then Continue For
+            If String.Equals(cached.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+            If cached.upToDate9 = "*" Then
+                outOfDatePaths.Add(commitPath)
+            End If
         Next
 
-        If pathsToCheck.Count = 0 Then Return True
-
-        Dim statusForCommitCheck As SVNStatus = getFileSVNStatus(
-            bCheckServer:=True,
-            modDocArr:=Nothing,
-            bUpdateStatusOfAllOpenModels:=False,
-            sDirectFilePathArr:=pathsToCheck.ToArray()
-        )
-
-        If statusForCommitCheck Is Nothing Then
+        If outOfDatePaths.Count > 0 Then
             iSwApp.SendMsgToUser2(
-            "Commit blocked. Could not verify latest SVN status.",
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-            Return False
-        End If
-
-        Dim outOfDateFiles As String() = statusForCommitCheck.sFilterUpToDate9("*")
-
-        If outOfDateFiles IsNot Nothing Then
-            Dim msg As String =
-            "Commit blocked." & vbCrLf & vbCrLf &
-            "The selected file is out of date." & vbCrLf & vbCrLf &
-            "Use Get Latest, confirm the geometry, then commit again." & vbCrLf & vbCrLf &
-            "Out-of-date files:" & vbCrLf &
-            stringArrToSingleStringWithNewLines(outOfDateFiles, bTrimFileNames:=True, iLimit:=10)
-
-            iSwApp.SendMsgToUser2(
-            msg,
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "One or more selected files are marked out of date by the last Sync cache." & vbCrLf & vbCrLf &
+                "Use Get Latest, confirm the geometry, then commit again." & vbCrLf & vbCrLf &
+                "Out-of-date files:" & vbCrLf &
+                stringArrToSingleStringWithNewLines(outOfDatePaths.ToArray(), bTrimFileNames:=True, iLimit:=10),
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
             Return False
         End If
 
