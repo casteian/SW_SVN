@@ -416,14 +416,18 @@ Public Module svnModule
 
     Public Function updateLockStatusPublic(Optional bRefreshAllTreeViews As Boolean = True) As Boolean
         updateLockStatusPublic = statusOfAllOpenModels.updateStatusLocally(iSwApp)
-        rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+
+        'Local lock/status refreshes may preserve the last server-aware upToDate9 values,
+        'but they are not a new Sync and must not reset the displayed Sync age.
+        rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=False)
+
         If bRefreshAllTreeViews Then myUserControl.refreshAllTreeViewsVariable()
     End Function
     Public Function updateStatusOfAllModelsVariable(Optional bRefreshAllTreeViews As Boolean = False) As Boolean
         Dim bWhatToReturn As Boolean = False
 
         bWhatToReturn = statusOfAllOpenModels.updateFromSvnServer(bRefreshAllTreeViews)
-        rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+        rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=bWhatToReturn)
 
         If bRefreshAllTreeViews And bWhatToReturn Then
             myUserControl.refreshAllTreeViewsVariable()
@@ -1022,72 +1026,46 @@ Public Module svnModule
 
     Public Function getStatusCacheAgeDisplayTextPublic() As String
         Try
-            If statusCacheByNormalizedPath Is Nothing OrElse statusCacheByNormalizedPath.Count = 0 Then Return "none"
-            If statusCacheLastWriteUtc = DateTime.MinValue Then Return "unknown"
-
-            Dim age As TimeSpan = DateTime.UtcNow - statusCacheLastWriteUtc
-            If age.TotalSeconds < 0 Then age = TimeSpan.Zero
-
-            Dim ageText As String
-
-            If age.TotalSeconds < 60 Then
-                ageText = "now"
-            ElseIf age.TotalMinutes < 60 Then
-                ageText = CInt(Math.Floor(age.TotalMinutes)).ToString() & "m"
-            ElseIf age.TotalHours < 24 Then
-                ageText = CInt(Math.Floor(age.TotalHours)).ToString() & "h"
-            Else
-                ageText = CInt(Math.Floor(age.TotalDays)).ToString() & "d"
-            End If
-
-            If statusCacheLastServerAwareUtc = DateTime.MinValue Then
-                Return ageText & " local"
-            End If
+            'The UI indicator represents the age of the last real server Sync only.
+            'Get Locks, Commit, Unlock, Refresh and other local cache edits must not make it say "now".
+            If statusCacheLastServerAwareUtc = DateTime.MinValue Then Return "not synced"
 
             Dim serverAge As TimeSpan = DateTime.UtcNow - statusCacheLastServerAwareUtc
             If serverAge.TotalSeconds < 0 Then serverAge = TimeSpan.Zero
 
-            Dim serverText As String
             If serverAge.TotalSeconds < 60 Then
-                serverText = "sync now"
+                Return "sync now"
             ElseIf serverAge.TotalMinutes < 60 Then
-                serverText = "sync " & CInt(Math.Floor(serverAge.TotalMinutes)).ToString() & "m"
+                Return "sync " & CInt(Math.Floor(serverAge.TotalMinutes)).ToString() & "m"
             ElseIf serverAge.TotalHours < 24 Then
-                serverText = "sync " & CInt(Math.Floor(serverAge.TotalHours)).ToString() & "h"
+                Return "sync " & CInt(Math.Floor(serverAge.TotalHours)).ToString() & "h"
             Else
-                serverText = "sync " & CInt(Math.Floor(serverAge.TotalDays)).ToString() & "d"
+                Return "sync " & CInt(Math.Floor(serverAge.TotalDays)).ToString() & "d"
             End If
-
-            If Math.Abs((statusCacheLastWriteUtc - statusCacheLastServerAwareUtc).TotalSeconds) < 2 Then
-                Return serverText
-            End If
-
-            Return ageText & " / " & serverText
         Catch
             Return "unknown"
         End Try
     End Function
 
-    Private Sub markStatusCacheWritten(ByVal serverAwareWrite As Boolean)
+    Private Sub markStatusCacheWritten(ByVal markAsServerSync As Boolean)
         statusCacheLastWriteUtc = DateTime.UtcNow
 
-        If serverAwareWrite Then
+        If markAsServerSync Then
             statusCacheLastServerAwareUtc = statusCacheLastWriteUtc
         End If
 
         notifyStatusCacheChanged()
     End Sub
 
-    Private Sub rebuildStatusCacheFromStatus(ByVal statusToCache As SVNStatus)
+    Private Sub rebuildStatusCacheFromStatus(ByVal statusToCache As SVNStatus,
+                                              Optional ByVal markAsServerSync As Boolean = False)
         Try
             If statusToCache Is Nothing OrElse statusToCache.fp Is Nothing Then Exit Sub
 
-            Dim serverAwareWrite As Boolean = statusContainsServerAwareData(statusToCache)
-
-            'Server-aware Sync/status results replace the cache.
-            'Local-only refreshes merge into the existing cache so they do not destroy the
-            'last known up-to-date/out-of-date server column used by cached Get Latest.
-            If serverAwareWrite Then
+            'Only an explicit Sync replaces the bounded Sync cache and advances its age.
+            'Other actions may obtain server-aware information for their selected files, but they
+            'must merge those entries without erasing the last Sync result or changing its timestamp.
+            If markAsServerSync Then
                 statusCacheByNormalizedPath.Clear()
             End If
 
@@ -1100,9 +1078,12 @@ Public Module svnModule
 
                 Dim entryToStore As SVNStatus.filePpty = statusToCache.fp(i)
 
-                If Not serverAwareWrite AndAlso statusCacheByNormalizedPath.ContainsKey(normalizedPath) Then
+                If statusCacheByNormalizedPath.ContainsKey(normalizedPath) Then
                     Dim previousEntry As SVNStatus.filePpty = statusCacheByNormalizedPath(normalizedPath)
 
+                    'Local-only updates have NoUpdate in column 9. Preserve the last known server
+                    'state for that path. A targeted Get Locks server check may update its own path,
+                    'but it still does not become a new Sync or clear other cached branch entries.
                     If cacheEntryHasServerAwareData(previousEntry) AndAlso
                        (entryToStore.upToDate9 Is Nothing OrElse String.Equals(entryToStore.upToDate9, "NoUpdate", StringComparison.OrdinalIgnoreCase)) Then
                         entryToStore.upToDate9 = previousEntry.upToDate9
@@ -1112,7 +1093,7 @@ Public Module svnModule
                 statusCacheByNormalizedPath(normalizedPath) = entryToStore
             Next
 
-            markStatusCacheWritten(serverAwareWrite)
+            markStatusCacheWritten(markAsServerSync)
         Catch
             Try
                 If statusCacheByNormalizedPath Is Nothing Then
@@ -1196,7 +1177,7 @@ Public Module svnModule
 
         Try
             If statusCacheByNormalizedPath Is Nothing OrElse statusCacheByNormalizedPath.Count = 0 Then
-                rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+                rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=False)
             End If
 
             Dim normalizedPath As String = normalizeSvnPath(filePath)
@@ -1649,7 +1630,7 @@ Public Module svnModule
 
         If bUpdateStatusOfAllOpenModels Then
             statusOfAllOpenModels = entireSVNStatus.Clone
-            rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+            rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=False)
         End If
 
         If IsNothing(modDocArr) Then
@@ -1683,7 +1664,7 @@ Public Module svnModule
             If serverStatus Is Nothing Then Return False
 
             statusOfAllOpenModels = serverStatus.Clone
-            rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+            rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=True)
 
             Try
                 myUserControl.statusOfAllOpenModels = statusOfAllOpenModels
@@ -1966,7 +1947,7 @@ Public Module svnModule
 
         Try
             statusOfAllOpenModels = serverStatus.Clone
-            rebuildStatusCacheFromStatus(statusOfAllOpenModels)
+            rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=True)
         Catch
         End Try
 
@@ -4000,11 +3981,116 @@ Public Module svnModule
         End Try
     End Function
 
+    Private Function getAssemblyComponentsSafe(ByVal assy As AssemblyDoc) As List(Of Component2)
+        Dim output As New List(Of Component2)()
+        If assy Is Nothing Then Return output
+
+        Try
+            Dim compsObj As Object = assy.GetComponents(False)
+            If compsObj Is Nothing Then Return output
+
+            Dim comps As Object() = CType(compsObj, Object())
+
+            For Each compObj As Object In comps
+                Dim comp As Component2 = TryCast(compObj, Component2)
+                If comp IsNot Nothing Then output.Add(comp)
+            Next
+        Catch
+        End Try
+
+        Return output
+    End Function
+
+    Private Function getAssemblyComponentsUsingPath(ByVal assy As AssemblyDoc,
+                                                    ByVal filePath As String) As List(Of Component2)
+        Dim output As New List(Of Component2)()
+        If assy Is Nothing Then Return output
+        If String.IsNullOrWhiteSpace(filePath) Then Return output
+
+        For Each comp As Component2 In getAssemblyComponentsSafe(assy)
+            If comp Is Nothing Then Continue For
+
+            Dim compPath As String = ""
+
+            Try
+                compPath = comp.GetPathName()
+            Catch
+                compPath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(compPath) Then Continue For
+            If pathsAreSame(compPath, filePath) Then output.Add(comp)
+        Next
+
+        Return output
+    End Function
+
+    Private Function externalReferenceIsRelinked(ByVal assy As AssemblyDoc,
+                                                 ByVal refInfo As ExternalReferenceInfo) As Boolean
+        If assy Is Nothing Then Return False
+        If refInfo Is Nothing Then Return False
+        If String.IsNullOrWhiteSpace(refInfo.oldPath) Then Return False
+        If String.IsNullOrWhiteSpace(refInfo.newPath) Then Return False
+
+        Dim oldStillReferenced As Boolean = False
+        Dim newReferenced As Boolean = False
+
+        For Each comp As Component2 In getAssemblyComponentsSafe(assy)
+            If comp Is Nothing Then Continue For
+
+            Dim compPath As String = ""
+
+            Try
+                compPath = comp.GetPathName()
+            Catch
+                compPath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(compPath) Then Continue For
+
+            If pathsAreSame(compPath, refInfo.oldPath) Then oldStillReferenced = True
+            If pathsAreSame(compPath, refInfo.newPath) Then newReferenced = True
+        Next
+
+        Return (Not oldStillReferenced) AndAlso newReferenced
+    End Function
+
+    Private Function allExternalReferencesAreRelinked(ByVal assy As AssemblyDoc,
+                                                       ByVal externalRefs As List(Of ExternalReferenceInfo)) As Boolean
+        If externalRefs Is Nothing OrElse externalRefs.Count = 0 Then Return True
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If refInfo Is Nothing Then Continue For
+            If Not externalReferenceIsRelinked(assy, refInfo) Then Return False
+        Next
+
+        Return True
+    End Function
+
+    Private Function saveRelinkedAssemblyWithoutRebuild(ByVal activeDoc As ModelDoc2,
+                                                        ByRef saveErrors As Integer,
+                                                        ByRef saveWarnings As Integer) As Boolean
+        saveErrors = 0
+        saveWarnings = 0
+
+        If activeDoc Is Nothing Then Return False
+
+        Try
+            Dim saveOptions As Integer =
+                CInt(swSaveAsOptions_e.swSaveAsOptions_Silent) Or
+                CInt(swSaveAsOptions_e.swSaveAsOptions_AvoidRebuildOnSave)
+
+            Return activeDoc.Save3(saveOptions, saveErrors, saveWarnings)
+        Catch
+            Return False
+        End Try
+    End Function
+
     Private Function relinkExternalRefsToVaultCopies(ByRef externalRefs As List(Of ExternalReferenceInfo)) As Boolean
         If externalRefs Is Nothing Then Return True
         If externalRefs.Count = 0 Then Return True
 
-        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
+        Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
         If activeDoc Is Nothing Then Return False
 
         If activeDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then
@@ -4012,7 +4098,6 @@ Public Module svnModule
         End If
 
         Dim assy As AssemblyDoc = CType(activeDoc, AssemblyDoc)
-        Dim okAll As Boolean = True
         Dim activeAssemblyPath As String = ""
 
         Try
@@ -4021,99 +4106,118 @@ Public Module svnModule
             activeAssemblyPath = ""
         End Try
 
+        'Fast progressive relink:
+        '  1. Try the lightweight document-reference redirect.
+        '  2. Verify the open assembly path immediately and stop if it worked.
+        '  3. Try Component2.ReplaceReference only when needed.
+        '  4. Use the selection-based ReplaceComponents command only as the last resort.
+        'The old implementation ran all three methods for every file, which could repeatedly
+        'evaluate mates and trigger rebuild/error sounds even after the first method succeeded.
         For Each refInfo As ExternalReferenceInfo In externalRefs
             If refInfo Is Nothing Then Continue For
             If String.IsNullOrWhiteSpace(refInfo.oldPath) Then Continue For
             If String.IsNullOrWhiteSpace(refInfo.newPath) Then Continue For
 
-            Dim replacedThisRef As Boolean = False
+            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
 
-            Try
-                'First try the document-level replacement. This catches references that SolidWorks
-                'does not expose cleanly through Component2, and helps make the fix persist on save.
-                If Not String.IsNullOrWhiteSpace(activeAssemblyPath) Then
-                    Try
-                        Dim replaceDocOk As Boolean = iSwApp.ReplaceReferencedDocument(activeAssemblyPath, refInfo.oldPath, refInfo.newPath)
+            'Stage 1: cheapest path-level redirect.
+            If Not String.IsNullOrWhiteSpace(activeAssemblyPath) Then
+                Try
+                    iSwApp.ReplaceReferencedDocument(activeAssemblyPath, refInfo.oldPath, refInfo.newPath)
+                Catch
+                End Try
+            End If
 
-                        If replaceDocOk Then
-                            replacedThisRef = True
-                        End If
-                    Catch
-                    End Try
-                End If
+            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
 
-                Dim compsObj As Object = assy.GetComponents(False)
+            'Stage 2: update only component instances that still use the old exact full path.
+            Dim componentsUsingOldPath As List(Of Component2) =
+                getAssemblyComponentsUsingPath(assy, refInfo.oldPath)
 
-                If compsObj IsNot Nothing Then
-                    Dim comps As Object() = CType(compsObj, Object())
+            For Each comp As Component2 In componentsUsingOldPath
+                Try
+                    comp.ReplaceReference(refInfo.newPath)
+                Catch
+                End Try
+            Next
 
-                    For Each compObj As Object In comps
-                        Dim comp As Component2 = TryCast(compObj, Component2)
-                        If comp Is Nothing Then Continue For
+            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
 
-                        Dim compPath As String = ""
+            'Stage 3: most disruptive/manual-style replacement, used only as a last fallback.
+            componentsUsingOldPath = getAssemblyComponentsUsingPath(assy, refInfo.oldPath)
 
-                        Try
-                            compPath = comp.GetPathName()
-                        Catch
-                            Continue For
-                        End Try
-
-                        If String.IsNullOrWhiteSpace(compPath) Then Continue For
-
-                        If pathsAreSame(compPath, refInfo.oldPath) Then
-                            'Try both APIs.  Component2.ReplaceReference can report success while the
-                            'open assembly still keeps the old path in memory.  The assembly-level
-                            'ReplaceComponents command is the no-reload path that usually updates the
-                            'active component instance immediately.
-                            Try
-                                Dim replaceOk As Boolean = comp.ReplaceReference(refInfo.newPath)
-
-                                If replaceOk Then
-                                    replacedThisRef = True
-                                End If
-                            Catch
-                            End Try
-
-                            Try
-                                If tryAssemblyReplaceComponent(assy, comp, refInfo.newPath) Then
-                                    replacedThisRef = True
-                                End If
-                            Catch
-                            End Try
-                        End If
-                    Next
-                End If
-
-                If Not replacedThisRef Then
-                    okAll = False
-                    iSwApp.SendMsgToUser2(
-                    "Failed to relink reference in the open assembly:" & vbCrLf & vbCrLf &
-                    refInfo.oldPath & vbCrLf & "→" & vbCrLf & refInfo.newPath,
-                    swMessageBoxIcon_e.swMbWarning,
-                    swMessageBoxBtn_e.swMbOk
-                )
-                End If
-
-            Catch ex As Exception
-                okAll = False
-                iSwApp.SendMsgToUser2(
-                "Error while relinking reference in the open assembly:" & vbCrLf & vbCrLf &
-                refInfo.oldPath & vbCrLf & "→" & vbCrLf & refInfo.newPath & vbCrLf & vbCrLf &
-                ex.Message,
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbOk
-            )
-            End Try
+            For Each comp As Component2 In componentsUsingOldPath
+                Try
+                    tryAssemblyReplaceComponent(assy, comp, refInfo.newPath)
+                Catch
+                End Try
+            Next
         Next
 
+        'Persist all successful path changes once, without forcing a full assembly rebuild.
+        Dim saveErrors As Integer = 0
+        Dim saveWarnings As Integer = 0
+        Dim fastSaveSucceeded As Boolean =
+            saveRelinkedAssemblyWithoutRebuild(activeDoc, saveErrors, saveWarnings)
+
+        If fastSaveSucceeded AndAlso allExternalReferencesAreRelinked(assy, externalRefs) Then
+            Return True
+        End If
+
+        'Recovery only:
+        'Some SolidWorks states do not expose the new in-memory component path until one rebuild.
+        'Run at most one full rebuild/save, and only when the lightweight path did not fully settle.
         Try
             activeDoc.ForceRebuild3(False)
-            activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
         Catch
         End Try
 
-        Return okAll
+        Dim recoveryErrors As Integer = 0
+        Dim recoveryWarnings As Integer = 0
+        Dim recoverySaveSucceeded As Boolean = False
+
+        Try
+            recoverySaveSucceeded = activeDoc.Save3(
+                swSaveAsOptions_e.swSaveAsOptions_Silent,
+                recoveryErrors,
+                recoveryWarnings
+            )
+        Catch
+            recoverySaveSucceeded = False
+        End Try
+
+        If recoverySaveSucceeded AndAlso allExternalReferencesAreRelinked(assy, externalRefs) Then
+            Return True
+        End If
+
+        Dim failedMsg As New System.Text.StringBuilder()
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If refInfo Is Nothing Then Continue For
+            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+
+            failedMsg.AppendLine(Path.GetFileName(refInfo.oldPath))
+            failedMsg.AppendLine(refInfo.oldPath)
+            failedMsg.AppendLine("→")
+            failedMsg.AppendLine(refInfo.newPath)
+            failedMsg.AppendLine()
+        Next
+
+        If failedMsg.Length = 0 Then
+            failedMsg.AppendLine("The references appear updated, but SolidWorks could not save the assembly reliably.")
+            failedMsg.AppendLine("Fast save errors: " & saveErrors.ToString() & "; warnings: " & saveWarnings.ToString())
+            failedMsg.AppendLine("Recovery save errors: " & recoveryErrors.ToString() & "; warnings: " & recoveryWarnings.ToString())
+        End If
+
+        iSwApp.SendMsgToUser2(
+            "Commit blocked." & vbCrLf & vbCrLf &
+            "SolidWorks could not complete and save the external/vendor reference relink." & vbCrLf & vbCrLf &
+            failedMsg.ToString(),
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+        Return False
     End Function
 
     Private Function verifyExternalRefsNowPointToVaultCopies(ByRef externalRefs As List(Of ExternalReferenceInfo)) As Boolean
@@ -4464,15 +4568,8 @@ Public Module svnModule
         externalRefs = refsStillExternal
 
         If externalRefs.Count = 0 Then
-            Dim activeDocExistingVendor As ModelDoc2 = iSwApp.ActiveDoc
-            If activeDocExistingVendor IsNot Nothing Then
-                Try
-                    activeDocExistingVendor.ForceRebuild3(False)
-                    activeDocExistingVendor.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
-                Catch
-                End Try
-            End If
-
+            'relinkExternalRefsToVaultCopies already verified and saved the assembly once.
+            'Do not perform a second full rebuild/save here.
             Return True
         End If
 
@@ -4617,15 +4714,8 @@ Public Module svnModule
             Next
         End If
 
-        Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
-        If activeDoc IsNot Nothing Then
-            Try
-                activeDoc.ForceRebuild3(False)
-                activeDoc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, 0, 0)
-            Catch
-            End Try
-        End If
-
+        'The relink routine already persisted the assembly reference changes.
+        'The normal commit save step will only save again if the document is still dirty.
         Return True
     End Function
 
@@ -5718,6 +5808,18 @@ Public Module svnModule
 
             Dim doc As ModelDoc2 = getOpenModelByPathSafe(p)
             If doc Is Nothing Then Continue For
+
+            'The optimized vendor relink already saves the assembly once.
+            'Do not save/evaluate a large clean assembly again immediately before Commit.
+            Dim documentIsDirty As Boolean = True
+
+            Try
+                documentIsDirty = doc.GetSaveFlag()
+            Catch
+                documentIsDirty = True
+            End Try
+
+            If Not documentIsDirty Then Continue For
 
             Try
                 Dim errors As Integer = 0
