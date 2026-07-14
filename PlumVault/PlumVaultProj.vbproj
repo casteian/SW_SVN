@@ -144,9 +144,11 @@
     <Compile Include="AssemblyInfo.vb">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="CloseLockReviewForm.vb" />
     <Compile Include="EventHandling.vb">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="ExternalReferenceImportForm.vb" />
     <Compile Include="LegacyImportForm.vb" />
     <Compile Include="My Project\Settings.Designer.vb">
       <AutoGen>True</AutoGen>
@@ -171,6 +173,7 @@
     <Compile Include="UserControl1.vb">
       <SubType>UserControl</SubType>
     </Compile>
+    <Compile Include="VirtualComponentExternalizeForm.vb" />
     <EmbeddedResource Include="My Project\Resources.resx">
       <CustomToolNamespace>My.Resources</CustomToolNamespace>
       <Generator>VbMyResourcesResXFileCodeGenerator</Generator>

@@ -30,8 +30,12 @@ Public Module svnModule
     Private pendingExternalRefCommitPaths As New List(Of String)
     Private pendingExternalRefSkipNameCheckPaths As New List(Of String)
     Private closeGuardMessageShowing As Boolean = False
+    Private lockReviewMessageShowing As Boolean = False
     Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
     Private unsafeForceCloseApprovedUntil As DateTime = DateTime.MinValue
+    Private documentLockReviewApprovedUntil As DateTime = DateTime.MinValue
+    Private documentLockReviewApprovedPath As String = ""
+    Private applicationLockReviewApprovedUntil As DateTime = DateTime.MinValue
     Private statusCacheByNormalizedPath As New Dictionary(Of String, SVNStatus.filePpty)(StringComparer.OrdinalIgnoreCase)
     Private statusCacheLastWriteUtc As DateTime = DateTime.MinValue
     Private statusCacheLastServerAwareUtc As DateTime = DateTime.MinValue
@@ -48,6 +52,33 @@ Public Module svnModule
     Private pendingAutomaticSaveCommitPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private automaticSaveCommitPreparing As Boolean = False
     Private legacyImportInProgress As Boolean = False
+
+    'Assembly edit protection state. The guard is event-driven; it does not poll and
+    'does not contact the SVN server while the user is modelling.
+    Private assemblyGuardUndoInProgress As Boolean = False
+    Private ReadOnly assemblyGuardQueuedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private ReadOnly assemblyGuardSync As New Object()
+    Private lastAssemblyGuardMessageUtc As DateTime = DateTime.MinValue
+    Private lastAssemblyGuardMessagePath As String = ""
+
+    'A dimension selected through an assembly can belong to a separately file-backed child
+    'even when IAssemblyDoc.GetEditTarget temporarily returns Nothing while the dimension
+    'dialog is opening. Remember that selection briefly so the assembly guard checks the
+    'document that actually owns the dimension instead of blocking the parent assembly.
+    Private Class AssemblySelectionContext
+        Public Property ChildPath As String = ""
+        Public Property CapturedUtc As DateTime = DateTime.MinValue
+        Public Property IsDimensionSelection As Boolean = False
+    End Class
+
+    Private ReadOnly assemblySelectionContextByAssemblyPath As New Dictionary(Of String, AssemblySelectionContext)(StringComparer.OrdinalIgnoreCase)
+
+    'When PlumVault immediately undoes an unauthorized assembly edit, SOLIDWORKS can leave
+    'the assembly SaveFlag set even though the on-disk SVN file is still clean. Track only
+    'those known guard-generated cases so the close workflow may proceed to the retained-lock
+    'review table without weakening protection for genuine unsaved assembly edits.
+    Private ReadOnly assemblyGuardFalseDirtyCandidatePaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
     Private Const SW_COMMAND_SAVE As Integer = 2
     Private Const SW_COMMAND_SAVE_AS As Integer = 620
 
@@ -102,6 +133,649 @@ Public Module svnModule
     Private Function automaticSaveEventsSuppressed() As Boolean
         Return internalSolidWorksSaveDepth > 0 OrElse automaticSaveCommitPreparing OrElse legacyImportInProgress
     End Function
+
+
+    '==========================================================================
+    ' ASSEMBLY EDIT PROTECTION
+    '==========================================================================
+
+    Private Function assemblyEditGuardSuppressed() As Boolean
+        Return automaticSaveEventsSuppressed() OrElse assemblyGuardUndoInProgress
+    End Function
+
+    Private Function getAssemblyEditTargetDocumentSafe(ByVal assemblyDocument As ModelDoc2) As ModelDoc2
+        If assemblyDocument Is Nothing Then Return Nothing
+
+        Try
+            Dim swAssembly As AssemblyDoc = TryCast(assemblyDocument, AssemblyDoc)
+            If swAssembly Is Nothing Then Return Nothing
+
+            Return TryCast(swAssembly.GetEditTarget(), ModelDoc2)
+        Catch
+            Return Nothing
+        End Try
+    End Function
+
+    Private Function getAssemblyPathKeySafe(ByVal assemblyDocument As ModelDoc2) As String
+        If assemblyDocument Is Nothing Then Return ""
+
+        Dim assemblyPath As String = ""
+
+        Try
+            assemblyPath = assemblyDocument.GetPathName()
+        Catch
+            assemblyPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(assemblyPath) Then
+            Try
+                assemblyPath = assemblyDocument.GetTitle()
+            Catch
+                assemblyPath = ""
+            End Try
+        End If
+
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Return ""
+
+        Try
+            Return Path.GetFullPath(assemblyPath)
+        Catch
+            Return assemblyPath
+        End Try
+    End Function
+
+    Private Function getSelectedExternalPhysicalChildPathSafe(ByVal assemblyDocument As ModelDoc2) As String
+        If assemblyDocument Is Nothing Then Return ""
+
+        Dim assemblyPath As String = ""
+
+        Try
+            assemblyPath = assemblyDocument.GetPathName()
+        Catch
+            assemblyPath = ""
+        End Try
+
+        Dim selectionManager As SelectionMgr = Nothing
+
+        Try
+            selectionManager = TryCast(assemblyDocument.SelectionManager, SelectionMgr)
+        Catch
+            selectionManager = Nothing
+        End Try
+
+        If selectionManager Is Nothing Then Return ""
+
+        Dim selectedCount As Integer = 0
+
+        Try
+            selectedCount = CInt(selectionManager.GetSelectedObjectCount2(-1))
+        Catch
+            selectedCount = 0
+        End Try
+
+        For index As Integer = 1 To selectedCount
+            Dim selectedComponent As Component2 = Nothing
+
+            Try
+                selectedComponent = TryCast(selectionManager.GetSelectedObjectsComponent4(index, -1), Component2)
+            Catch
+                selectedComponent = Nothing
+            End Try
+
+            If selectedComponent Is Nothing Then Continue For
+
+            Dim isVirtual As Boolean = False
+
+            Try
+                isVirtual = selectedComponent.IsVirtual
+            Catch
+                isVirtual = False
+            End Try
+
+            If isVirtual Then Continue For
+
+            Dim childPath As String = ""
+
+            Try
+                childPath = selectedComponent.GetPathName()
+            Catch
+                childPath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(childPath) Then Continue For
+            If isSolidWorksTempOrVirtualPath(childPath) Then Continue For
+            If Not isCadFilePath(childPath) Then Continue For
+            If Not String.IsNullOrWhiteSpace(assemblyPath) AndAlso pathsAreSame(assemblyPath, childPath) Then Continue For
+
+            Try
+                Return Path.GetFullPath(childPath)
+            Catch
+                Return childPath
+            End Try
+        Next
+
+        Return ""
+    End Function
+
+    Private Function selectionContainsDimensionSafe(ByVal assemblyDocument As ModelDoc2) As Boolean
+        If assemblyDocument Is Nothing Then Return False
+
+        Dim selectionManager As SelectionMgr = Nothing
+
+        Try
+            selectionManager = TryCast(assemblyDocument.SelectionManager, SelectionMgr)
+        Catch
+            selectionManager = Nothing
+        End Try
+
+        If selectionManager Is Nothing Then Return False
+
+        Dim selectedCount As Integer = 0
+
+        Try
+            selectedCount = CInt(selectionManager.GetSelectedObjectCount2(-1))
+        Catch
+            selectedCount = 0
+        End Try
+
+        For index As Integer = 1 To selectedCount
+            Try
+                If CInt(selectionManager.GetSelectedObjectType3(index, -1)) = CInt(swSelectType_e.swSelDIMENSIONS) Then
+                    Return True
+                End If
+            Catch
+            End Try
+        Next
+
+        Return False
+    End Function
+
+    Private Function externalChildPathHasRequiredLockFast(ByVal childPath As String) As Boolean
+        If String.IsNullOrWhiteSpace(childPath) Then Return False
+        If Not isPathInsideLocalRepo(childPath) Then Return False
+        If isNewUnversionedOrAddedFile(childPath) Then Return True
+
+        Try
+            Dim cached As SVNStatus.filePpty = Nothing
+
+            If tryFindCachedStatusProperty(childPath, cached) Then
+                If cached.lock6 = "K" Then Return True
+            End If
+        Catch
+        End Try
+
+        Return userHasLocalSvnLockTokenForPath(childPath)
+    End Function
+
+    Public Sub noteAssemblySelectionContextPublic(ByVal assemblyDocument As ModelDoc2)
+        If assemblyDocument Is Nothing Then Exit Sub
+
+        Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyKey) Then Exit Sub
+
+        Dim childPath As String = getSelectedExternalPhysicalChildPathSafe(assemblyDocument)
+        Dim isDimensionSelection As Boolean = selectionContainsDimensionSafe(assemblyDocument)
+
+        SyncLock assemblyGuardSync
+            'Only retain the fallback for a selected child-owned dimension. Ordinary selected
+            'components must never bypass assembly protection for moves, mates, suppression,
+            'display-state changes, or other assembly-owned edits.
+            If String.IsNullOrWhiteSpace(childPath) OrElse Not isDimensionSelection Then
+                assemblySelectionContextByAssemblyPath.Remove(assemblyKey)
+                Exit Sub
+            End If
+
+            assemblySelectionContextByAssemblyPath(assemblyKey) = New AssemblySelectionContext With {
+                .ChildPath = childPath,
+                .CapturedUtc = DateTime.UtcNow,
+                .IsDimensionSelection = True
+            }
+        End SyncLock
+    End Sub
+
+    Private Function getRecentSelectedExternalChildPath(ByVal assemblyDocument As ModelDoc2) As String
+        Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyKey) Then Return ""
+
+        SyncLock assemblyGuardSync
+            Dim context As AssemblySelectionContext = Nothing
+
+            If Not assemblySelectionContextByAssemblyPath.TryGetValue(assemblyKey, context) Then Return ""
+            If context Is Nothing OrElse Not context.IsDimensionSelection Then Return ""
+
+            'The dimension Modify dialog can remain open while the user enters a value.
+            'This is selection-scoped rather than a general child-selection bypass.
+            If (DateTime.UtcNow - context.CapturedUtc).TotalMinutes > 3.0 Then
+                assemblySelectionContextByAssemblyPath.Remove(assemblyKey)
+                Return ""
+            End If
+
+            Return context.ChildPath
+        End SyncLock
+    End Function
+
+    Private Sub clearAssemblySelectionContext(ByVal assemblyDocument As ModelDoc2)
+        Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyKey) Then Exit Sub
+
+        SyncLock assemblyGuardSync
+            assemblySelectionContextByAssemblyPath.Remove(assemblyKey)
+        End SyncLock
+    End Sub
+
+    Private Sub markAssemblyGuardFalseDirtyCandidate(ByVal assemblyDocument As ModelDoc2)
+        Dim assemblyPath As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Exit Sub
+
+        SyncLock assemblyGuardSync
+            assemblyGuardFalseDirtyCandidatePaths.Add(assemblyPath)
+        End SyncLock
+    End Sub
+
+    Private Sub clearAssemblyGuardFalseDirtyCandidate(ByVal assemblyDocument As ModelDoc2)
+        Dim assemblyPath As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Exit Sub
+
+        SyncLock assemblyGuardSync
+            assemblyGuardFalseDirtyCandidatePaths.Remove(assemblyPath)
+        End SyncLock
+    End Sub
+
+    Private Function isAssemblyGuardFalseDirtyCandidate(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Dim key As String = filePath
+
+        Try
+            key = Path.GetFullPath(filePath)
+        Catch
+        End Try
+
+        SyncLock assemblyGuardSync
+            Return assemblyGuardFalseDirtyCandidatePaths.Contains(key)
+        End SyncLock
+    End Function
+
+    Private Function isSvnPathLocallyClean(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+        If Not isPathInsideLocalRepo(filePath) Then Return False
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "status --non-interactive --depth empty """ & filePath & """"
+            )
+
+            Dim errorText As String = ""
+            If statusResult.outputError IsNot Nothing Then errorText = statusResult.outputError.Trim()
+            If errorText <> "" Then Return False
+
+            Dim outputText As String = ""
+            If statusResult.output IsNot Nothing Then outputText = statusResult.output
+
+            If String.IsNullOrWhiteSpace(outputText) Then Return True
+
+            Dim lines() As String = outputText.Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+                If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+                Dim workingCopyState As Char = If(line.Length >= 1, line(0), " "c)
+                Dim propertyState As Char = If(line.Length >= 2, line(1), " "c)
+                Dim treeConflictState As Char = If(line.Length >= 7, line(6), " "c)
+
+                'A clean locked file can still produce a status row because column 6 is K.
+                'Only working-copy, property, or conflict changes make the path unsafe.
+                If workingCopyState <> " "c OrElse propertyState <> " "c OrElse treeConflictState <> " "c Then
+                    Return False
+                End If
+            Next
+
+            Return True
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function canTreatAssemblySaveFlagAsGuardGenerated(ByVal document As ModelDoc2,
+                                                               ByVal filePath As String) As Boolean
+        If document Is Nothing Then Return False
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Try
+            If document.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Return False
+        Catch
+            Return False
+        End Try
+
+        If Not isAssemblyGuardFalseDirtyCandidate(filePath) Then Return False
+        Return isSvnPathLocallyClean(filePath)
+    End Function
+
+    Private Function assemblyIsEditingExternalPhysicalChild(ByVal assemblyDocument As ModelDoc2,
+                                                             Optional ByVal allowLockedChildDimensionFallback As Boolean = False) As Boolean
+        If assemblyDocument Is Nothing Then Return False
+
+        Dim assemblyPath As String = ""
+
+        Try
+            assemblyPath = assemblyDocument.GetPathName()
+        Catch
+            assemblyPath = ""
+        End Try
+
+        Dim editTarget As ModelDoc2 = getAssemblyEditTargetDocumentSafe(assemblyDocument)
+
+        If editTarget IsNot Nothing Then
+            Dim targetPath As String = ""
+
+            Try
+                targetPath = editTarget.GetPathName()
+            Catch
+                targetPath = ""
+            End Try
+
+            If Not String.IsNullOrWhiteSpace(assemblyPath) AndAlso
+               Not String.IsNullOrWhiteSpace(targetPath) AndAlso
+               pathsAreSame(assemblyPath, targetPath) Then
+                targetPath = ""
+            End If
+
+            If Not String.IsNullOrWhiteSpace(targetPath) Then
+                'Virtual documents are stored by the physical assembly and therefore require
+                'the assembly lock. They commonly have a temporary/AppData path or a title
+                'containing a caret.
+                Try
+                    Dim ownerPath As String = getOwningPhysicalAssemblyPathForVirtualDocument(editTarget)
+                    If Not String.IsNullOrWhiteSpace(ownerPath) Then targetPath = ""
+                Catch
+                End Try
+            End If
+
+            If Not String.IsNullOrWhiteSpace(targetPath) AndAlso isSolidWorksTempOrVirtualPath(targetPath) Then
+                targetPath = ""
+            End If
+
+            If Not String.IsNullOrWhiteSpace(targetPath) Then
+                Dim targetTitle As String = ""
+
+                Try
+                    targetTitle = editTarget.GetTitle()
+                Catch
+                    targetTitle = ""
+                End Try
+
+                If targetTitle.Contains("^") AndAlso Not isPathInsideLocalRepo(targetPath) Then
+                    targetPath = ""
+                End If
+            End If
+
+            If Not String.IsNullOrWhiteSpace(targetPath) Then Return True
+        End If
+
+        If allowLockedChildDimensionFallback Then
+            'SOLIDWORKS can temporarily clear GetEditTarget while the dimension Modify dialog
+            'opens. Use only a dimension selection owned by a separately file-backed child.
+            'A normal selected component is deliberately insufficient because moving that
+            'component is an assembly-owned edit and still requires the assembly lock.
+            noteAssemblySelectionContextPublic(assemblyDocument)
+
+            Dim recentChildPath As String = getRecentSelectedExternalChildPath(assemblyDocument)
+
+            If Not String.IsNullOrWhiteSpace(recentChildPath) AndAlso
+               externalChildPathHasRequiredLockFast(recentChildPath) Then
+                Return True
+            End If
+        End If
+
+        Return False
+    End Function
+
+    Private Function assemblyHasRequiredLockFast(ByVal assemblyDocument As ModelDoc2) As Boolean
+        If assemblyDocument Is Nothing Then Return False
+
+        Dim assemblyPath As String = ""
+
+        Try
+            assemblyPath = assemblyDocument.GetPathName()
+        Catch
+            assemblyPath = ""
+        End Try
+
+        'New or unmanaged assemblies are allowed to be created normally. Their first
+        'managed save is still handled by the existing naming/add/commit workflow.
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Return True
+        If Not isPathInsideLocalRepo(assemblyPath) Then Return True
+        If isNewUnversionedOrAddedFile(assemblyPath) Then Return True
+
+        'Fast cache path: normal modelling actions do not launch an SVN process.
+        Try
+            Dim cached As SVNStatus = findStatusForFile(assemblyPath)
+            If cached IsNot Nothing AndAlso cached.fp IsNot Nothing AndAlso cached.fp.Length > 0 Then
+                If cached.fp(0).lock6 = "K" Then Return True
+                If cached.fp(0).lock6 = " " Then Return False
+            End If
+        Catch
+        End Try
+
+        'Fallback is local working-copy status only; no server call is made.
+        Return userHasSvnLockOnDoc(assemblyDocument)
+    End Function
+
+    Private Function assemblyOwnedEditMustBeBlocked(ByVal assemblyDocument As ModelDoc2,
+                                                      Optional ByVal allowLockedChildDimensionFallback As Boolean = False) As Boolean
+        If assemblyDocument Is Nothing Then Return False
+        If assemblyEditGuardSuppressed() Then Return False
+
+        Try
+            If assemblyDocument.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Return False
+        Catch
+            Return False
+        End Try
+
+        'Do not let the parent assembly's lack of a lock interfere while a separately
+        'file-backed child is being edited in context.
+        If assemblyIsEditingExternalPhysicalChild(assemblyDocument, allowLockedChildDimensionFallback) Then Return False
+
+        Return Not assemblyHasRequiredLockFast(assemblyDocument)
+    End Function
+
+    Private Sub showAssemblyLockRequiredMessage(ByVal assemblyDocument As ModelDoc2,
+                                                ByVal actionDescription As String,
+                                                Optional ByVal editWasUndone As Boolean = False)
+        Dim assemblyPath As String = ""
+        Dim assemblyName As String = "the assembly"
+
+        Try
+            assemblyPath = assemblyDocument.GetPathName()
+            If Not String.IsNullOrWhiteSpace(assemblyPath) Then assemblyName = Path.GetFileName(assemblyPath)
+        Catch
+        End Try
+
+        'Several post-notifications can describe one SOLIDWORKS action. Suppress only
+        'duplicate messages from that same action, not later user attempts.
+        If pathsAreSame(lastAssemblyGuardMessagePath, assemblyPath) AndAlso
+           (DateTime.UtcNow - lastAssemblyGuardMessageUtc).TotalMilliseconds < 750.0 Then
+            Exit Sub
+        End If
+
+        lastAssemblyGuardMessagePath = assemblyPath
+        lastAssemblyGuardMessageUtc = DateTime.UtcNow
+
+        Dim firstLine As String = If(editWasUndone,
+                                     "Assembly edit was undone.",
+                                     "Assembly edit blocked.")
+
+        Dim actionText As String = ""
+        If Not String.IsNullOrWhiteSpace(actionDescription) Then
+            actionText = vbCrLf & vbCrLf & "Attempted action: " & actionDescription
+        End If
+
+        Try
+            iSwApp.SendMsgToUser2(
+                firstLine & vbCrLf & vbCrLf &
+                assemblyName & " is not locked by you." & vbCrLf &
+                "Get Locks on the assembly before changing mates, component positions, inserted components, assembly configurations, display state, or virtual components." &
+                actionText & vbCrLf & vbCrLf &
+                "You may still edit a separately file-backed child part in context when that child has its own lock.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+        Catch
+        End Try
+    End Sub
+
+    Public Function blockAssemblyOwnedEditPrePublic(ByVal assemblyDocument As ModelDoc2,
+                                                     ByVal actionDescription As String) As Integer
+        Dim childEditContext As Boolean = assemblyIsEditingExternalPhysicalChild(assemblyDocument)
+
+        If Not assemblyOwnedEditMustBeBlocked(assemblyDocument) Then
+            'A genuine assembly-owned edit made while the assembly is locked supersedes any
+            'earlier guard-generated false-dirty candidate. Child edits do not touch it.
+            If Not childEditContext Then clearAssemblyGuardFalseDirtyCandidate(assemblyDocument)
+            Return 0
+        End If
+
+        showAssemblyLockRequiredMessage(assemblyDocument, actionDescription, editWasUndone:=False)
+        Return 1
+    End Function
+
+    Public Sub handleAssemblyDimensionChangePostPublic(ByVal assemblyDocument As ModelDoc2,
+                                                        ByVal displayDimension As Object)
+        'Capture the selected owning component before SOLIDWORKS clears the temporary
+        'dimension-selection context. No SVN/server operation occurs here.
+        noteAssemblySelectionContextPublic(assemblyDocument)
+
+        Try
+            handleAssemblyOwnedEditPostPublic(
+                assemblyDocument,
+                "changing an assembly, mate, or child-part dimension",
+                allowLockedChildDimensionFallback:=True
+            )
+        Finally
+            clearAssemblySelectionContext(assemblyDocument)
+        End Try
+    End Sub
+
+    Public Sub handleAssemblyOwnedEditPostPublic(ByVal assemblyDocument As ModelDoc2,
+                                                  ByVal actionDescription As String,
+                                                  Optional ByVal allowLockedChildDimensionFallback As Boolean = False)
+        Dim childEditContext As Boolean = assemblyIsEditingExternalPhysicalChild(
+            assemblyDocument,
+            allowLockedChildDimensionFallback
+        )
+
+        If Not assemblyOwnedEditMustBeBlocked(assemblyDocument, allowLockedChildDimensionFallback) Then
+            If Not childEditContext Then clearAssemblyGuardFalseDirtyCandidate(assemblyDocument)
+            Exit Sub
+        End If
+
+        Dim assemblyPath As String = ""
+        Dim queueKey As String = ""
+
+        Try
+            assemblyPath = assemblyDocument.GetPathName()
+        Catch
+            assemblyPath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(assemblyPath) Then
+            Try
+                queueKey = Path.GetFullPath(assemblyPath)
+            Catch
+                queueKey = assemblyPath
+            End Try
+        Else
+            Try
+                queueKey = assemblyDocument.GetTitle()
+            Catch
+                queueKey = Guid.NewGuid().ToString()
+            End Try
+        End If
+
+        SyncLock assemblyGuardSync
+            If assemblyGuardQueuedPaths.Contains(queueKey) Then Exit Sub
+            assemblyGuardQueuedPaths.Add(queueKey)
+        End SyncLock
+
+        Dim undoAction As New System.Windows.Forms.MethodInvoker(
+            Sub()
+                Try
+                    Dim currentAssembly As ModelDoc2 = assemblyDocument
+
+                    If Not String.IsNullOrWhiteSpace(assemblyPath) Then
+                        Try
+                            Dim reopened As ModelDoc2 = getOpenModelByPathSafe(assemblyPath)
+                            If reopened IsNot Nothing Then currentAssembly = reopened
+                        Catch
+                        End Try
+                    End If
+
+                    If currentAssembly Is Nothing Then Exit Sub
+                    If Not assemblyOwnedEditMustBeBlocked(currentAssembly, allowLockedChildDimensionFallback) Then Exit Sub
+
+                    assemblyGuardUndoInProgress = True
+                    Try
+                        currentAssembly.EditUndo2(1)
+                        Try
+                            currentAssembly.ForceRebuild3(False)
+                        Catch
+                        End Try
+                    Finally
+                        assemblyGuardUndoInProgress = False
+                    End Try
+
+                    'SOLIDWORKS sometimes leaves GetSaveFlag=True after an immediate Undo even
+                    'though the assembly file on disk is unchanged. Mark this exact guard-generated
+                    'case so close safety can verify local SVN cleanliness before showing the lock table.
+                    markAssemblyGuardFalseDirtyCandidate(currentAssembly)
+
+                    showAssemblyLockRequiredMessage(currentAssembly, actionDescription, editWasUndone:=True)
+
+                    Try
+                        refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+                    Catch
+                    End Try
+                Catch
+                    assemblyGuardUndoInProgress = False
+
+                    Try
+                        showAssemblyLockRequiredMessage(assemblyDocument, actionDescription, editWasUndone:=False)
+                    Catch
+                    End Try
+                Finally
+                    SyncLock assemblyGuardSync
+                        assemblyGuardQueuedPaths.Remove(queueKey)
+                    End SyncLock
+                End Try
+            End Sub
+        )
+
+        Try
+            If myUserControl IsNot Nothing AndAlso
+               Not myUserControl.IsDisposed AndAlso
+               myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(undoAction)
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        'The task pane is normally available. This fallback keeps the edit from being
+        'left behind if the pane is temporarily unavailable.
+        Try
+            undoAction.Invoke()
+        Catch
+            SyncLock assemblyGuardSync
+                assemblyGuardQueuedPaths.Remove(queueKey)
+            End SyncLock
+        End Try
+    End Sub
 
     Private Sub beginInternalSolidWorksSave()
         internalSolidWorksSaveDepth += 1
@@ -264,6 +938,35 @@ Public Module svnModule
         Return -1
     End Function
 
+
+    Public Function startNewDocumentFirstSaveFromCommitPublic() As Boolean
+        If iSwApp Is Nothing Then Return False
+
+        Dim activeDocument As ModelDoc2 = Nothing
+
+        Try
+            activeDocument = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Catch
+            activeDocument = Nothing
+        End Try
+
+        If activeDocument Is Nothing OrElse Not isCadDocument(activeDocument) Then Return False
+
+        Dim activePath As String = ""
+
+        Try
+            activePath = activeDocument.GetPathName()
+        Catch
+            activePath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(activePath) Then Return False
+
+        'Reuse the exact managed first-save workflow used by Save/Ctrl+S. The return value
+        'is -1 when PlumVault consumed the command and queued the controlled Save As flow.
+        Return handleSolidWorksSaveCommandPreNotifyPublic(SW_COMMAND_SAVE, 0) = -1
+    End Function
+
     Private Sub performNewDocumentSvnSave(ByVal doc As ModelDoc2,
                                           ByVal compliantFileName As String)
         Try
@@ -365,6 +1068,38 @@ Public Module svnModule
 
             If String.IsNullOrWhiteSpace(selectedPath) Then Exit Sub
 
+            'A user can create a brand-new folder from the Save dialog or Windows Explorer.
+            'SVN versions directories separately, so create/add/commit the destination folder
+            'before SOLIDWORKS writes the new CAD file into it.
+            Dim selectedFolder As String = ""
+
+            Try
+                selectedFolder = Path.GetDirectoryName(selectedPath)
+            Catch
+                selectedFolder = ""
+            End Try
+
+            Dim folderPreparationError As String = ""
+            Dim folderCommitMessage As String =
+                If(isVendorPartPath(selectedPath),
+                   "Create Vendor Parts folder for first CAD save",
+                   "Create CAD folder for first save")
+
+            If Not prepareSvnDestinationFolderAndCommitIfNeeded(
+                selectedFolder,
+                folderCommitMessage,
+                folderPreparationError) Then
+
+                iSwApp.SendMsgToUser2(
+                    "The destination folder could not be prepared in SVN." & vbCrLf & vbCrLf &
+                    folderPreparationError & vbCrLf & vbCrLf &
+                    "The CAD file was not saved.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Exit Sub
+            End If
+
             Dim errors As Integer = 0
             Dim warnings As Integer = 0
             Dim saveSucceeded As Boolean = False
@@ -423,6 +1158,16 @@ Public Module svnModule
         Catch
             currentPath = ""
         End Try
+
+        Dim virtualOwnerPath As String = getOwningPhysicalAssemblyPathForVirtualDocument(doc)
+
+        'A Ctrl+S on an active virtual part/subassembly changes the physical owning
+        'assembly file. Enforce the assembly lock and commit the assembly instead of
+        'attempting SVN operations on a temporary virtual-component path.
+        If Not String.IsNullOrWhiteSpace(virtualOwnerPath) Then
+            If Not isSaveAs Then targetPath = virtualOwnerPath
+            currentPath = virtualOwnerPath
+        End If
 
         'FileSaveAsNotify2 is raised before the native Save As destination is finalized.
         'For an existing SVN document, verify the source lock before allowing Save As.
@@ -582,9 +1327,23 @@ Public Module svnModule
             End Try
         End If
 
+        Dim virtualOwnerPath As String = getOwningPhysicalAssemblyPathForVirtualDocument(doc)
+
+        If Not String.IsNullOrWhiteSpace(virtualOwnerPath) AndAlso
+           (String.IsNullOrWhiteSpace(savedPath) OrElse isSolidWorksTempOrVirtualPath(savedPath) OrElse Not isPathInsideLocalRepo(savedPath)) Then
+            savedPath = virtualOwnerPath
+        End If
+
         If String.IsNullOrWhiteSpace(savedPath) Then Return 0
         If Not isCadFilePath(savedPath) Then Return 0
         If Not isPathInsideLocalRepo(savedPath) Then Return 0
+
+        Try
+            If doc.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                clearAssemblyGuardFalseDirtyCandidate(doc)
+            End If
+        Catch
+        End Try
 
         If Not isOnlineModeEnabled() Then
             iSwApp.SendMsgToUser2(
@@ -909,7 +1668,15 @@ Public Module svnModule
                 End If
             End If
 
-            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+            'A newly-added CAD file changes the tree structure, so rebuild the current tree once.
+            'Normal Ctrl+S commits only change SVN status and keep the faster recolor-only path.
+            Dim shouldRebuildTreeAfterCommit As Boolean =
+                firstCommitCadPaths IsNot Nothing AndAlso firstCommitCadPaths.Length > 0
+
+            refreshActiveTreeAfterSvnAction(
+                bUpdateLocalLockStatus:=False,
+                bRebuildTree:=shouldRebuildTreeAfterCommit
+            )
         Catch
         End Try
 
@@ -1292,6 +2059,18 @@ Public Module svnModule
         'but they are not a new Sync and must not reset the displayed Sync age.
         rebuildStatusCacheFromStatus(statusOfAllOpenModels, markAsServerSync:=False)
 
+        'If the local working copy still has K lock tokens, immediately reconcile open
+        'SOLIDWORKS documents to writable. This repairs stale cache/read-only states without
+        'requiring the unsafe unlock-then-relock workaround and without changing unlocked docs.
+        Try
+            Dim locallyLockedPaths() As String = getLockedPathsFromStatus(statusOfAllOpenModels)
+
+            If locallyLockedPaths IsNot Nothing AndAlso locallyLockedPaths.Length > 0 Then
+                myUserControl.forceWriteAccessForLockedFilePathsPublic(locallyLockedPaths)
+            End If
+        Catch
+        End Try
+
         If bRefreshAllTreeViews Then myUserControl.refreshAllTreeViewsVariable()
     End Function
     Public Function updateStatusOfAllModelsVariable(Optional bRefreshAllTreeViews As Boolean = False) As Boolean
@@ -1341,10 +2120,32 @@ Public Module svnModule
         If myUserControl Is Nothing Then Return False
         If Not isOnlineModeEnabled() Then Return False
 
+        If DateTime.Now < applicationLockReviewApprovedUntil Then Return False
+
+        Dim blockedByUnsafeChanges As Boolean = blockCloseIfOpenDocsUnsafeOnly()
+        If blockedByUnsafeChanges Then Return True
+
+        'If the user explicitly chose the existing "close anyway" path for unsafe changes,
+        'do not immediately place a second lock-review dialog in front of that decision.
+        If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
+
+        Return blockCloseForOwnedLocks(
+            isClosingSolidWorks:=True,
+            closingDocumentPath:=""
+        )
+    End Function
+
+    Private Function blockCloseIfOpenDocsUnsafeOnly() As Boolean
+        If iSwApp Is Nothing Then Return False
+        If myUserControl Is Nothing Then Return False
+        If Not isOnlineModeEnabled() Then Return False
+
         'If the user just chose "No = close anyway", allow duplicate close events through briefly.
         If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
 
-        If closeGuardMessageShowing Then Return False
+        'A duplicate close message can arrive while the modal warning is open.
+        'Block it; allowing it through can close SOLIDWORKS behind the prompt.
+        If closeGuardMessageShowing Then Return True
 
         Dim openPaths As New List(Of String)
 
@@ -1389,7 +2190,12 @@ Public Module svnModule
                 End If
 
                 If isDirty Then
-                    If userHasSvnLockOnDoc(doc) OrElse isNewUnversionedOrAddedFile(docPath) Then
+                    If canTreatAssemblySaveFlagAsGuardGenerated(doc, docPath) Then
+                        'The assembly guard already undid the blocked edit and SVN confirms the
+                        'physical assembly file is locally clean. Continue to the retained-lock
+                        'review instead of showing a false uncommitted-changes warning.
+                        openPaths.Add(docPath)
+                    ElseIf userHasSvnLockOnDoc(doc) OrElse isNewUnversionedOrAddedFile(docPath) Then
                         openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
                     Else
                         openPaths.Add("[UNSAVED_WITHOUT_LOCK] " & title)
@@ -1432,7 +2238,9 @@ Public Module svnModule
         'If the user just chose "No = close anyway", allow duplicate close events through briefly.
         If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
 
-        If closeGuardMessageShowing Then Return False
+        'A duplicate close message can arrive while the modal warning is open.
+        'Block it; allowing it through can destroy the document behind the prompt.
+        If closeGuardMessageShowing Then Return True
         If closingDoc Is Nothing Then Return False
 
         Dim openPaths As New List(Of String)
@@ -1465,7 +2273,9 @@ Public Module svnModule
                 openPaths.Add("[UNSAVED_NEW_FILE] " & title)
 
             ElseIf isDirty Then
-                If userHasSvnLockOnDoc(closingDoc) OrElse isNewUnversionedOrAddedFile(docPath) Then
+                If canTreatAssemblySaveFlagAsGuardGenerated(closingDoc, docPath) Then
+                    openPaths.Add(docPath)
+                ElseIf userHasSvnLockOnDoc(closingDoc) OrElse isNewUnversionedOrAddedFile(docPath) Then
                     openPaths.Add("[UNSAVED_SOLIDWORKS_CHANGES] " & title)
                 Else
                     openPaths.Add("[UNSAVED_WITHOUT_LOCK] " & title)
@@ -1498,8 +2308,11 @@ Public Module svnModule
 
     Public Function blockCloseIfActiveDocUnsafe() As Boolean
         If iSwApp Is Nothing Then Return False
+        If myUserControl Is Nothing Then Return False
+        If Not isOnlineModeEnabled() Then Return False
 
         Dim activeDoc As ModelDoc2 = Nothing
+        Dim activePath As String = ""
 
         Try
             activeDoc = TryCast(iSwApp.ActiveDoc, ModelDoc2)
@@ -1509,7 +2322,335 @@ Public Module svnModule
 
         If activeDoc Is Nothing Then Return False
 
-        Return blockCloseIfSingleDocUnsafe(activeDoc)
+        Try
+            activePath = activeDoc.GetPathName()
+        Catch
+            activePath = ""
+        End Try
+
+        If DateTime.Now < documentLockReviewApprovedUntil AndAlso
+           String.Equals(normalizeSvnPath(activePath),
+                         normalizeSvnPath(documentLockReviewApprovedPath),
+                         StringComparison.OrdinalIgnoreCase) Then
+            Return False
+        End If
+
+        Dim blockedByUnsafeChanges As Boolean = blockCloseIfSingleDocUnsafe(activeDoc)
+        If blockedByUnsafeChanges Then Return True
+
+        'The pre-existing close-anyway choice is authoritative. Do not stack the
+        'informational lock-review table on top of that exceptional path.
+        If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
+
+        Return blockCloseForOwnedLocks(
+            isClosingSolidWorks:=False,
+            closingDocumentPath:=activePath
+        )
+    End Function
+
+    Private Function blockCloseForOwnedLocks(ByVal isClosingSolidWorks As Boolean,
+                                                  ByVal closingDocumentPath As String) As Boolean
+        If iSwApp Is Nothing Then Return False
+        If myUserControl Is Nothing Then Return False
+        If Not isOnlineModeEnabled() Then Return False
+
+        'A second native close message can be pumped while the modal table is open.
+        'Always block that duplicate instead of allowing the document/application to
+        'close behind the user's review window.
+        If lockReviewMessageShowing Then Return True
+
+        Dim reviewItems As List(Of CloseLockReviewItem) = Nothing
+
+        Try
+            If isClosingSolidWorks Then
+                reviewItems = getOwnedLockReviewItems(
+                    candidatePaths:=Nothing,
+                    scanWholeWorkingCopy:=True
+                )
+            Else
+                reviewItems = getOwnedLockReviewItems(
+                    candidatePaths:=getOpenSessionCadPathsForLockReview(),
+                    scanWholeWorkingCopy:=False
+                )
+            End If
+        Catch
+            reviewItems = Nothing
+        End Try
+
+        If reviewItems Is Nothing OrElse reviewItems.Count = 0 Then Return False
+
+        Try
+            lockReviewMessageShowing = True
+
+            Using reviewForm As New CloseLockReviewForm(reviewItems, isClosingSolidWorks)
+                reviewForm.ShowDialog()
+
+                If reviewForm.Decision = CloseLockReviewDecision.ContinueClose Then
+                    If isClosingSolidWorks Then
+                        applicationLockReviewApprovedUntil = DateTime.Now.AddSeconds(10)
+                    Else
+                        documentLockReviewApprovedPath = closingDocumentPath
+                        documentLockReviewApprovedUntil = DateTime.Now.AddSeconds(10)
+                    End If
+
+                    Return False
+                End If
+            End Using
+
+            Return True
+        Catch
+            'The lock table is advisory after the existing save/commit failsafe has
+            'already passed. Never crash SOLIDWORKS if the review UI itself fails.
+            Return False
+        Finally
+            lockReviewMessageShowing = False
+        End Try
+    End Function
+
+    Private Function getOpenSessionCadPathsForLockReview() As String()
+        If iSwApp Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            Dim docsObj As Object = iSwApp.GetDocuments()
+            If docsObj Is Nothing Then Return Nothing
+
+            Dim docs As Object() = CType(docsObj, Object())
+
+            For Each docObj As Object In docs
+                Dim doc As ModelDoc2 = TryCast(docObj, ModelDoc2)
+                If doc Is Nothing Then Continue For
+
+                Dim docPath As String = ""
+
+                Try
+                    docPath = doc.GetPathName()
+                Catch
+                    docPath = ""
+                End Try
+
+                If String.IsNullOrWhiteSpace(docPath) Then Continue For
+                If Not isCadFilePath(docPath) Then Continue For
+                If Not isPathInsideLocalRepo(docPath) Then Continue For
+
+                Try
+                    docPath = Path.GetFullPath(docPath)
+                Catch
+                End Try
+
+                If seen.Add(docPath) Then output.Add(docPath)
+            Next
+        Catch
+            Return Nothing
+        End Try
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function getOwnedLockReviewItems(ByVal candidatePaths() As String,
+                                             ByVal scanWholeWorkingCopy As Boolean) As List(Of CloseLockReviewItem)
+        Dim output As New List(Of CloseLockReviewItem)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If String.IsNullOrWhiteSpace(sSVNPath) OrElse Not File.Exists(sSVNPath) Then Return output
+
+        Dim workingCopyRoot As String = getResolvedSvnWorkingCopyRootPath()
+        If String.IsNullOrWhiteSpace(workingCopyRoot) Then Return output
+
+        Try
+            workingCopyRoot = Path.GetFullPath(workingCopyRoot).TrimEnd("\"c)
+        Catch
+            workingCopyRoot = workingCopyRoot.TrimEnd("\"c)
+        End Try
+
+        Dim statusArguments As String = "status -v --non-interactive "
+
+        If scanWholeWorkingCopy Then
+            statusArguments &= """" & workingCopyRoot & """"
+        Else
+            Dim filteredPaths() As String = distinctExistingCadFilePaths(candidatePaths)
+            If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return output
+            statusArguments &= formatFilePathArrForSvnProc(filteredPaths)
+        End If
+
+        Dim statusResult As rawProcessReturn = runSvnProcess(sSVNPath, statusArguments)
+        Dim outputText As String = If(statusResult.output, "")
+        Dim errorText As String = If(statusResult.outputError, "").Trim()
+
+        If errorText <> "" OrElse String.IsNullOrWhiteSpace(outputText) Then Return output
+
+        Dim lines() As String = outputText.Split(
+            New String() {vbCrLf, vbLf},
+            StringSplitOptions.RemoveEmptyEntries
+        )
+
+        For Each statusLine As String In lines
+            If String.IsNullOrWhiteSpace(statusLine) Then Continue For
+            If statusLine.Length < 7 Then Continue For
+
+            'SVN status column 6 is K when this working copy owns the lock token.
+            If statusLine(5) <> "K"c Then Continue For
+
+            Dim pathStart As Integer = statusLine.IndexOf(
+                workingCopyRoot,
+                StringComparison.OrdinalIgnoreCase
+            )
+
+            If pathStart < 0 Then Continue For
+
+            Dim filePath As String = statusLine.Substring(pathStart).Trim()
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            If Not isCadFilePath(filePath) Then Continue For
+
+            Try
+                filePath = Path.GetFullPath(filePath)
+            Catch
+            End Try
+
+            If Not seen.Add(filePath) Then Continue For
+
+            Dim workingCopyState As Char = statusLine(0)
+            Dim propertyState As Char = statusLine(1)
+            Dim treeConflictState As Char = statusLine(6)
+
+            Dim safeToUnlock As Boolean =
+                workingCopyState = " "c AndAlso
+                propertyState = " "c AndAlso
+                treeConflictState = " "c
+
+            Dim stateText As String = If(
+                safeToUnlock,
+                "Saved and committed",
+                getLockReviewUnsafeStateText(workingCopyState, propertyState, treeConflictState)
+            )
+
+            output.Add(
+                New CloseLockReviewItem With {
+                    .FilePath = filePath,
+                    .IsSafeToUnlock = safeToUnlock,
+                    .StateText = stateText,
+                    .IsStillLocked = True,
+                    .ResultText = If(safeToUnlock,
+                                     "Lock retained",
+                                     "Return to SOLIDWORKS and resolve changes")
+                }
+            )
+        Next
+
+        Return output.
+            OrderBy(Function(item) Path.GetFileName(item.FilePath), StringComparer.OrdinalIgnoreCase).
+            ThenBy(Function(item) item.FilePath, StringComparer.OrdinalIgnoreCase).
+            ToList()
+    End Function
+
+    Private Function getLockReviewUnsafeStateText(ByVal workingCopyState As Char,
+                                                  ByVal propertyState As Char,
+                                                  ByVal treeConflictState As Char) As String
+        Select Case workingCopyState
+            Case "M"c
+                Return "Local changes not committed"
+            Case "A"c
+                Return "File not committed yet"
+            Case "D"c
+                Return "Deletion not committed"
+            Case "R"c
+                Return "Replacement not committed"
+            Case "C"c
+                Return "SVN conflict requires attention"
+            Case "!"c
+                Return "File is missing locally"
+            Case "?"c
+                Return "File is not versioned"
+        End Select
+
+        If propertyState <> " "c Then Return "SVN property changes not committed"
+        If treeConflictState <> " "c Then Return "SVN tree conflict requires attention"
+
+        Return "Local SVN changes require attention"
+    End Function
+
+    Public Function unlockPathFromCloseReviewPublic(ByVal filePath As String,
+                                                     ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        If iSwApp Is Nothing OrElse myUserControl Is Nothing Then
+            errorMessage = "PlumVault is not connected to SOLIDWORKS."
+            Return False
+        End If
+
+        If Not isOnlineModeEnabled() Then
+            errorMessage = "PlumVault is offline. Reconnect before releasing the lock."
+            Return False
+        End If
+
+        If String.IsNullOrWhiteSpace(filePath) OrElse Not File.Exists(filePath) Then
+            errorMessage = "The CAD file could not be found locally."
+            Return False
+        End If
+
+        If Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then
+            errorMessage = "The selected file is not a managed CAD file in this SVN working copy."
+            Return False
+        End If
+
+        'Recheck the exact file immediately before unlock so a stale table can never
+        'release a file that was edited after the review window opened.
+        Dim currentItems As List(Of CloseLockReviewItem) = getOwnedLockReviewItems(
+            candidatePaths:=New String() {filePath},
+            scanWholeWorkingCopy:=False
+        )
+
+        Dim currentItem As CloseLockReviewItem = currentItems.
+            FirstOrDefault(Function(item) String.Equals(
+                normalizeSvnPath(item.FilePath),
+                normalizeSvnPath(filePath),
+                StringComparison.OrdinalIgnoreCase
+            ))
+
+        If currentItem Is Nothing Then
+            errorMessage = "The file is no longer locked by this working copy."
+            Return False
+        End If
+
+        If Not currentItem.IsSafeToUnlock Then
+            errorMessage = currentItem.StateText & ". Commit or revert the file before unlocking it."
+            Return False
+        End If
+
+        Dim unlockResult As rawProcessReturn = runSvnProcess(
+            sSVNPath,
+            "unlock --non-interactive """ & filePath & """"
+        )
+
+        Dim svnError As String = If(unlockResult.outputError, "").Trim()
+        If svnError <> "" Then
+            errorMessage = svnError
+            Return False
+        End If
+
+        'Do not call ModelDoc2.SetReadOnlyState(True) here. SVN unlock already applies
+        'the working-copy read-only state for needs-lock files, and forcing the open
+        'SOLIDWORKS document into read-only mode can set a false document save/dirty flag.
+        'That false flag caused the next close attempt to report uncommitted changes even
+        'though the file was clean. Future saves remain protected by PlumVault's lock check.
+
+        Try
+            updateStatusCacheForKnownPaths(New String() {filePath}, forceLock6:=" ")
+        Catch
+        End Try
+
+        Try
+            refreshActiveTreeAfterSvnAction(
+                bUpdateLocalLockStatus:=False,
+                bRebuildTree:=False
+            )
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Private Function userHasSvnLockOnDoc(ByVal doc As ModelDoc2) As Boolean
@@ -2825,6 +3966,11 @@ Public Module svnModule
         Try
             If myUserControl IsNot Nothing Then
                 myUserControl.statusOfAllOpenModels = statusOfAllOpenModels
+
+                Dim locallyOwnedPaths() As String = getLockedPathsFromStatus(statusOfAllOpenModels)
+                If locallyOwnedPaths IsNot Nothing AndAlso locallyOwnedPaths.Length > 0 Then
+                    myUserControl.forceWriteAccessForLockedFilePathsPublic(locallyOwnedPaths)
+                End If
             End If
         Catch
         End Try
@@ -3513,6 +4659,183 @@ Public Module svnModule
         Return False
     End Function
 
+    Private Function isComponentVirtualSafe(ByVal component As Component2) As Boolean
+        If component Is Nothing Then Return False
+
+        Try
+            Return component.IsVirtual
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function getPhysicalOwnerAssemblyPathForVirtualComponent(ByVal component As Component2,
+                                                                     ByVal fallbackAssembly As ModelDoc2) As String
+        If component Is Nothing Then Return ""
+
+        Dim currentComponent As Component2 = Nothing
+
+        Try
+            currentComponent = component.GetParent()
+        Catch
+            currentComponent = Nothing
+        End Try
+
+        Dim guard As Integer = 0
+
+        While currentComponent IsNot Nothing AndAlso guard < 100
+            guard += 1
+
+            If Not isComponentVirtualSafe(currentComponent) Then
+                Try
+                    Dim currentPath As String = currentComponent.GetPathName()
+
+                    If Not String.IsNullOrWhiteSpace(currentPath) AndAlso
+                       String.Equals(Path.GetExtension(currentPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) AndAlso
+                       File.Exists(currentPath) Then
+                        Return Path.GetFullPath(currentPath)
+                    End If
+                Catch
+                End Try
+            End If
+
+            Try
+                currentComponent = currentComponent.GetParent()
+            Catch
+                currentComponent = Nothing
+            End Try
+        End While
+
+        If fallbackAssembly IsNot Nothing Then
+            Try
+                If fallbackAssembly.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                    Dim fallbackPath As String = fallbackAssembly.GetPathName()
+
+                    If Not String.IsNullOrWhiteSpace(fallbackPath) AndAlso File.Exists(fallbackPath) Then
+                        Return Path.GetFullPath(fallbackPath)
+                    End If
+                End If
+            Catch
+            End Try
+        End If
+
+        Return ""
+    End Function
+
+    Private Function getOwningPhysicalAssemblyPathForVirtualDocument(ByVal possibleVirtualDocument As ModelDoc2) As String
+        If possibleVirtualDocument Is Nothing OrElse iSwApp Is Nothing Then Return ""
+
+        Dim possiblePath As String = ""
+        Dim possibleTitle As String = ""
+
+        Try
+            possiblePath = possibleVirtualDocument.GetPathName()
+        Catch
+            possiblePath = ""
+        End Try
+
+        Try
+            possibleTitle = possibleVirtualDocument.GetTitle()
+        Catch
+            possibleTitle = ""
+        End Try
+
+        'Normal physical CAD should take the fast path. Only temporary/internal
+        'document paths need the assembly-component scan below.
+        If Not String.IsNullOrWhiteSpace(possiblePath) AndAlso
+           File.Exists(possiblePath) AndAlso
+           Not isSolidWorksTempOrVirtualPath(possiblePath) Then
+            Return ""
+        End If
+
+        Dim documentsObject As Object = Nothing
+
+        Try
+            documentsObject = iSwApp.GetDocuments()
+        Catch
+            documentsObject = Nothing
+        End Try
+
+        Dim documentsArray As Array = TryCast(documentsObject, Array)
+        If documentsArray Is Nothing Then Return ""
+
+        For Each documentObject As Object In documentsArray
+            Dim assemblyModel As ModelDoc2 = TryCast(documentObject, ModelDoc2)
+            If assemblyModel Is Nothing Then Continue For
+
+            Try
+                If assemblyModel.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            Dim assemblyDocument As AssemblyDoc = TryCast(assemblyModel, AssemblyDoc)
+            If assemblyDocument Is Nothing Then Continue For
+
+            Dim componentsObject As Object = Nothing
+
+            Try
+                componentsObject = assemblyDocument.GetComponents(False)
+            Catch
+                componentsObject = Nothing
+            End Try
+
+            Dim componentsArray As Array = TryCast(componentsObject, Array)
+            If componentsArray Is Nothing Then Continue For
+
+            For Each componentObject As Object In componentsArray
+                Dim component As Component2 = TryCast(componentObject, Component2)
+                If component Is Nothing OrElse Not isComponentVirtualSafe(component) Then Continue For
+
+                Dim componentDocument As ModelDoc2 = Nothing
+                Dim matches As Boolean = False
+
+                Try
+                    componentDocument = TryCast(component.GetModelDoc2(), ModelDoc2)
+                    matches = componentDocument IsNot Nothing AndAlso Object.ReferenceEquals(componentDocument, possibleVirtualDocument)
+                Catch
+                    componentDocument = Nothing
+                    matches = False
+                End Try
+
+                If Not matches AndAlso componentDocument IsNot Nothing Then
+                    Dim componentPath As String = ""
+                    Dim componentTitle As String = ""
+
+                    Try
+                        componentPath = componentDocument.GetPathName()
+                    Catch
+                        componentPath = ""
+                    End Try
+
+                    Try
+                        componentTitle = componentDocument.GetTitle()
+                    Catch
+                        componentTitle = ""
+                    End Try
+
+                    If Not String.IsNullOrWhiteSpace(possiblePath) AndAlso Not String.IsNullOrWhiteSpace(componentPath) Then
+                        Try
+                            matches = String.Equals(Path.GetFullPath(componentPath), Path.GetFullPath(possiblePath), StringComparison.OrdinalIgnoreCase)
+                        Catch
+                            matches = String.Equals(componentPath, possiblePath, StringComparison.OrdinalIgnoreCase)
+                        End Try
+                    ElseIf Not String.IsNullOrWhiteSpace(possibleTitle) AndAlso
+                           possibleTitle.Contains("^") AndAlso
+                           Not String.IsNullOrWhiteSpace(componentTitle) Then
+                        matches = String.Equals(componentTitle, possibleTitle, StringComparison.OrdinalIgnoreCase)
+                    End If
+                End If
+
+                If matches Then
+                    Return getPhysicalOwnerAssemblyPathForVirtualComponent(component, assemblyModel)
+                End If
+            Next
+        Next
+
+        Return ""
+    End Function
+
     Private Function getGrc27RootPath() As String
         Return Path.Combine(getResolvedSvnWorkingCopyRootPath(), "GRC27")
     End Function
@@ -3579,6 +4902,30 @@ Public Module svnModule
         Dim ext As String = Path.GetExtension(filePath).ToUpperInvariant()
 
         Return ext = ".SLDPRT" OrElse ext = ".SLDASM" OrElse ext = ".SLDDRW"
+    End Function
+
+    Public Function isPathInsideLocalRepoPublic(ByVal filePath As String) As Boolean
+        Return isPathInsideLocalRepo(filePath)
+    End Function
+
+    Public Function shouldIncludeCadPathInSyncPublic(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+        If Not isCadFilePath(filePath) Then Return False
+        If Not isPathInsideLocalRepo(filePath) Then Return False
+
+        'Use the existing local/cache status when available. Do not launch an SVN command
+        'for each tree node; normal Sync must remain fast and non-SVN references are skipped.
+        Try
+            Dim cached As SVNStatus.filePpty = Nothing
+
+            If tryFindCachedStatusProperty(filePath, cached) Then
+                If cached.addDelChg1 = "?" Then Return False
+            End If
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Private Function isValidGrc27FileName(filePathOrName As String) As Boolean
@@ -4088,6 +5435,11 @@ Public Module svnModule
 
             If String.IsNullOrWhiteSpace(docPath) Then Continue For
 
+            If Not String.IsNullOrWhiteSpace(getOwningPhysicalAssemblyPathForVirtualDocument(doc)) Then
+                'Embedded virtual components are versioned through their owning assembly.
+                Continue For
+            End If
+
             If isSolidWorksTempOrVirtualPath(docPath) Then
                 externalRefs.Add(New ExternalReferenceInfo With {
                     .oldPath = docPath,
@@ -4172,6 +5524,18 @@ Public Module svnModule
             For Each componentObject As Object In components
                 Dim component As Component2 = TryCast(componentObject, Component2)
                 If component Is Nothing Then Continue For
+
+                Dim componentIsVirtual As Boolean = False
+
+                Try
+                    componentIsVirtual = component.IsVirtual
+                Catch
+                    componentIsVirtual = False
+                End Try
+
+                'A virtual component is stored inside its owning assembly. It is not an
+                'external CAD reference and has no independent SVN target.
+                If componentIsVirtual Then Continue For
 
                 Dim componentPath As String = ""
 
@@ -4628,6 +5992,423 @@ Public Module svnModule
 
         If output.Count = 0 Then Return Nothing
         Return output.ToArray()
+    End Function
+
+
+    Private Function getVirtualComponentDocumentExtension(ByVal component As Component2) As String
+        If component Is Nothing Then Return ""
+
+        Try
+            Dim componentDocument As ModelDoc2 = TryCast(component.GetModelDoc2(), ModelDoc2)
+
+            If componentDocument IsNot Nothing Then
+                Select Case componentDocument.GetType()
+                    Case swDocumentTypes_e.swDocPART
+                        Return ".SLDPRT"
+                    Case swDocumentTypes_e.swDocASSEMBLY
+                        Return ".SLDASM"
+                End Select
+            End If
+        Catch
+        End Try
+
+        Try
+            Dim componentPath As String = component.GetPathName()
+            Dim ext As String = Path.GetExtension(componentPath).ToUpperInvariant()
+            If ext = ".SLDPRT" OrElse ext = ".SLDASM" Then Return ext
+        Catch
+        End Try
+
+        Return ""
+    End Function
+
+    Private Function getVirtualComponentDisplayName(ByVal component As Component2) As String
+        If component Is Nothing Then Return "VirtualComponent"
+
+        Dim displayName As String = ""
+
+        Try
+            displayName = component.Name2
+        Catch
+            displayName = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(displayName) Then
+            Try
+                Dim componentDocument As ModelDoc2 = TryCast(component.GetModelDoc2(), ModelDoc2)
+                If componentDocument IsNot Nothing Then displayName = componentDocument.GetTitle()
+            Catch
+                displayName = ""
+            End Try
+        End If
+
+        If String.IsNullOrWhiteSpace(displayName) Then displayName = "VirtualComponent"
+        Return displayName
+    End Function
+
+    Private Function getVirtualComponentDepth(ByVal component As Component2) As Integer
+        If component Is Nothing Then Return 0
+
+        Dim depth As Integer = 0
+        Dim current As Component2 = component
+
+        While current IsNot Nothing AndAlso depth < 100
+            depth += 1
+
+            Try
+                current = current.GetParent()
+            Catch
+                current = Nothing
+            End Try
+        End While
+
+        Return depth
+    End Function
+
+    Private Function getVirtualComponentStableKey(ByVal component As Component2,
+                                                   ByVal ownerAssemblyPath As String) As String
+        If component Is Nothing Then Return ""
+
+        Dim documentPath As String = ""
+        Dim documentTitle As String = ""
+        Dim componentName As String = ""
+
+        Try
+            componentName = component.Name2
+        Catch
+            componentName = ""
+        End Try
+
+        Try
+            Dim componentDocument As ModelDoc2 = TryCast(component.GetModelDoc2(), ModelDoc2)
+
+            If componentDocument IsNot Nothing Then
+                Try
+                    documentPath = componentDocument.GetPathName()
+                Catch
+                    documentPath = ""
+                End Try
+
+                Try
+                    documentTitle = componentDocument.GetTitle()
+                Catch
+                    documentTitle = ""
+                End Try
+            End If
+        Catch
+        End Try
+
+        Dim documentIdentity As String = documentPath.Trim().ToUpperInvariant() & "|" &
+                                         documentTitle.Trim().ToUpperInvariant()
+
+        'Multiple instances of the same virtual definition can have different component
+        'instance names. Deduplicate by the embedded document identity whenever available;
+        'fall back to the component name only when SOLIDWORKS exposes no document identity.
+        If String.IsNullOrWhiteSpace(documentPath) AndAlso String.IsNullOrWhiteSpace(documentTitle) Then
+            documentIdentity = componentName.Trim().ToUpperInvariant()
+        End If
+
+        Return normalizeSvnPath(ownerAssemblyPath) & "|" & documentIdentity
+    End Function
+
+    Private Function collectVirtualComponentsForCommitPaths(ByVal commitPaths() As String) As List(Of VirtualComponentExternalizeItem)
+        Dim output As New List(Of VirtualComponentExternalizeItem)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Dim assemblyDocs() As ModelDoc2 = getOpenAssemblyDocsForCommitPaths(commitPaths)
+        If assemblyDocs Is Nothing OrElse assemblyDocs.Length = 0 Then Return output
+
+        For Each assemblyModel As ModelDoc2 In assemblyDocs
+            If assemblyModel Is Nothing Then Continue For
+
+            Dim assemblyPath As String = ""
+            Dim assemblyDoc As AssemblyDoc = Nothing
+            Dim componentsObject As Object = Nothing
+
+            Try
+                assemblyPath = assemblyModel.GetPathName()
+                assemblyDoc = TryCast(assemblyModel, AssemblyDoc)
+                If assemblyDoc IsNot Nothing Then componentsObject = assemblyDoc.GetComponents(False)
+            Catch
+                componentsObject = Nothing
+            End Try
+
+            Dim componentsArray As Array = TryCast(componentsObject, Array)
+            If componentsArray Is Nothing Then Continue For
+
+            For Each componentObject As Object In componentsArray
+                Dim component As Component2 = TryCast(componentObject, Component2)
+                If component Is Nothing OrElse Not isComponentVirtualSafe(component) Then Continue For
+
+                Dim extension As String = getVirtualComponentDocumentExtension(component)
+                If extension <> ".SLDPRT" AndAlso extension <> ".SLDASM" Then Continue For
+
+                Dim ownerPath As String = getPhysicalOwnerAssemblyPathForVirtualComponent(component, assemblyModel)
+                If String.IsNullOrWhiteSpace(ownerPath) Then ownerPath = assemblyPath
+                If String.IsNullOrWhiteSpace(ownerPath) Then Continue For
+
+                Dim stableKey As String = getVirtualComponentStableKey(component, ownerPath)
+                If String.IsNullOrWhiteSpace(stableKey) Then Continue For
+                If Not seen.Add(stableKey) Then Continue For
+
+                Dim proposedName As String = getVirtualComponentDisplayName(component)
+
+                output.Add(New VirtualComponentExternalizeItem With {
+                    .Component = component,
+                    .DisplayName = proposedName,
+                    .OwnerAssemblyPath = ownerPath,
+                    .DocumentExtension = extension,
+                    .ComponentDepth = getVirtualComponentDepth(component),
+                    .Handling = VirtualComponentHandlingType.SaveExternally,
+                    .TargetType = VirtualComponentTargetType.GrcCad,
+                    .ProposedId = proposedName,
+                    .DestinationFolder = Path.GetDirectoryName(ownerPath)
+                })
+            Next
+        Next
+
+        Return output
+    End Function
+
+    Private Function buildVirtualComponentExternalizePlan(ByVal items As List(Of VirtualComponentExternalizeItem)) As VirtualComponentExternalizePlan
+        Dim plan As New VirtualComponentExternalizePlan()
+        plan.LocalRepoRootFolder = getResolvedSvnWorkingCopyRootPath()
+        plan.VendorRootFolder = Path.Combine(plan.LocalRepoRootFolder, "Vendor Parts")
+
+        If items IsNot Nothing Then
+            For Each item As VirtualComponentExternalizeItem In items
+                If item IsNot Nothing Then plan.Items.Add(item)
+            Next
+        End If
+
+        Return plan
+    End Function
+
+    Private Function showVirtualComponentExternalizeTable(ByVal items As List(Of VirtualComponentExternalizeItem)) As VirtualComponentExternalizePlan
+        Dim plan As VirtualComponentExternalizePlan = buildVirtualComponentExternalizePlan(items)
+
+        Try
+            Using form As New VirtualComponentExternalizeForm(plan)
+                Dim owner As System.Windows.Forms.IWin32Window = getSolidWorksDialogOwner()
+                Dim result As System.Windows.Forms.DialogResult
+
+                If owner Is Nothing Then
+                    result = form.ShowDialog()
+                Else
+                    result = form.ShowDialog(owner)
+                End If
+
+                If result <> System.Windows.Forms.DialogResult.OK Then Return Nothing
+            End Using
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+                "The virtual-component review table could not be opened." & vbCrLf & vbCrLf & ex.Message,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return Nothing
+        End Try
+
+        Return plan
+    End Function
+
+    Private Function getPhysicalOwnerAssemblyDocsForVirtualPlan(ByVal plan As VirtualComponentExternalizePlan) As ModelDoc2()
+        If plan Is Nothing OrElse plan.Items Is Nothing Then Return Nothing
+
+        Dim output As New List(Of ModelDoc2)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each item As VirtualComponentExternalizeItem In plan.Items
+            If item Is Nothing Then Continue For
+            If item.Handling <> VirtualComponentHandlingType.SaveExternally Then Continue For
+            If String.IsNullOrWhiteSpace(item.OwnerAssemblyPath) Then Continue For
+
+            Dim normalizedOwner As String = normalizeSvnPath(item.OwnerAssemblyPath)
+            If String.IsNullOrWhiteSpace(normalizedOwner) OrElse Not seen.Add(normalizedOwner) Then Continue For
+
+            Dim ownerDoc As ModelDoc2 = getOpenModelByPathSafe(item.OwnerAssemblyPath)
+            If ownerDoc IsNot Nothing Then output.Add(ownerDoc)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Private Function externalizeVirtualComponentsFromPlan(ByVal plan As VirtualComponentExternalizePlan,
+                                                           ByRef addedCommitPaths As List(Of String)) As Boolean
+        If plan Is Nothing OrElse plan.Items Is Nothing Then Return False
+        If addedCommitPaths Is Nothing Then addedCommitPaths = New List(Of String)()
+
+        Dim externalItems As List(Of VirtualComponentExternalizeItem) = plan.Items.
+            Where(Function(item As VirtualComponentExternalizeItem)
+                      Return item IsNot Nothing AndAlso
+                             item.Handling = VirtualComponentHandlingType.SaveExternally
+                  End Function).
+            OrderByDescending(Function(item As VirtualComponentExternalizeItem) item.ComponentDepth).
+            ToList()
+
+        If externalItems.Count = 0 Then Return True
+
+        For Each item As VirtualComponentExternalizeItem In externalItems
+            If Not item.IsChecked OrElse Not item.IsValid Then
+                iSwApp.SendMsgToUser2(
+                    "A virtual-component row was not fully validated:" & vbCrLf & vbCrLf & item.DisplayName,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+        Next
+
+        Dim preparedFolders As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each item As VirtualComponentExternalizeItem In externalItems
+            Dim folderKey As String = normalizeSvnPath(item.DestinationFolder)
+            If preparedFolders.Contains(folderKey) Then Continue For
+
+            Dim folderError As String = ""
+            Dim folderMessage As String =
+                If(item.TargetType = VirtualComponentTargetType.VendorPart,
+                   "Create Vendor Parts folder for virtual component",
+                   "Create CAD folder for virtual component")
+
+            If Not prepareSvnDestinationFolderAndCommitIfNeeded(item.DestinationFolder, folderMessage, folderError) Then
+                iSwApp.SendMsgToUser2(
+                    "The destination folder for a virtual component could not be prepared in SVN." & vbCrLf & vbCrLf &
+                    item.DestinationFolder & vbCrLf & vbCrLf & folderError,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            preparedFolders.Add(folderKey)
+        Next
+
+        Dim ownerPathsToSave As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each item As VirtualComponentExternalizeItem In externalItems
+            If File.Exists(item.DestinationPath) Then
+                iSwApp.SendMsgToUser2(
+                    "Virtual component export stopped because a file already exists at:" & vbCrLf & vbCrLf &
+                    item.DestinationPath & vbCrLf & vbCrLf &
+                    "Nothing was overwritten.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            Dim saveSucceeded As Boolean = False
+
+            Try
+                saveSucceeded = item.Component.SaveVirtualComponent(item.DestinationPath)
+            Catch ex As Exception
+                iSwApp.SendMsgToUser2(
+                    "SOLIDWORKS could not save this virtual component externally:" & vbCrLf & vbCrLf &
+                    item.DisplayName & vbCrLf & vbCrLf & ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End Try
+
+            If Not saveSucceeded OrElse Not File.Exists(item.DestinationPath) Then
+                iSwApp.SendMsgToUser2(
+                    "SOLIDWORKS did not complete the external save for:" & vbCrLf & vbCrLf &
+                    item.DisplayName & vbCrLf & vbCrLf &
+                    "Requested destination:" & vbCrLf & item.DestinationPath,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            Try
+                File.SetAttributes(item.DestinationPath,
+                                   File.GetAttributes(item.DestinationPath) And Not FileAttributes.ReadOnly)
+            Catch
+            End Try
+
+            addCommitPathIfMissing(item.DestinationPath, addedCommitPaths)
+            addCommitPathIfMissing(item.OwnerAssemblyPath, addedCommitPaths)
+            ownerPathsToSave.Add(normalizeSvnPath(item.OwnerAssemblyPath))
+        Next
+
+        'Save each physical owner after all child externalizations. This persists the new
+        'references without letting the normal Save event start a second automatic commit.
+        For Each ownerPath As String In ownerPathsToSave
+            Dim ownerDocument As ModelDoc2 = getOpenModelByPathSafe(ownerPath)
+            If ownerDocument Is Nothing Then Continue For
+
+            Dim errors As Integer = 0
+            Dim warnings As Integer = 0
+            Dim saveOk As Boolean = False
+
+            beginInternalSolidWorksSave()
+            Try
+                saveOk = ownerDocument.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, errors, warnings)
+            Finally
+                endInternalSolidWorksSave()
+            End Try
+
+            If Not saveOk Then
+                iSwApp.SendMsgToUser2(
+                    "The virtual component was saved externally, but the physical owner assembly could not be saved:" & vbCrLf & vbCrLf &
+                    ownerPath & vbCrLf & vbCrLf &
+                    "SOLIDWORKS errors: " & errors.ToString() & vbCrLf &
+                    "Warnings: " & warnings.ToString() & vbCrLf & vbCrLf &
+                    "The commit was stopped so the reference change is not misreported as complete.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+        Next
+
+        Try
+            If myUserControl IsNot Nothing Then myUserControl.refreshCurrentTreeViewOnly()
+        Catch
+        End Try
+
+        Return True
+    End Function
+
+    Private Function prepareVirtualComponentsForManualCommit(ByRef commitPaths() As String) As Boolean
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return True
+
+        Dim virtualItems As List(Of VirtualComponentExternalizeItem) = collectVirtualComponentsForCommitPaths(commitPaths)
+        If virtualItems Is Nothing OrElse virtualItems.Count = 0 Then Return True
+
+        Dim reviewedPlan As VirtualComponentExternalizePlan = showVirtualComponentExternalizeTable(virtualItems)
+        If reviewedPlan Is Nothing Then Return False
+
+        'Converting a virtual component to an external file changes the physical owner
+        'assembly reference. Require the lock on each real owner, while preserving the
+        'existing first-commit exemption for brand-new assemblies.
+        Dim ownerDocs() As ModelDoc2 = getPhysicalOwnerAssemblyDocsForVirtualPlan(reviewedPlan)
+        If ownerDocs IsNot Nothing AndAlso ownerDocs.Length > 0 Then
+            If Not targetAssembliesMustBeLockedForReferenceChanges(ownerDocs) Then Return False
+        End If
+
+        Dim addedPaths As New List(Of String)()
+        If Not externalizeVirtualComponentsFromPlan(reviewedPlan, addedPaths) Then Return False
+
+        If addedPaths.Count > 0 Then
+            Dim merged As New List(Of String)()
+
+            For Each pathValue As String In commitPaths
+                addCommitPathIfMissing(pathValue, merged)
+            Next
+
+            For Each pathValue As String In addedPaths
+                addCommitPathIfMissing(pathValue, merged)
+            Next
+
+            commitPaths = merged.ToArray()
+        End If
+
+        Return True
     End Function
 
     Private Function prepareExternalReferencesForCommitPaths(ByRef commitPaths() As String) As Boolean
@@ -5454,6 +7235,241 @@ Public Module svnModule
         End Try
     End Function
 
+    Private Function getDefaultExternalReferenceDestinationFolder(ByVal modDocArr() As ModelDoc2) As String
+        If modDocArr IsNot Nothing Then
+            For Each doc As ModelDoc2 In modDocArr
+                If doc Is Nothing Then Continue For
+
+                Try
+                    If doc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+                Catch
+                    Continue For
+                End Try
+
+                Dim assemblyPath As String = ""
+
+                Try
+                    assemblyPath = doc.GetPathName()
+                Catch
+                    assemblyPath = ""
+                End Try
+
+                If String.IsNullOrWhiteSpace(assemblyPath) Then Continue For
+                If Not isPathInsideLocalRepo(assemblyPath) Then Continue For
+
+                Try
+                    Return Path.GetDirectoryName(assemblyPath)
+                Catch
+                End Try
+            Next
+        End If
+
+        Try
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+
+            If activeDoc IsNot Nothing AndAlso activeDoc.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                Dim activePath As String = activeDoc.GetPathName()
+
+                If Not String.IsNullOrWhiteSpace(activePath) AndAlso isPathInsideLocalRepo(activePath) Then
+                    Return Path.GetDirectoryName(activePath)
+                End If
+            End If
+        Catch
+        End Try
+
+        Try
+            If myUserControl IsNot Nothing AndAlso myUserControl.localRepoPath IsNot Nothing Then
+                Dim configuredPath As String = myUserControl.localRepoPath.Text
+                If Not String.IsNullOrWhiteSpace(configuredPath) Then Return configuredPath
+            End If
+        Catch
+        End Try
+
+        Return getResolvedSvnWorkingCopyRootPath()
+    End Function
+
+    Private Function buildExternalReferenceImportPlan(ByVal externalRefs As List(Of ExternalReferenceInfo),
+                                                       ByVal modDocArr() As ModelDoc2) As ExternalReferenceImportPlan
+        Dim plan As New ExternalReferenceImportPlan()
+        plan.LocalRepoRootFolder = getResolvedSvnWorkingCopyRootPath()
+        plan.DefaultGrcDestinationFolder = getDefaultExternalReferenceDestinationFolder(modDocArr)
+        plan.VendorRootFolder = getVendorPartsRootPath()
+
+        If externalRefs Is Nothing Then Return plan
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If refInfo Is Nothing Then Continue For
+
+            Dim item As New ExternalReferenceImportItem()
+            item.SourcePath = refInfo.oldPath
+            item.ProposedId = Path.GetFileNameWithoutExtension(refInfo.fileName)
+            item.TargetType = ExternalReferenceImportTargetType.GrcCad
+            item.DestinationFolder = plan.DefaultGrcDestinationFolder
+
+            'A repeated standard part is pre-classified as Vendor Part when the same
+            'filename already exists anywhere under a Vendor Parts folder. The table still
+            'shows the row and tells the user that the existing canonical file will be reused.
+            If String.Equals(Path.GetExtension(refInfo.oldPath), ".SLDPRT", StringComparison.OrdinalIgnoreCase) Then
+                Dim existingVendorPath As String = getExistingVendorPathForFileName(refInfo.fileName)
+
+                If Not String.IsNullOrWhiteSpace(existingVendorPath) AndAlso File.Exists(existingVendorPath) Then
+                    item.TargetType = ExternalReferenceImportTargetType.VendorPart
+                    item.DestinationFolder = Path.GetDirectoryName(existingVendorPath)
+                End If
+            End If
+
+            plan.Items.Add(item)
+        Next
+
+        Return plan
+    End Function
+
+    Private Function copyExternalReferencesFromReviewedPlan(ByVal externalRefs As List(Of ExternalReferenceInfo),
+                                                             ByVal plan As ExternalReferenceImportPlan) As Boolean
+        If externalRefs Is Nothing OrElse externalRefs.Count = 0 Then Return True
+        If plan Is Nothing OrElse plan.Items Is Nothing Then Return False
+
+        Dim itemsBySource As New Dictionary(Of String, ExternalReferenceImportItem)(StringComparer.OrdinalIgnoreCase)
+
+        For Each item As ExternalReferenceImportItem In plan.Items
+            If item Is Nothing OrElse String.IsNullOrWhiteSpace(item.SourcePath) Then Continue For
+            itemsBySource(normalizeSvnPath(item.SourcePath)) = item
+        Next
+
+        'Prepare every unique destination folder first. This prevents a half-copied import
+        'when the user created one or more new folders in the table's Browse dialog.
+        Dim preparedFolders As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each item As ExternalReferenceImportItem In plan.Items
+            If item Is Nothing Then Continue For
+            If Not String.IsNullOrWhiteSpace(item.ReuseExistingPath) Then Continue For
+            If String.IsNullOrWhiteSpace(item.DestinationFolder) Then Return False
+
+            Dim folderKey As String = normalizeSvnPath(item.DestinationFolder)
+            If preparedFolders.Contains(folderKey) Then Continue For
+
+            Dim folderError As String = ""
+
+            If Not prepareSvnDestinationFolderAndCommitIfNeeded(
+                item.DestinationFolder,
+                "Create referenced CAD destination folder",
+                folderError) Then
+
+                iSwApp.SendMsgToUser2(
+                    "Could not prepare the selected referenced-CAD destination in SVN:" & vbCrLf & vbCrLf &
+                    item.DestinationFolder & vbCrLf & vbCrLf &
+                    folderError,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            preparedFolders.Add(folderKey)
+        Next
+
+        For Each refInfo As ExternalReferenceInfo In externalRefs
+            If refInfo Is Nothing Then Continue For
+
+            Dim item As ExternalReferenceImportItem = Nothing
+
+            If Not itemsBySource.TryGetValue(normalizeSvnPath(refInfo.oldPath), item) OrElse item Is Nothing Then
+                iSwApp.SendMsgToUser2(
+                    "The reviewed external-reference mapping no longer matches the assembly reference list:" & vbCrLf & vbCrLf &
+                    refInfo.oldPath,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            If Not item.IsChecked OrElse Not item.IsValid Then
+                iSwApp.SendMsgToUser2(
+                    "An external-reference row was not fully validated:" & vbCrLf & vbCrLf &
+                    refInfo.oldPath,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            If Not String.IsNullOrWhiteSpace(item.ReuseExistingPath) Then
+                If Not File.Exists(item.ReuseExistingPath) Then
+                    iSwApp.SendMsgToUser2(
+                        "The existing Vendor Parts file selected for reuse is no longer available:" & vbCrLf & vbCrLf &
+                        item.ReuseExistingPath,
+                        swMessageBoxIcon_e.swMbStop,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                    Return False
+                End If
+
+                refInfo.newPath = item.ReuseExistingPath
+                Continue For
+            End If
+
+            If String.IsNullOrWhiteSpace(item.DestinationPath) Then Return False
+
+            If File.Exists(item.DestinationPath) Then
+                iSwApp.SendMsgToUser2(
+                    "A file appeared at the reviewed destination before PlumVault could copy the reference:" & vbCrLf & vbCrLf &
+                    item.DestinationPath & vbCrLf & vbCrLf &
+                    "Nothing was overwritten. Reopen the table and choose another ID or destination.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End If
+
+            Try
+                File.Copy(refInfo.oldPath, item.DestinationPath, overwrite:=False)
+            Catch ex As Exception
+                iSwApp.SendMsgToUser2(
+                    "Failed to copy referenced CAD into SVN:" & vbCrLf & vbCrLf &
+                    refInfo.oldPath & vbCrLf & vbCrLf &
+                    "Destination:" & vbCrLf & item.DestinationPath & vbCrLf & vbCrLf &
+                    ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End Try
+
+            refInfo.newPath = item.DestinationPath
+        Next
+
+        Return True
+    End Function
+
+    Private Function showExternalReferenceImportTable(ByVal externalRefs As List(Of ExternalReferenceInfo),
+                                                       ByVal modDocArr() As ModelDoc2) As ExternalReferenceImportPlan
+        Dim plan As ExternalReferenceImportPlan = buildExternalReferenceImportPlan(externalRefs, modDocArr)
+
+        Try
+            Using form As New ExternalReferenceImportForm(plan)
+                Dim owner As System.Windows.Forms.IWin32Window = getSolidWorksDialogOwner()
+                Dim result As DialogResult
+
+                If owner Is Nothing Then
+                    result = form.ShowDialog()
+                Else
+                    result = form.ShowDialog(owner)
+                End If
+
+                If result <> DialogResult.OK Then Return Nothing
+            End Using
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+                "The referenced-CAD review table could not be opened." & vbCrLf & vbCrLf & ex.Message,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return Nothing
+        End Try
+
+        Return plan
+    End Function
+
     Public Function prepareExternalReferencesForSvnAction(ByRef modDocArr() As ModelDoc2) As Boolean
         Return prepareExternalReferencesForSvnActionInternal(modDocArr, Nothing)
     End Function
@@ -5486,17 +7502,17 @@ Public Module svnModule
 
         If virtualOrTempRefs.Count > 0 Then
             Dim virtualMsg As String =
-        "This assembly contains virtual or temporary SolidWorks components." & vbCrLf & vbCrLf &
-        "These cannot be automatically added to SVN safely." & vbCrLf & vbCrLf &
-        "Virtual/temp files:" & vbCrLf
+        "This assembly contains a temporary or unresolved external SOLIDWORKS file." & vbCrLf & vbCrLf &
+        "True virtual components are allowed and inherit the owning assembly's SVN state. " &
+        "The file(s) below could not be confirmed as embedded virtual components and cannot be copied safely." & vbCrLf & vbCrLf &
+        "Temporary/unresolved files:" & vbCrLf
 
             For Each refInfo As ExternalReferenceInfo In virtualOrTempRefs
                 virtualMsg &= refInfo.fileName & vbCrLf & refInfo.oldPath & vbCrLf & vbCrLf
             Next
 
-            virtualMsg &= "Please save these as external files inside the SVN working copy first." & vbCrLf & vbCrLf &
-                  "In SolidWorks: right click the component → Save Part(in External File)." & vbCrLf & vbCrLf &
-                  "Save under:" & vbCrLf &
+            virtualMsg &= "Resolve or save these temporary references to a stable file location, then retry." & vbCrLf & vbCrLf &
+                  "SVN working copy:" & vbCrLf &
                   myUserControl.localRepoPath.Text
 
             iSwApp.SendMsgToUser2(
@@ -5508,141 +7524,26 @@ Public Module svnModule
             Return False
         End If
 
-        'Second-time vendor behavior:
-        'If the assembly still points to Downloads, but a file with the same name already exists
-        'under Vendor Parts, silently relink to that existing vendor file instead of asking again.
-        Dim refsAlreadyInVendor As New List(Of ExternalReferenceInfo)
-        Dim refsStillExternal As New List(Of ExternalReferenceInfo)
+        'Every stable external reference is shown in one review table. Repeated vendor
+        'parts are preclassified and clearly shown as reusing the existing canonical SVN file;
+        'normal GRC/CFD rows may be re-IDed and placed independently.
+        Dim reviewedPlan As ExternalReferenceImportPlan = showExternalReferenceImportTable(externalRefs, modDocArr)
+        If reviewedPlan Is Nothing Then Return False
 
-        For Each refInfo As ExternalReferenceInfo In externalRefs
-            If refInfo Is Nothing Then Continue For
-
-            Dim existingVendorPath As String = getExistingVendorPathForFileName(refInfo.fileName)
-
-            If Not String.IsNullOrWhiteSpace(existingVendorPath) AndAlso File.Exists(existingVendorPath) Then
-                refInfo.newPath = existingVendorPath
-                refsAlreadyInVendor.Add(refInfo)
-            Else
-                refsStillExternal.Add(refInfo)
-            End If
-        Next
-
-        If refsAlreadyInVendor.Count > 0 Then
-            If Not relinkExternalRefsToVaultCopies(refsAlreadyInVendor) Then Return False
-            If Not verifyExternalRefsNowPointToVaultCopies(refsAlreadyInVendor) Then Return False
-
-            For Each refInfo As ExternalReferenceInfo In refsAlreadyInVendor
-                If refInfo Is Nothing Then Continue For
-
-                If Not String.IsNullOrWhiteSpace(refInfo.oldPath) Then
-                    pendingExternalRefSkipNameCheckPaths.Add(refInfo.oldPath)
-                End If
-
-                If Not String.IsNullOrWhiteSpace(refInfo.newPath) Then
-                    pendingExternalRefSkipNameCheckPaths.Add(refInfo.newPath)
-                End If
-            Next
-        End If
-
-        externalRefs = refsStillExternal
-
-        If externalRefs.Count = 0 Then
-            'relinkExternalRefsToVaultCopies already verified and saved the assembly once.
-            'Do not perform a second full rebuild/save here.
-            Return True
-        End If
-
-        Dim msg As String =
-        "This assembly references CAD outside the SVN working copy." & vbCrLf & vbCrLf &
-        "External files:" & vbCrLf
-
-        For Each refInfo As ExternalReferenceInfo In externalRefs
-            msg &= refInfo.fileName & vbCrLf & refInfo.oldPath & vbCrLf & vbCrLf
-        Next
-
-        msg &= "Would you like to copy these files into the SVN vault and relink the assembly?"
-
-        Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
-        msg,
-        swMessageBoxIcon_e.swMbWarning,
-        swMessageBoxBtn_e.swMbYesNo
-    )
-        If response <> swMessageBoxResult_e.swMbHitYes Then Return False
-
-        Dim vendorResponse As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
-    "Is this a vendor part?" & vbCrLf & vbCrLf &
-    "Yes = save under Vendor Parts and keep the vendor file name." & vbCrLf &
-    "No = this is normal GRC27/CFD27 CAD. It cannot go under Vendor Parts and the GRC27/CFD27 naming convention will be enforced.",
-    swMessageBoxIcon_e.swMbQuestion,
-    swMessageBoxBtn_e.swMbYesNo
-)
-
-        Dim isVendorFlow As Boolean = (vendorResponse = swMessageBoxResult_e.swMbHitYes)
-
-        Dim destinationFolder As String = ""
-
-        If isVendorFlow Then
-            Dim vendorRoot As String = getVendorPartsRootPath()
-
-            Try
-                If Not Directory.Exists(vendorRoot) Then
-                    Directory.CreateDirectory(vendorRoot)
-                End If
-            Catch ex As Exception
-                iSwApp.SendMsgToUser2(
-            "Could not create Vendor Parts folder:" & vbCrLf & vbCrLf &
-            vendorRoot & vbCrLf & vbCrLf &
-            ex.Message,
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-                Return False
-            End Try
-
-            Using fbd As New FolderBrowserDialog()
-                fbd.Description = "Choose a folder under Vendor Parts for the vendor CAD."
-                fbd.SelectedPath = vendorRoot
-
-                If fbd.ShowDialog() <> DialogResult.OK Then Return False
-
-                destinationFolder = fbd.SelectedPath
-            End Using
-
-            If Not isPathInsideFolder(destinationFolder, vendorRoot) Then
-                iSwApp.SendMsgToUser2(
-            "Vendor CAD must be saved under:" & vbCrLf & vbCrLf &
-            vendorRoot,
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-                Return False
-            End If
-
-            runSvnProcess(sSVNPath, "add --parents --depth empty """ & vendorRoot & """")
-            runSvnProcess(sSVNPath, "add --parents --depth empty """ & destinationFolder & """")
-
-            addPendingDirectoryCommitPathIfNeeded(vendorRoot)
-            addPendingDirectoryCommitPathIfNeeded(destinationFolder)
-        Else
-            destinationFolder = pickVaultDestinationFolder()
-            If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
-
-            If isVendorPartPath(destinationFolder) Then
-                iSwApp.SendMsgToUser2(
-            "Normal GRC27/CFD27 CAD cannot be saved inside Vendor Parts." & vbCrLf & vbCrLf &
-            "Choose Yes on the vendor question if this is a standard/vendor part.",
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-                Return False
-            End If
-        End If
-
-        If Not copyExternalRefsToVault(externalRefs, destinationFolder, isVendorFlow) Then Return False
+        If Not copyExternalReferencesFromReviewedPlan(externalRefs, reviewedPlan) Then Return False
         If Not relinkExternalRefsToVaultCopies(externalRefs) Then Return False
         If Not verifyExternalRefsNowPointToVaultCopies(externalRefs) Then Return False
 
         Dim copiedPaths As New List(Of String)
+        Dim reusedExistingPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If reviewedPlan IsNot Nothing AndAlso reviewedPlan.Items IsNot Nothing Then
+            For Each reviewedItem As ExternalReferenceImportItem In reviewedPlan.Items
+                If reviewedItem Is Nothing Then Continue For
+                If String.IsNullOrWhiteSpace(reviewedItem.ReuseExistingPath) Then Continue For
+                reusedExistingPaths.Add(normalizeSvnPath(reviewedItem.ReuseExistingPath))
+            Next
+        End If
 
         For Each refInfo As ExternalReferenceInfo In externalRefs
             If refInfo Is Nothing Then Continue For
@@ -5652,7 +7553,10 @@ Public Module svnModule
             End If
 
             If Not String.IsNullOrWhiteSpace(refInfo.newPath) Then
-                copiedPaths.Add(refInfo.newPath)
+                If Not reusedExistingPaths.Contains(normalizeSvnPath(refInfo.newPath)) Then
+                    copiedPaths.Add(refInfo.newPath)
+                End If
+
                 pendingExternalRefSkipNameCheckPaths.Add(refInfo.newPath)
             End If
         Next
@@ -6472,6 +8376,11 @@ Public Module svnModule
         'If external CAD is found, prompt vendor vs normal CAD, copy into the proper SVN folder, relink, and commit it too.
         If Not prepareExternalReferencesForCommitPaths(sModDocPathArr) Then Exit Sub
 
+        'Manual Commit encourages virtual components to become normal external SVN files.
+        'The review table defaults to Save externally in the physical owner assembly folder,
+        'but a deliberate Keep embedded choice preserves the supported virtual workflow.
+        If Not prepareVirtualComponentsForManualCommit(sModDocPathArr) Then Exit Sub
+
         'If this is a brand-new assembly dataset, include its brand-new referenced CAD files as well.
         'This is local-only and only runs for first-commit assemblies.
         sModDocPathArr = expandFirstCommitAssemblyDatasetPaths(sModDocPathArr)
@@ -6977,7 +8886,7 @@ Public Module svnModule
                          If bAutoFirstCommitDataset Then
                              success = autoCommitFirstDatasetPathsBackground(pathsForBackground, commitMessageForBackground, savedPathForBackground, errorMessage)
                          Else
-                             success = runTortoiseProcBackgroundNoUi(tortoiseArgs, repoRootForBackground, errorMessage)
+                             success = runTortoiseProcBackgroundNoUi(tortoiseArgs, repoRootForBackground, pathsForBackground, savedPathForBackground, errorMessage)
                          End If
 
                          If success Then
@@ -7020,6 +8929,14 @@ Public Module svnModule
         End Try
 
         If Not success Then
+            'Do not leave the selected nodes looking committed when the TortoiseSVN
+            'dialog was cancelled or only some selected paths were committed.
+            Try
+                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+                refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+            Catch
+            End Try
+
             iSwApp.SendMsgToUser2("Commit did not complete." & vbCrLf & vbCrLf & errorMessage,
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk)
@@ -7095,8 +9012,117 @@ Public Module svnModule
         End Try
     End Function
 
+    Private Function verifyCommitTargetsLocallyCleanBackground(ByVal commitPaths() As String,
+                                                               ByVal workingDirectory As String,
+                                                               ByRef remainingChangesMessage As String) As Boolean
+        remainingChangesMessage = ""
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return True
+
+        Dim targets As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each rawPath As String In commitPaths
+            If String.IsNullOrWhiteSpace(rawPath) Then Continue For
+
+            Dim normalizedPath As String = rawPath
+            Try
+                normalizedPath = Path.GetFullPath(rawPath)
+            Catch
+            End Try
+
+            If seen.Add(normalizedPath) Then targets.Add(normalizedPath)
+        Next
+
+        If targets.Count = 0 Then Return True
+
+        Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+            sSVNPath,
+            "status --xml --ignore-externals --depth empty " & quoteFilePathArgs(targets.ToArray()),
+            workingDirectory
+        )
+
+        Dim statusError As String = If(statusResult.outputError, "").Trim()
+        If statusError <> "" Then
+            remainingChangesMessage = "The commit dialog closed, but PlumVault could not verify the local SVN state:" & vbCrLf & statusError
+            Return False
+        End If
+
+        Dim xmlText As String = If(statusResult.output, "").Trim()
+        If xmlText = "" Then Return True
+
+        Dim remaining As New List(Of String)()
+
+        Try
+            Dim xmlDocument As New XmlDocument()
+            xmlDocument.LoadXml(xmlText)
+
+            Dim entryNodes As XmlNodeList = xmlDocument.SelectNodes("//entry")
+
+            If entryNodes IsNot Nothing Then
+                For Each entryNode As XmlNode In entryNodes
+                    Dim wcStatus As XmlNode = entryNode.SelectSingleNode("wc-status")
+                    If wcStatus Is Nothing Then Continue For
+
+                    Dim itemState As String = ""
+                    Dim propertyState As String = ""
+
+                    If wcStatus.Attributes IsNot Nothing Then
+                        Dim itemAttribute As XmlAttribute = wcStatus.Attributes("item")
+                        Dim propsAttribute As XmlAttribute = wcStatus.Attributes("props")
+
+                        If itemAttribute IsNot Nothing Then itemState = itemAttribute.Value
+                        If propsAttribute IsNot Nothing Then propertyState = propsAttribute.Value
+                    End If
+
+                    Dim itemDirty As Boolean =
+                        Not String.IsNullOrWhiteSpace(itemState) AndAlso
+                        Not String.Equals(itemState, "normal", StringComparison.OrdinalIgnoreCase) AndAlso
+                        Not String.Equals(itemState, "none", StringComparison.OrdinalIgnoreCase) AndAlso
+                        Not String.Equals(itemState, "external", StringComparison.OrdinalIgnoreCase) AndAlso
+                        Not String.Equals(itemState, "ignored", StringComparison.OrdinalIgnoreCase)
+
+                    Dim propsDirty As Boolean =
+                        Not String.IsNullOrWhiteSpace(propertyState) AndAlso
+                        Not String.Equals(propertyState, "normal", StringComparison.OrdinalIgnoreCase) AndAlso
+                        Not String.Equals(propertyState, "none", StringComparison.OrdinalIgnoreCase)
+
+                    If itemDirty OrElse propsDirty Then
+                        Dim entryPath As String = "<selected path>"
+                        If entryNode.Attributes IsNot Nothing AndAlso entryNode.Attributes("path") IsNot Nothing Then
+                            entryPath = entryNode.Attributes("path").Value
+                        End If
+
+                        remaining.Add(Path.GetFileName(entryPath) & " [" & itemState & If(propsDirty, ", properties modified", "") & "]")
+                    End If
+                Next
+            End If
+        Catch ex As Exception
+            remainingChangesMessage = "The commit dialog closed, but PlumVault could not parse the local SVN verification result:" & vbCrLf & ex.Message
+            Return False
+        End Try
+
+        If remaining.Count = 0 Then Return True
+
+        remainingChangesMessage =
+            "The TortoiseSVN commit was cancelled, or one or more selected paths were left out of the commit." & vbCrLf & vbCrLf &
+            "Local SVN changes still remain:" & vbCrLf &
+            String.Join(vbCrLf, remaining.Take(12))
+
+        If remaining.Count > 12 Then
+            remainingChangesMessage &= vbCrLf & "...and " & (remaining.Count - 12).ToString() & " more."
+        End If
+
+        remainingChangesMessage &= vbCrLf & vbCrLf &
+            "The tree was not marked committed. Commit again or revert the remaining changes before closing."
+
+        Return False
+    End Function
+
     Private Function runTortoiseProcBackgroundNoUi(ByVal arguments As String,
                                                    ByVal repoRoot As String,
+                                                   ByVal commitPaths() As String,
+                                                   ByVal verificationWorkingDirectory As String,
                                                    ByRef errorMessage As String) As Boolean
         errorMessage = ""
 
@@ -7132,6 +9158,16 @@ Public Module svnModule
             Do While Not p.HasExited
                 System.Threading.Thread.Sleep(50)
             Loop
+
+            'TortoiseProc can close normally when the user presses Cancel, so its process
+            'exit alone is not proof of a commit. Verify only the selected paths with a
+            'local, depth-empty svn status check. This does not contact the server and is
+            'normally effectively instant.
+            Dim localVerificationMessage As String = ""
+            If Not verifyCommitTargetsLocallyCleanBackground(commitPaths, verificationWorkingDirectory, localVerificationMessage) Then
+                errorMessage = localVerificationMessage
+                Return False
+            End If
 
             Return True
         Catch ex As Exception
@@ -7668,6 +9704,40 @@ Public Module svnModule
         End Try
     End Function
 
+    Private Function pathHasLocalSvnLockTokenBackground(ByVal filePath As String,
+                                                            ByVal savedPathForBackground As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                "status --non-interactive """ & filePath.Replace("""", "") & """",
+                savedPathForBackground
+            )
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Return False
+            End If
+
+            Dim statusText As String = ""
+            If statusResult.output IsNot Nothing Then statusText = statusResult.output
+
+            Dim lines() As String = statusText.Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+                If line.Length >= 6 AndAlso line(5) = "K"c Then Return True
+            Next
+        Catch
+        End Try
+
+        Return False
+    End Function
+
     Private Function performGetLocksForPathsBackground(ByVal selectedPaths() As String,
                                                        ByVal bBreakLocks As Boolean,
                                                        ByVal sMessage As String,
@@ -7687,6 +9757,7 @@ Public Module svnModule
 
             Dim lockablePaths As New List(Of String)()
             Dim firstCommitPaths As New List(Of String)()
+            Dim alreadyLockedPaths As New List(Of String)()
 
             For Each filePath As String In filteredPaths
                 If isFirstCommitCandidatePathForAsyncLock(filePath, repoRootPathForBackground, savedPathForBackground) Then
@@ -7696,12 +9767,31 @@ Public Module svnModule
                     End Try
 
                     firstCommitPaths.Add(filePath)
+                ElseIf pathHasLocalSvnLockTokenBackground(filePath, savedPathForBackground) Then
+                    'The working copy already owns the SVN lock token. This is the stale-cache /
+                    'read-only recovery case: do not call svn lock again and do not tell the user
+                    'they must unlock/relock. Reconcile the UI and SOLIDWORKS write state instead.
+                    Try
+                        File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
+                    Catch
+                    End Try
+
+                    alreadyLockedPaths.Add(filePath)
                 Else
                     lockablePaths.Add(filePath)
                 End If
             Next
 
             If lockablePaths.Count = 0 Then
+                If alreadyLockedPaths.Count > 0 Then
+                    result.Success = True
+                    result.LockedPaths = alreadyLockedPaths.ToArray()
+                    result.IsInfoOnly = True
+                    result.Message = "You already own the selected SVN lock." & vbCrLf & vbCrLf &
+                        "PlumVault refreshed the tree and restored write access without unlocking or relocking the file."
+                    Return result
+                End If
+
                 result.IsInfoOnly = True
                 result.Message = "No SVN lock needed." & vbCrLf & vbCrLf &
                     "The selected file appears to be new and not committed yet." & vbCrLf &
@@ -7749,6 +9839,26 @@ Public Module svnModule
             Dim lockResult As rawProcessReturn = runSvnLockForPathsBackground(lockablePaths.ToArray(), bBreakLocks, sMessage, savedPathForBackground)
 
             If lockResult.outputError IsNot Nothing AndAlso lockResult.outputError.Trim() <> "" Then
+                'One final local-token reconciliation handles the race where the cache said
+                'unlocked but SVN reports that this same working copy already owns the lock.
+                Dim recoveredAlreadyLocked As New List(Of String)()
+
+                For Each filePath As String In lockablePaths
+                    If pathHasLocalSvnLockTokenBackground(filePath, savedPathForBackground) Then
+                        recoveredAlreadyLocked.Add(filePath)
+                    End If
+                Next
+
+                If recoveredAlreadyLocked.Count = lockablePaths.Count Then
+                    alreadyLockedPaths.AddRange(recoveredAlreadyLocked)
+                    result.Success = True
+                    result.LockedPaths = alreadyLockedPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                    result.IsInfoOnly = True
+                    result.Message = "You already own the selected SVN lock." & vbCrLf & vbCrLf &
+                        "PlumVault reconciled the stale lock display and restored write access."
+                    Return result
+                End If
+
                 result.IsWarning = True
                 result.Message = "Locking failed." & vbCrLf & vbCrLf & lockResult.outputError.Trim()
                 Return result
@@ -7776,7 +9886,11 @@ Public Module svnModule
             Next
 
             result.Success = True
-            result.LockedPaths = lockablePaths.ToArray()
+
+            Dim allOwnedPaths As New List(Of String)()
+            allOwnedPaths.AddRange(alreadyLockedPaths)
+            allOwnedPaths.AddRange(lockablePaths)
+            result.LockedPaths = allOwnedPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
             Return result
 
         Catch ex As Exception
@@ -9254,7 +11368,7 @@ Public Module svnModule
         'Prepare both destinations before the table opens. This supports folders
         'created in Windows Explorer and ensures empty folders are actually added
         'and committed to SVN before Pack and Go writes CAD files into them.
-        If Not prepareLegacyDestinationFolderForReview(
+        If Not prepareSvnDestinationFolderAndCommitIfNeeded(
             selectedGrcDestination,
             "Create legacy CAD import destination",
             errorMessage) Then
@@ -9266,7 +11380,7 @@ Public Module svnModule
             Exit Sub
         End If
 
-        If Not prepareLegacyDestinationFolderForReview(
+        If Not prepareSvnDestinationFolderAndCommitIfNeeded(
             automaticVendorDestination,
             "Create Vendor Parts folder",
             errorMessage) Then
@@ -9734,10 +11848,11 @@ Public Module svnModule
         End If
 
         If item.IsVirtualComponent OrElse isVirtualComponent Then
+            result.IsValid = True
+            result.FinalFileName = item.OriginalFileName
+            result.DestinationPath = ""
             result.Message =
-                "This is a SOLIDWORKS virtual component. Pack and Go cannot rename a virtual component. " &
-                "In the source assembly, save this virtual component to an external SLDPRT/SLDASM file first, " &
-                "then reopen Copy Legacy Data to SVN."
+                "Virtual component retained inside its owning assembly. It does not receive a separate SVN filename, lock, or commit."
             Return result
         End If
 
@@ -9987,20 +12102,6 @@ Public Module svnModule
             Return False
         End If
 
-        Dim virtualItems As LegacyImportItem() = plan.Items.
-            Where(Function(item) item IsNot Nothing AndAlso item.IsVirtualComponent).
-            ToArray()
-
-        If virtualItems.Length > 0 Then
-            errorMessage =
-                "The import contains SOLIDWORKS virtual components, which Pack and Go cannot rename." & vbCrLf & vbCrLf &
-                stringArrToSingleStringWithNewLines(virtualItems.Select(Function(item) item.OriginalFileName).ToArray(),
-                                                    bTrimFileNames:=False,
-                                                    iLimit:=12) & vbCrLf &
-                "Save these virtual components externally from the source assembly, then reopen Legacy Import."
-            Return False
-        End If
-
         'Refresh the repo filename/ID cache once immediately before the authoritative check.
         plan.ExistingRepoFileNames = getExistingRepoCadFileNamesForLegacyImport()
         plan.ExistingRepoModelIds = getExistingRepoModelIdsForLegacyImport()
@@ -10056,7 +12157,16 @@ Public Module svnModule
                 Return False
             End If
 
-            saveToNames(i) = itemBySource(sourceKey).DestinationPath
+            Dim mappedItem As LegacyImportItem = itemBySource(sourceKey)
+
+            If mappedItem.IsVirtualComponent Then
+                'A virtual component must remain represented in the Pack and Go array,
+                'and SOLIDWORKS does not allow its filename to be changed. Preserve the
+                'original Pack and Go entry so it remains embedded in its owning assembly.
+                saveToNames(i) = currentSourceNames(i)
+            Else
+                saveToNames(i) = mappedItem.DestinationPath
+            End If
         Next
 
         Dim outputFiles() As String = plan.Items.
@@ -10065,8 +12175,10 @@ Public Module svnModule
             Distinct(StringComparer.OrdinalIgnoreCase).
             ToArray()
 
-        If outputFiles.Length <> plan.Items.Count Then
-            errorMessage = "Two or more table rows resolve to the same final path."
+        Dim physicalOutputItemCount As Integer = plan.Items.Where(Function(item) item IsNot Nothing AndAlso Not item.IsVirtualComponent).Count()
+
+        If outputFiles.Length <> physicalOutputItemCount Then
+            errorMessage = "Two or more physical table rows resolve to the same final path."
             Return False
         End If
 
@@ -10112,6 +12224,7 @@ Public Module svnModule
             End Try
 
             Dim duplicateDestination As String = saveToNames.
+                Where(Function(value) Not String.IsNullOrWhiteSpace(value)).
                 GroupBy(Function(value) normalizeLegacyFolderPath(value), StringComparer.OrdinalIgnoreCase).
                 Where(Function(groupValue) groupValue.Count() > 1).
                 Select(Function(groupValue) groupValue.Key).
@@ -10125,24 +12238,10 @@ Public Module svnModule
             Dim saveNamesObject As Object = saveToNames
 
             If Not packAndGo.SetDocumentSaveToNames(saveNamesObject) Then
-                Dim suspectedVirtual As String() = currentSourceNames.
-                    Where(Function(sourceName) isLegacyVirtualSourcePath(sourceName, Nothing)).
-                    Select(Function(sourceName) Path.GetFileName(sourceName)).
-                    Distinct(StringComparer.OrdinalIgnoreCase).
-                    ToArray()
-
                 errorMessage =
                     "SOLIDWORKS rejected one or more proposed Pack and Go destination names." & vbCrLf & vbCrLf &
-                    "SOLIDWORKS requires the destination array to match the Pack and Go list exactly, does not allow duplicate destination names, " &
-                    "and does not allow a virtual component to be renamed."
-
-                If suspectedVirtual.Length > 0 Then
-                    errorMessage &= vbCrLf & vbCrLf &
-                        "Likely virtual component(s):" & vbCrLf &
-                        stringArrToSingleStringWithNewLines(suspectedVirtual, bTrimFileNames:=False, iLimit:=12) &
-                        "Save these components externally in the source assembly, then reopen Legacy Import."
-                End If
-
+                    "The destination array must match the Pack and Go list exactly and physical destination filenames must be unique. " &
+                    "Virtual-component entries keep their original filenames so they remain embedded in their owning assemblies."
                 Return False
             End If
 
@@ -10225,13 +12324,8 @@ Public Module svnModule
             Return False
         End If
 
-        Dim grcLockPaths() As String = plan.Items.
-            Where(Function(item) item.TargetType <> LegacyImportTargetType.VendorPart).
-            Select(Function(item) item.DestinationPath).
-            Where(Function(pathValue) File.Exists(pathValue) AndAlso isCadFilePath(pathValue)).
-            Distinct(StringComparer.OrdinalIgnoreCase).
-            ToArray()
-
+        'Legacy imports intentionally finish unlocked. Imported CAD remains read-only
+        'until a user explicitly chooses Get Locks from PlumVault.
         Dim topImportedPath As String = ""
         Dim topItem As LegacyImportItem = plan.Items.FirstOrDefault(Function(item) pathsAreSame(item.SourcePath, plan.SourceTopAssemblyPath))
         If topItem IsNot Nothing Then topImportedPath = topItem.DestinationPath
@@ -10248,7 +12342,6 @@ Public Module svnModule
         startLegacyImportCommitBackground(
             commitTargetsFile,
             outputFiles,
-            grcLockPaths,
             topImportedPath,
             "Legacy CAD import: " & Path.GetFileNameWithoutExtension(plan.SourceTopAssemblyPath))
 
@@ -10257,14 +12350,12 @@ Public Module svnModule
 
     Private Sub startLegacyImportCommitBackground(ByVal commitTargetsFile As String,
                                                   ByVal importedCadPaths() As String,
-                                                  ByVal grcLockPaths() As String,
                                                   ByVal topImportedAssemblyPath As String,
                                                   ByVal commitMessage As String)
         If String.IsNullOrWhiteSpace(commitTargetsFile) OrElse Not File.Exists(commitTargetsFile) Then Exit Sub
 
         Dim targetsFileForBackground As String = commitTargetsFile
         Dim cadPathsForCompletion() As String = If(importedCadPaths Is Nothing, Nothing, CType(importedCadPaths.Clone(), String()))
-        Dim lockPathsForCompletion() As String = If(grcLockPaths Is Nothing, Nothing, CType(grcLockPaths.Clone(), String()))
         Dim safeMessage As String = If(commitMessage, "Legacy CAD import").Replace("""", "'")
         Dim savedPathForBackground As String = ""
 
@@ -10311,7 +12402,6 @@ Public Module svnModule
                                 Sub()
                                     finishLegacyImportCommitOnMainThread(
                                         cadPathsForCompletion,
-                                        lockPathsForCompletion,
                                         topImportedAssemblyPath,
                                         success,
                                         backgroundError)
@@ -10326,7 +12416,6 @@ Public Module svnModule
     End Sub
 
     Private Sub finishLegacyImportCommitOnMainThread(ByVal importedCadPaths() As String,
-                                                     ByVal grcLockPaths() As String,
                                                      ByVal topImportedAssemblyPath As String,
                                                      ByVal success As Boolean,
                                                      ByVal errorMessage As String)
@@ -10376,22 +12465,13 @@ Public Module svnModule
             message &= vbCrLf & vbCrLf & "Imported top assembly:" & vbCrLf & topImportedAssemblyPath
         End If
 
-        If grcLockPaths IsNot Nothing AndAlso grcLockPaths.Length > 0 Then
-            message &= vbCrLf & vbCrLf &
-                "PlumVault will now get locks on the imported GRC files. Vendor parts remain unlocked and read-only."
-        End If
+        message &= vbCrLf & vbCrLf &
+            "Imported files remain unlocked and read-only. Use Get Locks only on the files you intend to edit."
 
         iSwApp.SendMsgToUser2(
             message,
             swMessageBoxIcon_e.swMbInformation,
             swMessageBoxBtn_e.swMbOk)
-
-        If grcLockPaths IsNot Nothing AndAlso grcLockPaths.Length > 0 Then
-            Try
-                getLocksOfPathsAsync(grcLockPaths, bBreakLocks:=False, bUseTortoise:=False, sMessage:="Auto-lock after legacy import")
-            Catch
-            End Try
-        End If
 
         processPendingAutomaticSaveCommits()
     End Sub
@@ -10448,7 +12528,7 @@ Public Module svnModule
             ToArray()
     End Function
 
-    Private Function prepareLegacyDestinationFolderForReview(ByVal folderPath As String,
+    Private Function prepareSvnDestinationFolderAndCommitIfNeeded(ByVal folderPath As String,
                                                              ByVal commitMessage As String,
                                                              ByRef errorMessage As String) As Boolean
         errorMessage = ""

@@ -1836,6 +1836,26 @@ Public Class UserControl1
         'If there is no batch selection, this helper falls back to the exact single tree node.
         Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
 
+        'A brand-new document has no physical path yet, so the normal path-first Commit
+        'workflow cannot act on it. When there is no explicit tree selection, Commit now
+        'starts the same controlled naming, Save As, folder preparation, and automatic
+        'first-commit workflow used by Save/Ctrl+S.
+        If selectedTreePaths Is Nothing OrElse selectedTreePaths.Length = 0 Then
+            Dim activePath As String = ""
+
+            Try
+                activePath = modDoc.GetPathName()
+            Catch
+                activePath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(activePath) Then
+                svnModule.startNewDocumentFirstSaveFromCommitPublic()
+                updateStatusStrip()
+                Exit Sub
+            End If
+        End If
+
         If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
             tortCommitPathsAsync(selectedTreePaths)
         Else
@@ -2010,20 +2030,23 @@ Public Class UserControl1
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
 
             If rootNode IsNot Nothing Then
-                loadOneExtraLazyLevelForSync(rootNode)
+                'Original lazy-sync boundary: load the root's immediate children only,
+                'then Sync those Level-1 files. Do not expand or Sync Level 2.
+                loadImmediateChildrenForNode(rootNode)
                 syncPaths = collectImmediateChildCadPathsForSync(rootNode)
             End If
 
             If debugWatch IsNot Nothing Then
-                debugNotes.Add("Default Level-1/Level-2 load/collect: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+                debugNotes.Add("Default Level-1 load/collect: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
             End If
         Else
-            'Selected Level 0 -> sync selected node + Level 1 + Level 2.
-            'Selected Level 1 -> sync selected node + Level 2 + Level 3.
-            'This deliberately loads only one extra lazy level below the old behavior, not the whole tree.
+            'Original lazy-sync boundary:
+            'Selected Level 0 -> selected file + Level 1 only.
+            'Selected Level 1 -> selected file + Level 2 only.
+            'No deeper descendants are loaded or server-checked by normal Sync.
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
 
-            loadOneExtraLazyLevelForSync(selectedNode)
+            loadImmediateChildrenForNode(selectedNode)
             syncPaths = collectSelectedBranchCadPathsForSync(selectedNode)
 
             If debugWatch IsNot Nothing Then
@@ -2309,25 +2332,19 @@ Public Class UserControl1
         Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         If selectedNode IsNot Nothing Then
-            'Selected branch sync is intentionally bounded:
-            'selected node + loaded direct children + loaded grandchildren only.
-            'It does not recurse forever, so it will not accidentally become whole-car sync.
+            'Selected branch Sync is intentionally bounded to exactly one tree level:
+            'the selected file plus its immediate children. It never includes grandchildren.
             addTreeNodePathToSyncList(selectedNode, seen, output)
 
             For Each childNode As TreeNode In selectedNode.Nodes
                 If isLazyPlaceholderNode(childNode) Then Continue For
                 addTreeNodePathToSyncList(childNode, seen, output)
-
-                For Each grandChildNode As TreeNode In childNode.Nodes
-                    If isLazyPlaceholderNode(grandChildNode) Then Continue For
-                    addTreeNodePathToSyncList(grandChildNode, seen, output)
-                Next
             Next
         End If
 
         'Never fall back to collectCurrentTreeCadPaths() here.
-        'That fallback turns a failed/empty selected-branch sync into a whole loaded-tree sync,
-        'which breaks the controlled Level 0 / Level 1 / Level 2 / Level 3 sync behavior.
+        'That fallback turns a failed/empty selected-branch Sync into a whole loaded-tree Sync
+        'and breaks the controlled lazy boundary.
         If output.Count = 0 Then Return Nothing
 
         Return output.ToArray()
@@ -2337,17 +2354,11 @@ Public Class UserControl1
         Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
         If parentNode IsNot Nothing Then
-            'Default/no-selection sync stays bounded to one level lower than before:
-            'direct children + loaded grandchildren only. It does not include the root node
-            'and it does not recurse through the whole car.
+            'Default/no-selection Sync includes the root's immediate children only.
+            'It does not include the root itself and never includes grandchildren.
             For Each childNode As TreeNode In parentNode.Nodes
                 If isLazyPlaceholderNode(childNode) Then Continue For
                 addTreeNodePathToSyncList(childNode, seen, output)
-
-                For Each grandChildNode As TreeNode In childNode.Nodes
-                    If isLazyPlaceholderNode(grandChildNode) Then Continue For
-                    addTreeNodePathToSyncList(grandChildNode, seen, output)
-                Next
             Next
         End If
 
@@ -2438,11 +2449,29 @@ Public Class UserControl1
 
         Try
             If TypeOf node.Tag Is ModelDoc2 Then
-                Return CType(node.Tag, ModelDoc2).GetPathName()
+                Dim model As ModelDoc2 = CType(node.Tag, ModelDoc2)
+
+                'When a virtual component is opened in its own SOLIDWORKS window, the root
+                'tree node is tagged with the virtual ModelDoc2 rather than Component2. Its
+                'temporary/internal path is not an SVN file; resolve every action and status
+                'display to the nearest physical owning assembly instead.
+                Dim ownerDocument As ModelDoc2 = getOwningPhysicalAssemblyDocumentForVirtualModel(model)
+                If ownerDocument IsNot Nothing Then Return getSafeModelPath(ownerDocument)
+
+                Return model.GetPathName()
             End If
 
             If TypeOf node.Tag Is Component2 Then
-                Return CType(node.Tag, Component2).GetPathName()
+                Dim component As Component2 = CType(node.Tag, Component2)
+
+                'Virtual components do not have an independent SVN file. Their editable
+                'content is stored in the nearest physical owning assembly, so every
+                'tree action resolves to that assembly path.
+                If isComponentVirtualSafe(component) Then
+                    Return getPhysicalOwnerAssemblyPathForTreeNode(node)
+                End If
+
+                Return getSafeComponentPath(component)
             End If
         Catch
         End Try
@@ -2462,7 +2491,15 @@ Public Class UserControl1
             Return False
         End Try
 
-        Return ext = ".SLDPRT" OrElse ext = ".SLDASM" OrElse ext = ".SLDDRW"
+        If ext <> ".SLDPRT" AndAlso ext <> ".SLDASM" AndAlso ext <> ".SLDDRW" Then Return False
+
+        'External CAD remains visible in the tree, but it has no SVN server status to
+        'synchronize. Skip it silently so one unmanaged reference never blocks Sync.
+        Try
+            Return svnModule.shouldIncludeCadPathInSyncPublic(filePath)
+        Catch
+            Return False
+        End Try
     End Function
 
     Private Function getSelectedTreeCadPathForFileAction() As String
@@ -2962,6 +2999,298 @@ Public Class UserControl1
         End Try
     End Function
 
+    Private Function isComponentVirtualSafe(ByVal comp As Component2) As Boolean
+        If comp Is Nothing Then Return False
+
+        Try
+            Return comp.IsVirtual
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function getPhysicalAssemblyPathFromComponent(ByVal comp As Component2) As String
+        If comp Is Nothing Then Return ""
+        If isComponentVirtualSafe(comp) Then Return ""
+
+        Dim componentPath As String = getSafeComponentPath(comp)
+        If String.IsNullOrWhiteSpace(componentPath) Then Return ""
+
+        Try
+            If Not String.Equals(Path.GetExtension(componentPath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then Return ""
+            If Not File.Exists(componentPath) Then Return ""
+            Return Path.GetFullPath(componentPath)
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Function getPhysicalOwnerAssemblyPathForComponent(ByVal comp As Component2,
+                                                               Optional ByVal fallbackDocument As ModelDoc2 = Nothing) As String
+        If comp Is Nothing Then Return ""
+
+        Dim currentComponent As Component2 = Nothing
+
+        Try
+            currentComponent = comp.GetParent()
+        Catch
+            currentComponent = Nothing
+        End Try
+
+        Dim guard As Integer = 0
+
+        While currentComponent IsNot Nothing AndAlso guard < 100
+            guard += 1
+
+            Dim assemblyPath As String = getPhysicalAssemblyPathFromComponent(currentComponent)
+            If Not String.IsNullOrWhiteSpace(assemblyPath) Then Return assemblyPath
+
+            Try
+                currentComponent = currentComponent.GetParent()
+            Catch
+                currentComponent = Nothing
+            End Try
+        End While
+
+        'A top-level virtual component has no Component2 parent. In that case its
+        'physical owner is the active top-level assembly.
+        Dim candidates As New List(Of ModelDoc2)()
+        If fallbackDocument IsNot Nothing Then candidates.Add(fallbackDocument)
+
+        Try
+            Dim activeDocument As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDocument IsNot Nothing AndAlso Not candidates.Contains(activeDocument) Then
+                candidates.Add(activeDocument)
+            End If
+        Catch
+        End Try
+
+        For Each candidate As ModelDoc2 In candidates
+            If candidate Is Nothing Then Continue For
+
+            Try
+                If candidate.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+
+                Dim candidatePath As String = candidate.GetPathName()
+                If String.IsNullOrWhiteSpace(candidatePath) Then Continue For
+                If Not File.Exists(candidatePath) Then Continue For
+
+                Return Path.GetFullPath(candidatePath)
+            Catch
+            End Try
+        Next
+
+        Return ""
+    End Function
+
+    Private Function getPhysicalOwnerAssemblyPathForTreeNode(ByVal node As TreeNode) As String
+        If node Is Nothing Then Return ""
+
+        'The tree hierarchy is the most reliable owner map, including nested virtual
+        'subassemblies. Walk upward until a real file-backed assembly is found.
+        Dim parentNode As TreeNode = node.Parent
+        Dim guard As Integer = 0
+
+        While parentNode IsNot Nothing AndAlso guard < 100
+            guard += 1
+
+            Try
+                If TypeOf parentNode.Tag Is ModelDoc2 Then
+                    Dim parentDocument As ModelDoc2 = CType(parentNode.Tag, ModelDoc2)
+
+                    If parentDocument.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                        Dim parentPath As String = parentDocument.GetPathName()
+
+                        If Not String.IsNullOrWhiteSpace(parentPath) AndAlso File.Exists(parentPath) Then
+                            Return Path.GetFullPath(parentPath)
+                        End If
+                    End If
+                ElseIf TypeOf parentNode.Tag Is Component2 Then
+                    Dim parentComponent As Component2 = CType(parentNode.Tag, Component2)
+                    Dim parentPath As String = getPhysicalAssemblyPathFromComponent(parentComponent)
+
+                    If Not String.IsNullOrWhiteSpace(parentPath) Then Return parentPath
+                End If
+            Catch
+            End Try
+
+            parentNode = parentNode.Parent
+        End While
+
+        Try
+            If TypeOf node.Tag Is Component2 Then
+                Return getPhysicalOwnerAssemblyPathForComponent(CType(node.Tag, Component2), TryCast(iSwApp.ActiveDoc, ModelDoc2))
+            End If
+        Catch
+        End Try
+
+        Return ""
+    End Function
+
+    Private Function getOpenDocumentByPathSafe(ByVal filePath As String) As ModelDoc2
+        If String.IsNullOrWhiteSpace(filePath) Then Return Nothing
+
+        Try
+            Dim openDocument As ModelDoc2 = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
+            If openDocument IsNot Nothing Then Return openDocument
+        Catch
+        End Try
+
+        Try
+            Dim activeDocument As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDocument Is Nothing Then Return Nothing
+
+            Dim activePath As String = activeDocument.GetPathName()
+            If String.IsNullOrWhiteSpace(activePath) Then Return Nothing
+
+            If String.Equals(Path.GetFullPath(activePath), Path.GetFullPath(filePath), StringComparison.OrdinalIgnoreCase) Then
+                Return activeDocument
+            End If
+        Catch
+        End Try
+
+        Return Nothing
+    End Function
+
+    Private Function getOwningPhysicalAssemblyDocumentForVirtualModel(ByVal possibleVirtualDocument As ModelDoc2) As ModelDoc2
+        If possibleVirtualDocument Is Nothing OrElse iSwApp Is Nothing Then Return Nothing
+
+        Dim possiblePath As String = getSafeModelPath(possibleVirtualDocument)
+        Dim possibleTitle As String = ""
+
+        Try
+            possibleTitle = possibleVirtualDocument.GetTitle()
+        Catch
+            possibleTitle = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(possiblePath) AndAlso
+           File.Exists(possiblePath) AndAlso
+           possiblePath.IndexOf("\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) < 0 AndAlso
+           Not Path.GetFileName(possiblePath).Contains("^") Then
+            Return Nothing
+        End If
+
+        Dim documentsObject As Object = Nothing
+
+        Try
+            documentsObject = iSwApp.GetDocuments()
+        Catch
+            documentsObject = Nothing
+        End Try
+
+        Dim documentsArray As Array = TryCast(documentsObject, Array)
+        If documentsArray Is Nothing Then Return Nothing
+
+        For Each documentObject As Object In documentsArray
+            Dim assemblyModel As ModelDoc2 = TryCast(documentObject, ModelDoc2)
+            If assemblyModel Is Nothing Then Continue For
+
+            Try
+                If assemblyModel.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            Dim assemblyDocument As AssemblyDoc = TryCast(assemblyModel, AssemblyDoc)
+            If assemblyDocument Is Nothing Then Continue For
+
+            Dim componentsObject As Object = Nothing
+
+            Try
+                componentsObject = assemblyDocument.GetComponents(False)
+            Catch
+                componentsObject = Nothing
+            End Try
+
+            Dim componentsArray As Array = TryCast(componentsObject, Array)
+            If componentsArray Is Nothing Then Continue For
+
+            For Each componentObject As Object In componentsArray
+                Dim component As Component2 = TryCast(componentObject, Component2)
+                If component Is Nothing OrElse Not isComponentVirtualSafe(component) Then Continue For
+
+                Dim componentDocument As ModelDoc2 = Nothing
+                Dim matches As Boolean = False
+
+                Try
+                    componentDocument = TryCast(component.GetModelDoc2(), ModelDoc2)
+                    matches = componentDocument IsNot Nothing AndAlso Object.ReferenceEquals(componentDocument, possibleVirtualDocument)
+                Catch
+                    componentDocument = Nothing
+                    matches = False
+                End Try
+
+                If Not matches AndAlso componentDocument IsNot Nothing Then
+                    Dim componentPath As String = getSafeModelPath(componentDocument)
+                    Dim componentTitle As String = ""
+
+                    Try
+                        componentTitle = componentDocument.GetTitle()
+                    Catch
+                        componentTitle = ""
+                    End Try
+
+                    If Not String.IsNullOrWhiteSpace(possiblePath) AndAlso Not String.IsNullOrWhiteSpace(componentPath) Then
+                        Try
+                            matches = String.Equals(Path.GetFullPath(componentPath), Path.GetFullPath(possiblePath), StringComparison.OrdinalIgnoreCase)
+                        Catch
+                            matches = String.Equals(componentPath, possiblePath, StringComparison.OrdinalIgnoreCase)
+                        End Try
+                    ElseIf Not String.IsNullOrWhiteSpace(possibleTitle) AndAlso
+                           possibleTitle.Contains("^") AndAlso
+                           Not String.IsNullOrWhiteSpace(componentTitle) Then
+                        matches = String.Equals(componentTitle, possibleTitle, StringComparison.OrdinalIgnoreCase)
+                    End If
+                End If
+
+                If matches Then
+                    Dim ownerPath As String = getPhysicalOwnerAssemblyPathForComponent(component, assemblyModel)
+                    Return getOpenDocumentByPathSafe(ownerPath)
+                End If
+            Next
+        Next
+
+        Return Nothing
+    End Function
+
+    Private Function distinctModelDocsByPhysicalPath(ByVal inputDocs() As ModelDoc2) As ModelDoc2()
+        If inputDocs Is Nothing Then Return Nothing
+
+        Dim output As New List(Of ModelDoc2)()
+        Dim seenPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each inputDoc As ModelDoc2 In inputDocs
+            If inputDoc Is Nothing Then Continue For
+
+            Dim inputPath As String = ""
+
+            Try
+                inputPath = inputDoc.GetPathName()
+            Catch
+                inputPath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(inputPath) Then
+                If Not output.Contains(inputDoc) Then output.Add(inputDoc)
+                Continue For
+            End If
+
+            Try
+                inputPath = Path.GetFullPath(inputPath)
+            Catch
+            End Try
+
+            If seenPaths.Contains(inputPath) Then Continue For
+
+            seenPaths.Add(inputPath)
+            output.Add(inputDoc)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
     Private Function isComponentSuppressedState(ByVal suppressionState As Integer) As Boolean
         Return suppressionState = swComponentSuppressionState_e.swComponentSuppressed
     End Function
@@ -2974,18 +3303,30 @@ Public Class UserControl1
     Private Function buildComponentNodeText(ByVal comp As Component2, ByVal modDoc As ModelDoc2) As String
         Dim compPath As String = getSafeComponentPath(comp)
         Dim nodeText As String = ""
+        Dim isVirtual As Boolean = isComponentVirtualSafe(comp)
 
-        If Not String.IsNullOrWhiteSpace(compPath) Then
+        If isVirtual Then
+            'Use the SOLIDWORKS component name rather than its temporary/internal path.
+            Try
+                nodeText = comp.Name2
+            Catch
+                nodeText = ""
+            End Try
+        End If
+
+        If String.IsNullOrWhiteSpace(nodeText) AndAlso Not String.IsNullOrWhiteSpace(compPath) Then
             nodeText = System.IO.Path.GetFileName(compPath)
-        ElseIf modDoc IsNot Nothing Then
+        ElseIf String.IsNullOrWhiteSpace(nodeText) AndAlso modDoc IsNot Nothing Then
             Try
                 nodeText = modDoc.GetTitle()
             Catch
                 nodeText = "<unknown component>"
             End Try
-        Else
+        ElseIf String.IsNullOrWhiteSpace(nodeText) Then
             nodeText = "<unknown component>"
         End If
+
+        If isVirtual Then nodeText &= " [Virtual]"
 
         Dim suppressionState As Integer = getSafeComponentSuppression(comp)
 
@@ -3039,17 +3380,7 @@ Public Class UserControl1
         If node Is Nothing Then Return False
         If String.IsNullOrWhiteSpace(filePath) Then Return False
 
-        Dim nodePath As String = ""
-
-        Try
-            If TypeOf node.Tag Is Component2 Then
-                nodePath = CType(node.Tag, Component2).GetPathName()
-            ElseIf TypeOf node.Tag Is ModelDoc2 Then
-                nodePath = CType(node.Tag, ModelDoc2).GetPathName()
-            End If
-        Catch
-            nodePath = ""
-        End Try
+        Dim nodePath As String = getCadPathFromTreeNode(node)
 
         If String.IsNullOrWhiteSpace(nodePath) Then Return False
 
@@ -3110,10 +3441,11 @@ Public Class UserControl1
             Catch
             End Try
 
+            Dim componentIsVirtual As Boolean = isComponentVirtualSafe(comp)
             Dim compPath As String = getSafeComponentPath(comp)
-            If String.IsNullOrWhiteSpace(compPath) Then Continue For
+            If String.IsNullOrWhiteSpace(compPath) AndAlso Not componentIsVirtual Then Continue For
 
-            If treeContainsPath(rootNode, compPath) Then Continue For
+            If Not componentIsVirtual AndAlso treeContainsPath(rootNode, compPath) Then Continue For
 
             Dim suppressionState As Integer = getSafeComponentSuppression(comp)
             Dim compDoc As ModelDoc2 = Nothing
@@ -3133,7 +3465,7 @@ Public Class UserControl1
                 End Try
             End If
 
-            If compDoc IsNot Nothing Then
+            If compDoc IsNot Nothing AndAlso Not componentIsVirtual Then
                 addModelDocIfMissing(mdComponentList, compDoc, bUniqueOnly)
             End If
 
@@ -3323,7 +3655,7 @@ Public Class UserControl1
             End Try
         End If
 
-        If modDocParent IsNot Nothing Then
+        If modDocParent IsNot Nothing AndAlso Not isComponentVirtualSafe(swComp) Then
             addModelDocIfMissing(mdComponentList, modDocParent, bUniqueOnly)
         End If
 
@@ -3361,6 +3693,7 @@ Public Class UserControl1
             Catch
             End Try
 
+            Dim childIsVirtual As Boolean = isComponentVirtualSafe(swChildComp)
             Dim childPath As String = getSafeComponentPath(swChildComp)
             Dim childSuppression As Integer = getSafeComponentSuppression(swChildComp)
 
@@ -3400,7 +3733,7 @@ Public Class UserControl1
             If childIsAssembly AndAlso modDocChild IsNot Nothing Then
 
                 If bUC AndAlso iTreeDepthLimit >= 0 AndAlso nLevel >= iTreeDepthLimit Then
-                    addModelDocIfMissing(mdComponentList, modDocChild, bUniqueOnly)
+                    If Not childIsVirtual Then addModelDocIfMissing(mdComponentList, modDocChild, bUniqueOnly)
 
                     childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
                     childNode.Tag = swChildComp
@@ -3411,7 +3744,7 @@ Public Class UserControl1
                     Continue For
                 End If
 
-                If bUniqueOnly AndAlso modelDocListContainsPath(mdComponentList, getSafeModelPath(modDocChild)) Then
+                If Not childIsVirtual AndAlso bUniqueOnly AndAlso modelDocListContainsPath(mdComponentList, getSafeModelPath(modDocChild)) Then
                     If bUC Then
                         childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
                         childNode.Tag = swChildComp
@@ -3427,7 +3760,7 @@ Public Class UserControl1
 
             Else
 
-                If modDocChild IsNot Nothing Then
+                If modDocChild IsNot Nothing AndAlso Not childIsVirtual Then
                     addModelDocIfMissing(mdComponentList, modDocChild, bUniqueOnly)
                 End If
 
@@ -3708,6 +4041,11 @@ Public Class UserControl1
         If TypeOf rootNode.Tag Is Component2 Then
             comp = CType(rootNode.Tag, Component2)
 
+            If isComponentVirtualSafe(comp) Then
+                'Context-menu actions on a virtual node operate on its physical owner.
+                Return getOpenDocumentByPathSafe(getCadPathFromTreeNode(rootNode))
+            End If
+
             Try
                 Dim suppressionState As Integer = comp.GetSuppression2()
 
@@ -3726,7 +4064,14 @@ Public Class UserControl1
             End Try
 
         ElseIf TypeOf rootNode.Tag Is ModelDoc2 Then
-            Return CType(rootNode.Tag, ModelDoc2)
+            Dim model As ModelDoc2 = CType(rootNode.Tag, ModelDoc2)
+            Dim ownerDocument As ModelDoc2 = getOwningPhysicalAssemblyDocumentForVirtualModel(model)
+
+            'A virtual component opened in position inherits its physical assembly's lock,
+            'commit, and SVN status. Returning the owner also keeps context-menu actions from
+            'sending the virtual AppData/internal path to SVN.
+            If ownerDocument IsNot Nothing Then Return ownerDocument
+            Return model
         End If
 
         Return Nothing
@@ -3743,7 +4088,8 @@ Public Class UserControl1
             " [Syncing",
             " [Committing",
             " [Saving to SVN",
-            " [Pending"
+            " [Pending",
+            " [Not in SVN]"
         }
 
         For Each suffix As String In knownSuffixes
@@ -4189,26 +4535,35 @@ Public Class UserControl1
         'Selected/highlighted nodes still draw white through TreeView1_DrawNode.
         rootNode.ForeColor = normalTreeTextColor()
 
-        If modDoc IsNot Nothing Then
-            status1 = findStatusForFile(modDoc.GetPathName())
-        Else
-            Dim nodeFilePath As String = ""
+        Dim nodeFilePath As String = ""
 
-            Try
-                If TypeOf rootNode.Tag Is Component2 Then
-                    nodeFilePath = CType(rootNode.Tag, Component2).GetPathName()
-                ElseIf TypeOf rootNode.Tag Is ModelDoc2 Then
-                    nodeFilePath = CType(rootNode.Tag, ModelDoc2).GetPathName()
-                End If
-            Catch
-                nodeFilePath = ""
-            End Try
+        Try
+            'Always resolve through the tree-node helper. For normal physical nodes this is
+            'the same file path; for a virtual component opened in position it is the owning
+            'physical assembly path, preventing the false [Not in SVN] state.
+            nodeFilePath = getCadPathFromTreeNode(rootNode)
 
-            If Not String.IsNullOrWhiteSpace(nodeFilePath) Then
-                status1 = findStatusForFile(nodeFilePath)
-            Else
-                status1 = findStatusForFile(baseNodeText)
+            If String.IsNullOrWhiteSpace(nodeFilePath) AndAlso modDoc IsNot Nothing Then
+                nodeFilePath = modDoc.GetPathName()
             End If
+        Catch
+            nodeFilePath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(nodeFilePath) Then
+            status1 = findStatusForFile(nodeFilePath)
+        Else
+            status1 = findStatusForFile(baseNodeText)
+        End If
+
+        Dim pathIsOutsideSvn As Boolean = False
+
+        If Not String.IsNullOrWhiteSpace(nodeFilePath) Then
+            Try
+                pathIsOutsideSvn = Not svnModule.isPathInsideLocalRepoPublic(nodeFilePath)
+            Catch
+                pathIsOutsideSvn = False
+            End Try
         End If
 
         If modDoc Is Nothing Then
@@ -4224,9 +4579,22 @@ Public Class UserControl1
             'modDoc = rootNode.Tag
         End If
 
-        If status1 Is Nothing Then
+        If pathIsOutsideSvn Then
+            rootNode.BackColor = myCol.notOnVault
+            rootNode.ToolTipText = "Not in SVN. PlumVault will skip this file during Sync."
+            rootNode.Text &= " [Not in SVN]"
+
+        ElseIf status1 Is Nothing Then
             rootNode.BackColor = myCol.unknown
             rootNode.ToolTipText = "Unknown"
+
+        ElseIf status1.fp(0).addDelChg1 = "?" Then
+            rootNode.BackColor = myCol.notOnVault
+            rootNode.ToolTipText = "Not in SVN. PlumVault will skip this file during Sync."
+            rootNode.Text &= " [Not in SVN]"
+            If bModelDocAttached Then
+                docMenu.Items.Add(myContextMenu.addToRepo)
+            End If
 
         ElseIf status1.fp(0).upToDate9 = "*" Then
             rootNode.BackColor = myCol.outOfDate
@@ -4234,8 +4602,7 @@ Public Class UserControl1
             'If bModelDocAttached Then docMenu.Items.AddRange({myContextMenu.getLocksStealLabel})
 
         ElseIf status1.fp(0).addDelChg1 = "M" OrElse
-            status1.fp(0).addDelChg1 = "A" OrElse
-            status1.fp(0).addDelChg1 = "?" Then
+            status1.fp(0).addDelChg1 = "A" Then
 
             rootNode.BackColor = myCol.localChangesNotCommitted
             rootNode.ToolTipText = "Local changes not committed"
@@ -4294,13 +4661,6 @@ Public Class UserControl1
             If bModelDocAttached Then
                 docMenu.Items.AddRange({myContextMenu.upRevEdit})
             End If
-        ElseIf status1.fp(0).addDelChg1 = "?" Then
-            rootNode.BackColor = myCol.notOnVault
-            rootNode.ToolTipText = "File is not saved the to the Vault"
-            If bModelDocAttached Then
-                docMenu.Items.Add(myContextMenu.addToRepo)
-            End If
-
         ElseIf status1.fp(0).lock6 = " " Then
             rootNode.BackColor = myCol.available
             rootNode.ToolTipText = "Available"
@@ -4345,6 +4705,12 @@ Public Class UserControl1
         'swSelectType_e.swSelSHEETS
         Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
         If activeModDoc Is Nothing Then Return Nothing
+
+        'When a virtual part/subassembly is open in its own edit tab, it still has no
+        'independent SVN file. Route file actions to the physical owning assembly.
+        Dim virtualOwnerDocument As ModelDoc2 = getOwningPhysicalAssemblyDocumentForVirtualModel(activeModDoc)
+        If virtualOwnerDocument IsNot Nothing Then Return New ModelDoc2() {virtualOwnerDocument}
+
         Dim swSelMgr As SolidWorks.Interop.sldworks.SelectionMgr = activeModDoc.SelectionManager
         Dim nSelCount As Long = swSelMgr.GetSelectedObjectCount2(-1)
 
@@ -4366,7 +4732,15 @@ Public Class UserControl1
         For i = 1 To nSelCount
 
             swComp = swSelCompArr(i - 1)
-            If ensureResolvedComponent(swComp) Then
+
+            If swComp IsNot Nothing AndAlso isComponentVirtualSafe(swComp) Then
+                Dim ownerPath As String = getPhysicalOwnerAssemblyPathForComponent(swComp, activeModDoc)
+                Dim ownerDocument As ModelDoc2 = getOpenDocumentByPathSafe(ownerPath)
+
+                If ownerDocument Is Nothing Then Continue For
+                modDocArr(UBound(modDocArr)) = ownerDocument
+
+            ElseIf ensureResolvedComponent(swComp) Then
                 modDocArr(UBound(modDocArr)) = swComp.GetModelDoc2
             Else
 
@@ -4404,7 +4778,7 @@ Public Class UserControl1
 
         ReDim Preserve modDocArr(UBound(modDocArr) - 1)
 
-        Return modDocArr
+        Return distinctModelDocsByPhysicalPath(modDocArr)
 
     End Function
     Class myColours

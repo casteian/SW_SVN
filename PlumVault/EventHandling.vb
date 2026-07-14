@@ -1,8 +1,57 @@
 Imports System.Collections.Generic
 Imports System.Runtime.InteropServices
+Imports System.Threading
 Imports System.Windows.Forms
 Imports SolidWorks.Interop.sldworks
 Imports SolidWorks.Interop.swconst
+
+
+'Coordinates all pre-close entry points so one click/shortcut is evaluated once.
+'SOLIDWORKS can emit SC_CLOSE, WM_CLOSE, and nested window messages for the same action.
+Friend NotInheritable Class SolidWorksCloseGuardCoordinator
+    Private Shared ReadOnly closeCheckSync As New Object()
+    Private Shared closeCheckInProgress As Boolean = False
+    Private Shared lastDecisionUtc As DateTime = DateTime.MinValue
+    Private Shared lastDecisionBlocked As Boolean = False
+    Private Const CLOSE_DECISION_REUSE_MILLISECONDS As Double = 150.0
+
+    Private Sub New()
+    End Sub
+
+    Public Shared Function ShouldBlockActiveDocumentClose() As Boolean
+        SyncLock closeCheckSync
+            'A modal close-safety prompt can pump another close message. While the first
+            'check is still active, always block the duplicate message.
+            If closeCheckInProgress Then Return True
+
+            'SC_CLOSE and WM_CLOSE commonly arrive back-to-back for the same click.
+            'Reuse the first decision briefly instead of re-entering SVN/COM checks.
+            If (DateTime.UtcNow - lastDecisionUtc).TotalMilliseconds <= CLOSE_DECISION_REUSE_MILLISECONDS Then
+                Return lastDecisionBlocked
+            End If
+
+            closeCheckInProgress = True
+        End SyncLock
+
+        Dim blocked As Boolean = False
+
+        Try
+            blocked = svnModule.blockCloseIfActiveDocUnsafe()
+        Catch
+            'Do not crash SOLIDWORKS because the safety check itself failed.
+            'The document-level close events are cleanup-only and never return invalid cancel codes.
+            blocked = False
+        Finally
+            SyncLock closeCheckSync
+                lastDecisionBlocked = blocked
+                lastDecisionUtc = DateTime.UtcNow
+                closeCheckInProgress = False
+            End SyncLock
+        End Try
+
+        Return blocked
+    End Function
+End Class
 
 
 'Global keyboard hook used to catch Ctrl+W before SOLIDWORKS processes it.
@@ -81,7 +130,7 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
                                 IsKeyCurrentlyDown(VK_RCONTROL)
 
                         If ctrlDown Then
-                            If svnModule.blockCloseIfActiveDocUnsafe() Then
+                            If SolidWorksCloseGuardCoordinator.ShouldBlockActiveDocumentClose() Then
                                 Return New IntPtr(1) 'Eat Ctrl+W, preventing SOLIDWORKS from closing the document.
                             End If
                         End If
@@ -102,6 +151,69 @@ Public Class DocumentEventHandler
     Protected userAddin As SwAddin
     Protected iDocument As ModelDoc2
     Protected iSwApp As SldWorks
+
+    Private detachQueued As Boolean = False
+    Private detachStarted As Boolean = False
+
+    'SOLIDWORKS close notifications can fire while its native close message is still
+    'being processed. Releasing NativeWindow/COM event hooks synchronously in that
+    'call stack can destabilize the document window, so cleanup is deferred one UI turn.
+    Protected Sub ScheduleDetachEventHandlers()
+        If detachQueued OrElse detachStarted Then Exit Sub
+        detachQueued = True
+
+        Dim cleanupAction As New MethodInvoker(
+            Sub()
+                detachQueued = False
+
+                Try
+                    Me.DetachEventHandlers()
+                Catch
+                    'The document may already be released by SOLIDWORKS. Cleanup is best-effort.
+                End Try
+            End Sub
+        )
+
+        Try
+            Dim host As Control = Nothing
+
+            If userAddin IsNot Nothing Then
+                host = TryCast(userAddin.myTaskPaneHost, Control)
+            End If
+
+            If host IsNot Nothing AndAlso Not host.IsDisposed AndAlso host.IsHandleCreated Then
+                host.BeginInvoke(cleanupAction)
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        Try
+            Dim context As SynchronizationContext = SynchronizationContext.Current
+
+            If context IsNot Nothing Then
+                context.Post(
+                    New SendOrPostCallback(Sub(state As Object) cleanupAction.Invoke()),
+                    Nothing
+                )
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        'Last-resort fallback. Normally the task pane or WinForms synchronization
+        'context is available, so cleanup remains outside the native close callback.
+        Try
+            cleanupAction.Invoke()
+        Catch
+        End Try
+    End Sub
+
+    Protected Function TryBeginDetachEventHandlers() As Boolean
+        If detachStarted Then Return False
+        detachStarted = True
+        Return True
+    End Function
 
     Protected Function IsThisDocumentFile(ByVal fileName As String) As Boolean
         If iDocument Is Nothing Then Return False
@@ -175,23 +287,33 @@ Public Class DocumentEventHandler
     End Function
 
     Function DisconnectModelViews() As Boolean
-        'Close events on all currently open docs
-        Dim mView As DocView
-        Dim key As ModelView
-        Dim numKeys As Integer
-        numKeys = openModelViews.Count
-        Dim keys() As Object = New Object(numKeys - 1) {}
+        Try
+            If openModelViews Is Nothing OrElse openModelViews.Count = 0 Then Return True
 
-        'Remove all ModelView event handlers
-        openModelViews.Keys.CopyTo(keys, 0)
+            'Close events on all currently open docs.
+            Dim keys() As Object = New Object(openModelViews.Count - 1) {}
+            openModelViews.Keys.CopyTo(keys, 0)
 
-        For Each key In keys
-            mView = openModelViews.Item(key)
-            mView.DetachEventHandlers()
-            openModelViews.Remove(key)
-            mView = Nothing
-            key = Nothing
-        Next
+            For Each keyObject As Object In keys
+                Try
+                    Dim key As ModelView = TryCast(keyObject, ModelView)
+                    Dim mView As DocView = TryCast(openModelViews.Item(keyObject), DocView)
+
+                    If mView IsNot Nothing Then mView.DetachEventHandlers()
+                    openModelViews.Remove(keyObject)
+                    key = Nothing
+                    mView = Nothing
+                Catch
+                    Try
+                        openModelViews.Remove(keyObject)
+                    Catch
+                    End Try
+                End Try
+            Next
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Sub DetachModelViewEventHandler(ByVal mView As ModelView)
@@ -237,19 +359,29 @@ Public Class PartEventHandler
     End Function
 
     Overrides Function DetachEventHandlers() As Boolean
-        RemoveHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
-        RemoveHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
-        RemoveHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
-        RemoveHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
-        RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+        If Not TryBeginDetachEventHandlers() Then Return True
 
-        'RemoveHandler iPart.NewSelectionNotify, AddressOf Me.PartDoc_NewSelectionNotify
-        'RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.PartDoc_ActiveModelDocChangeNotify
-        'RemoveHandler iSwApp.FileOpenPostNotify, AddressOf Me.PartDoc_FileOpenPostNotify
+        Try
+            RemoveHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+            RemoveHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
+            RemoveHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
+            RemoveHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
+            RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+        Catch
+            'The SOLIDWORKS document may already have released its COM connection.
+        End Try
 
-        DisconnectModelViews()
+        Try
+            DisconnectModelViews()
+        Catch
+        End Try
 
-        userAddin.DetachModelEventHandler(iDocument)
+        Try
+            If userAddin IsNot Nothing Then userAddin.DetachModelEventHandler(iDocument)
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Function PartDoc_FileOpenPostNotify() As Integer
@@ -283,26 +415,16 @@ Public Class PartEventHandler
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
-
-        If Not IsThisDocumentFile(FileName) Then
-            Return 0
-        End If
-
-        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
-            Return 1 'Cancel close
-        End If
-
-        Return 0 'Allow close
+        'FileCloseNotify is a post-close notification. It cannot safely cancel a close.
+        If IsThisDocumentFile(FileName) Then ScheduleDetachEventHandlers()
+        Return 0
     End Function
 
     Function PartDoc_DestroyNotify() As Integer
-
-        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
-            Return 1 'Cancel close
-        End If
-
-        DetachEventHandlers()
-        Return 0 'Allow close
+        'Pre-close blocking is handled by the Ctrl+W/document-window/main-window guards.
+        'This obsolete destroy event is cleanup-only and must never return a cancel code.
+        ScheduleDetachEventHandlers()
+        Return 0
     End Function
 
     Function PartDoc_NewSelectionNotify() As Integer
@@ -331,6 +453,15 @@ Public Class AssemblyEventHandler
         AddHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
         AddHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
         AddHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
+
+        'Assembly-owned edit protection. Pre-notify events block directly; post-notify
+        'events are safely undone one UI turn later when the assembly is not locked.
+        AddHandler iAssembly.ModifyNotify, AddressOf Me.AssemblyDoc_ModifyNotify
+        AddHandler iAssembly.ComponentMoveNotify2, AddressOf Me.AssemblyDoc_ComponentMoveNotify2
+        AddHandler iAssembly.AddItemNotify, AddressOf Me.AssemblyDoc_AddItemNotify
+        AddHandler iAssembly.DeleteItemPreNotify, AddressOf Me.AssemblyDoc_DeleteItemPreNotify
+        AddHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
+
         AddHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
         AddHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
         AddHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
@@ -345,23 +476,39 @@ Public Class AssemblyEventHandler
     End Function
 
     Overrides Function DetachEventHandlers() As Boolean
-        RemoveHandler iAssembly.DestroyNotify, AddressOf Me.AssemblyDoc_DestroyNotify
-        RemoveHandler iAssembly.FileSaveNotify, AddressOf Me.AssemblyDoc_FileSaveNotify
-        RemoveHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
-        RemoveHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
-        RemoveHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
-        RemoveHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
-        RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
-        RemoveHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
-        RemoveHandler iAssembly.ComponentDisplayStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentDisplayStateChangeNotify
-        RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+        If Not TryBeginDetachEventHandlers() Then Return True
 
-        'RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.AssemblyDoc_ActiveModelDocChangeNotify
-        'RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.DSldWorksEvents_FileCloseNotifyEventHandler
+        Try
+            RemoveHandler iAssembly.DestroyNotify, AddressOf Me.AssemblyDoc_DestroyNotify
+            RemoveHandler iAssembly.FileSaveNotify, AddressOf Me.AssemblyDoc_FileSaveNotify
+            RemoveHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
+            RemoveHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
+            RemoveHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
+            RemoveHandler iAssembly.ModifyNotify, AddressOf Me.AssemblyDoc_ModifyNotify
+            RemoveHandler iAssembly.ComponentMoveNotify2, AddressOf Me.AssemblyDoc_ComponentMoveNotify2
+            RemoveHandler iAssembly.AddItemNotify, AddressOf Me.AssemblyDoc_AddItemNotify
+            RemoveHandler iAssembly.DeleteItemPreNotify, AddressOf Me.AssemblyDoc_DeleteItemPreNotify
+            RemoveHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
+            RemoveHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
+            RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
+            RemoveHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
+            RemoveHandler iAssembly.ComponentDisplayStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentDisplayStateChangeNotify
+            RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+        Catch
+            'The SOLIDWORKS document may already have released its COM connection.
+        End Try
 
-        DisconnectModelViews()
+        Try
+            DisconnectModelViews()
+        Catch
+        End Try
 
-        userAddin.DetachModelEventHandler(iDocument)
+        Try
+            If userAddin IsNot Nothing Then userAddin.DetachModelEventHandler(iDocument)
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Function AssemblyDoc_ActiveModelDocChangeNotify() As Integer
@@ -385,30 +532,48 @@ Public Class AssemblyEventHandler
     End Function
 
     Function AssemblyDoc_DestroyNotify() As Integer
-
-        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
-            Return 1 'Cancel close
-        End If
-
-        DetachEventHandlers()
-        Return 0 'Allow close
+        ScheduleDetachEventHandlers()
+        Return 0
     End Function
 
     Function AssemblyDoc_NewSelectionNotify() As Integer
-
+        svnModule.noteAssemblySelectionContextPublic(iDocument)
+        Return 0
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
+        If IsThisDocumentFile(FileName) Then ScheduleDetachEventHandlers()
+        Return 0
+    End Function
 
-        If Not IsThisDocumentFile(FileName) Then
-            Return 0
-        End If
+    Private Function AssemblyDoc_ModifyNotify() As Integer
+        'ModifyNotify is also raised while a child-owned dimension dialog is active.
+        'The module permits that narrow case only when the selected external child has its lock.
+        svnModule.handleAssemblyOwnedEditPostPublic(
+            iDocument,
+            "assembly-level modification",
+            allowLockedChildDimensionFallback:=True
+        )
+        Return 0
+    End Function
 
-        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
-            Return 1 'Cancel close
-        End If
+    Private Function AssemblyDoc_ComponentMoveNotify2(ByRef Components As Object) As Integer
+        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "moving or rotating an assembly component")
+        Return 0
+    End Function
 
-        Return 0 'Allow close
+    Private Function AssemblyDoc_AddItemNotify(ByVal EntityType As Integer, ByVal itemName As String) As Integer
+        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "adding " & itemName)
+        Return 0
+    End Function
+
+    Private Function AssemblyDoc_DeleteItemPreNotify(ByVal EntityType As Integer, ByVal itemName As String) As Integer
+        Return svnModule.blockAssemblyOwnedEditPrePublic(iDocument, "deleting " & itemName)
+    End Function
+
+    Private Function AssemblyDoc_DimensionChangeNotify(ByVal displayDim As Object) As Integer
+        svnModule.handleAssemblyDimensionChangePostPublic(iDocument, displayDim)
+        Return 0
     End Function
 
     Protected Function ComponentStateChange(ByVal componentModel As Object, Optional ByVal newCompState As Short = swComponentSuppressionState_e.swComponentResolved) As Integer
@@ -453,6 +618,7 @@ Public Class AssemblyEventHandler
 
         modDoc = component.GetModelDoc
 
+        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "changing component visual properties")
         Return ComponentStateChange(modDoc)
 
     End Function
@@ -484,6 +650,7 @@ Public Class AssemblyEventHandler
 
         modDoc = component.GetModelDoc
 
+        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "changing a component display state")
         Return ComponentStateChange(modDoc)
 
     End Function
@@ -515,16 +682,30 @@ Public Class DrawingEventHandler
     End Function
 
     Overrides Function DetachEventHandlers() As Boolean
-        RemoveHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
-        RemoveHandler iDrawing.FileSaveNotify, AddressOf Me.DrawingDoc_FileSaveNotify
-        RemoveHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
-        RemoveHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
-        RemoveHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
-        RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+        If Not TryBeginDetachEventHandlers() Then Return True
 
-        DisconnectModelViews()
+        Try
+            RemoveHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
+            RemoveHandler iDrawing.FileSaveNotify, AddressOf Me.DrawingDoc_FileSaveNotify
+            RemoveHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
+            RemoveHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
+            RemoveHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
+            RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
+        Catch
+            'The SOLIDWORKS document may already have released its COM connection.
+        End Try
 
-        userAddin.DetachModelEventHandler(iDocument)
+        Try
+            DisconnectModelViews()
+        Catch
+        End Try
+
+        Try
+            If userAddin IsNot Nothing Then userAddin.DetachModelEventHandler(iDocument)
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Private Function DrawingDoc_FileSaveNotify(ByVal FileName As String) As Integer
@@ -540,13 +721,8 @@ Public Class DrawingEventHandler
     End Function
 
     Function DrawingDoc_DestroyNotify() As Integer
-
-        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
-            Return 1 'Cancel close
-        End If
-
-        DetachEventHandlers()
-        Return 0 'Allow close
+        ScheduleDetachEventHandlers()
+        Return 0
     End Function
 
     Function DrawingDoc_NewSelectionNotify() As Integer
@@ -554,16 +730,8 @@ Public Class DrawingEventHandler
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
-
-        If Not IsThisDocumentFile(FileName) Then
-            Return 0
-        End If
-
-        If svnModule.blockCloseIfSingleDocUnsafe(iDocument) Then
-            Return 1 'Cancel close
-        End If
-
-        Return 0 'Allow close
+        If IsThisDocumentFile(FileName) Then ScheduleDetachEventHandlers()
+        Return 0
     End Function
 End Class
 
@@ -574,6 +742,56 @@ Public Class DocView
     Dim userAddin As SwAddin
     Dim parentDoc As DocumentEventHandler
     Dim docWindowCloseGuards As New List(Of SolidWorksDocumentCloseGuardWindowHook)
+    Private detachQueued As Boolean = False
+    Private detachStarted As Boolean = False
+
+    Private Sub ScheduleDetachEventHandlers()
+        If detachQueued OrElse detachStarted Then Exit Sub
+        detachQueued = True
+
+        Dim cleanupAction As New MethodInvoker(
+            Sub()
+                detachQueued = False
+
+                Try
+                    DetachEventHandlers()
+                Catch
+                End Try
+            End Sub
+        )
+
+        Try
+            Dim host As Control = Nothing
+
+            If userAddin IsNot Nothing Then
+                host = TryCast(userAddin.myTaskPaneHost, Control)
+            End If
+
+            If host IsNot Nothing AndAlso Not host.IsDisposed AndAlso host.IsHandleCreated Then
+                host.BeginInvoke(cleanupAction)
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        Try
+            Dim context As SynchronizationContext = SynchronizationContext.Current
+
+            If context IsNot Nothing Then
+                context.Post(
+                    New SendOrPostCallback(Sub(state As Object) cleanupAction.Invoke()),
+                    Nothing
+                )
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        Try
+            cleanupAction.Invoke()
+        Catch
+        End Try
+    End Sub
 
     Function Init(ByVal addin As SwAddin, ByVal mView As ModelView, ByVal parent As DocumentEventHandler) As Boolean
         userAddin = addin
@@ -607,10 +825,13 @@ Public Class DocView
         Dim currentHwnd As IntPtr = startHwnd
         Dim hookedHandles As New HashSet(Of IntPtr)()
 
-        'Walk upward through the model view parent windows.
-        'The little document X is usually on one of these parent MDI/document windows.
+        'Walk upward through the model-view/document windows. Do not subclass the
+        'top-level SOLIDWORKS frame; SwAddin already owns the major-X close guard.
         For i As Integer = 0 To 8
             If currentHwnd = IntPtr.Zero Then Exit For
+
+            Dim parentHwnd As IntPtr = SolidWorksDocumentCloseGuardWindowHook.GetParentWindow(currentHwnd)
+            If parentHwnd = IntPtr.Zero Then Exit For
 
             If Not hookedHandles.Contains(currentHwnd) Then
                 Dim hook As New SolidWorksDocumentCloseGuardWindowHook()
@@ -619,13 +840,20 @@ Public Class DocView
                 hookedHandles.Add(currentHwnd)
             End If
 
-            currentHwnd = SolidWorksDocumentCloseGuardWindowHook.GetParentWindow(currentHwnd)
+            currentHwnd = parentHwnd
         Next
     End Sub
 
     Function DetachEventHandlers() As Boolean
-        RemoveHandler iModelView.DestroyNotify2, AddressOf Me.ModelView_DestroyNotify2
-        RemoveHandler iModelView.RepaintNotify, AddressOf Me.ModelView_RepaintNotify
+        If detachStarted Then Return True
+        detachStarted = True
+
+        Try
+            RemoveHandler iModelView.DestroyNotify2, AddressOf Me.ModelView_DestroyNotify2
+            RemoveHandler iModelView.RepaintNotify, AddressOf Me.ModelView_RepaintNotify
+        Catch
+            'The model view may already have been destroyed by SOLIDWORKS.
+        End Try
 
         Try
             For Each hook As SolidWorksDocumentCloseGuardWindowHook In docWindowCloseGuards
@@ -638,7 +866,12 @@ Public Class DocView
             docWindowCloseGuards.Clear()
         End Try
 
-        parentDoc.DetachModelViewEventHandler(iModelView)
+        Try
+            If parentDoc IsNot Nothing Then parentDoc.DetachModelViewEventHandler(iModelView)
+        Catch
+        End Try
+
+        Return True
     End Function
 
     Public Class SolidWorksDocumentCloseGuardWindowHook
@@ -684,7 +917,7 @@ Public Class DocView
                     If keyCode = CInt(Keys.W) AndAlso
                            ((Control.ModifierKeys And Keys.Control) = Keys.Control) Then
 
-                        If svnModule.blockCloseIfActiveDocUnsafe() Then
+                        If SolidWorksCloseGuardCoordinator.ShouldBlockActiveDocumentClose() Then
                             Return
                         End If
                     End If
@@ -693,7 +926,7 @@ Public Class DocView
             End If
 
             If m.Msg = WM_CLOSE Then
-                If svnModule.blockCloseIfActiveDocUnsafe() Then
+                If SolidWorksCloseGuardCoordinator.ShouldBlockActiveDocumentClose() Then
                     Return
                 End If
             End If
@@ -702,7 +935,7 @@ Public Class DocView
                 Dim command As Integer = m.WParam.ToInt32() And &HFFF0
 
                 If command = SC_CLOSE Then
-                    If svnModule.blockCloseIfActiveDocUnsafe() Then
+                    If SolidWorksCloseGuardCoordinator.ShouldBlockActiveDocumentClose() Then
                         Return
                     End If
                 End If
@@ -713,7 +946,8 @@ Public Class DocView
     End Class
 
     Function ModelView_DestroyNotify2(ByVal destroyTYpe As Integer) As Integer
-        DetachEventHandlers()
+        ScheduleDetachEventHandlers()
+        Return 0
     End Function
 
     Function ModelView_RepaintNotify(ByVal repaintTYpe As Integer) As Integer

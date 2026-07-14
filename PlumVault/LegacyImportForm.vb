@@ -145,8 +145,8 @@ Public Class LegacyImportForm
         _lblInstruction.MaximumSize = New Size(1220, 0)
         _lblInstruction.Text =
             "The SVN destination folders were selected, created, and committed before this table opened. " &
-            "Assign a valid GRC27/CFD27 ID to every assembly, part, and drawing. " &
-            "Only source PART rows may be changed to VENDOR PART. " &
+            "Assign a valid GRC27/CFD27 ID to every physical assembly, part, and drawing. " &
+            "Only source PART rows may be changed to VENDOR PART. Virtual components remain embedded in their owning assembly. " &
             "Press Check on each row, or use Check All. Continue remains disabled until every row passes."
         _lblInstruction.Padding = New Padding(0, 0, 0, 4)
         root.Controls.Add(_lblInstruction, 0, 0)
@@ -404,15 +404,17 @@ Public Class LegacyImportForm
                 row.Cells(COL_FINAL_NAME).Value = ""
                 row.Cells(COL_STATUS).Value = "○"
                 row.Cells(COL_EXPLANATION).Value = If(item.IsVirtualComponent,
-                    "Virtual component: SOLIDWORKS Pack and Go cannot rename it. Press Check for details.",
+                    "Virtual component will remain embedded in its owning assembly. Press Check to confirm.",
                     "Not checked")
 
                 If item.IsVirtualComponent Then
-                    row.Cells(COL_OLD_NAME).Style.BackColor = Color.LemonChiffon
-                    row.Cells(COL_ORIGINAL).Style.BackColor = Color.LemonChiffon
-                End If
-
-                If item.SourceType <> LegacyImportSourceType.Part Then
+                    row.DefaultCellStyle.BackColor = Color.LemonChiffon
+                    row.Cells(COL_TARGET_TYPE).ReadOnly = True
+                    row.Cells(COL_NEW_ID).ReadOnly = True
+                    row.Cells(COL_TARGET_TYPE).Style.BackColor = SystemColors.Control
+                    row.Cells(COL_NEW_ID).Style.BackColor = SystemColors.Control
+                    row.Cells(COL_NEW_ID).Value = "Embedded"
+                ElseIf item.SourceType <> LegacyImportSourceType.Part Then
                     row.Cells(COL_TARGET_TYPE).ReadOnly = True
                     row.Cells(COL_TARGET_TYPE).Style.BackColor = SystemColors.Control
                 End If
@@ -468,7 +470,7 @@ Public Class LegacyImportForm
         If columnName <> COL_TARGET_TYPE Then Return
 
         Dim item As LegacyImportItem = TryCast(_grid.Rows(e.RowIndex).Tag, LegacyImportItem)
-        If item Is Nothing OrElse item.SourceType <> LegacyImportSourceType.Part Then
+        If item Is Nothing OrElse item.IsVirtualComponent OrElse item.SourceType <> LegacyImportSourceType.Part Then
             e.Cancel = True
         End If
     End Sub
@@ -549,7 +551,7 @@ Public Class LegacyImportForm
         item.IsChecked = False
         item.IsValid = False
         item.ValidationMessage = If(item.IsVirtualComponent,
-            "Virtual component: SOLIDWORKS Pack and Go cannot rename it. Press Check for details.",
+            "Virtual component will remain embedded in its owning assembly. Press Check to confirm.",
             "Not checked")
         item.FinalFileName = ""
         item.DestinationPath = ""
@@ -569,7 +571,12 @@ Public Class LegacyImportForm
         If item Is Nothing Then Return
 
         item.TargetType = targetTypeFromText(row.Cells(COL_TARGET_TYPE).Value)
-        item.ProposedId = Convert.ToString(row.Cells(COL_NEW_ID).Value).Trim()
+
+        If item.IsVirtualComponent Then
+            item.ProposedId = ""
+        Else
+            item.ProposedId = Convert.ToString(row.Cells(COL_NEW_ID).Value).Trim()
+        End If
 
         _plan.GrcDestinationFolder = _txtGrcFolder.Text.Trim()
         _plan.VendorDestinationFolder = _txtVendorFolder.Text.Trim()
