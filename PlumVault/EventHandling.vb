@@ -223,6 +223,9 @@ Public Class PartEventHandler
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+        AddHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
+        AddHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
+        AddHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         'AddHandler iPart.NewSelectionNotify, AddressOf Me.PartDoc_NewSelectionNotify
@@ -235,6 +238,9 @@ Public Class PartEventHandler
 
     Overrides Function DetachEventHandlers() As Boolean
         RemoveHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+        RemoveHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
+        RemoveHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
+        RemoveHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
         RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         'RemoveHandler iPart.NewSelectionNotify, AddressOf Me.PartDoc_NewSelectionNotify
@@ -262,6 +268,18 @@ Public Class PartEventHandler
         'UC1.getComponentsOfAssemblyOptionalUpdateTree(modDoc, status)
 
         'swAddin.myTaskPaneHost.switchTreeViewToCurrentModel()
+    End Function
+
+    Private Function PartDoc_FileSaveNotify(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePrePublic(iDocument, FileName, isSaveAs:=False)
+    End Function
+
+    Private Function PartDoc_FileSaveAsNotify2(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePrePublic(iDocument, FileName, isSaveAs:=True)
+    End Function
+
+    Private Function PartDoc_FileSavePostNotify(ByVal saveType As Integer, ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePostPublic(iDocument, saveType, FileName)
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
@@ -309,6 +327,9 @@ Public Class AssemblyEventHandler
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iAssembly.DestroyNotify, AddressOf Me.AssemblyDoc_DestroyNotify
+        AddHandler iAssembly.FileSaveNotify, AddressOf Me.AssemblyDoc_FileSaveNotify
+        AddHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
+        AddHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
         AddHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
         AddHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
         AddHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
@@ -325,6 +346,9 @@ Public Class AssemblyEventHandler
 
     Overrides Function DetachEventHandlers() As Boolean
         RemoveHandler iAssembly.DestroyNotify, AddressOf Me.AssemblyDoc_DestroyNotify
+        RemoveHandler iAssembly.FileSaveNotify, AddressOf Me.AssemblyDoc_FileSaveNotify
+        RemoveHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
+        RemoveHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
         RemoveHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
         RemoveHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
         RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
@@ -346,6 +370,18 @@ Public Class AssemblyEventHandler
 
     Function DSldWorksEvents_FileOpenPostNotifyEventHandler() As Integer
 
+    End Function
+
+    Private Function AssemblyDoc_FileSaveNotify(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePrePublic(iDocument, FileName, isSaveAs:=False)
+    End Function
+
+    Private Function AssemblyDoc_FileSaveAsNotify2(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePrePublic(iDocument, FileName, isSaveAs:=True)
+    End Function
+
+    Private Function AssemblyDoc_FileSavePostNotify(ByVal saveType As Integer, ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePostPublic(iDocument, saveType, FileName)
     End Function
 
     Function AssemblyDoc_DestroyNotify() As Integer
@@ -468,6 +504,9 @@ Public Class DrawingEventHandler
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
+        AddHandler iDrawing.FileSaveNotify, AddressOf Me.DrawingDoc_FileSaveNotify
+        AddHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
+        AddHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
         AddHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
@@ -477,12 +516,27 @@ Public Class DrawingEventHandler
 
     Overrides Function DetachEventHandlers() As Boolean
         RemoveHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
+        RemoveHandler iDrawing.FileSaveNotify, AddressOf Me.DrawingDoc_FileSaveNotify
+        RemoveHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
+        RemoveHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
         RemoveHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
         RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         DisconnectModelViews()
 
         userAddin.DetachModelEventHandler(iDocument)
+    End Function
+
+    Private Function DrawingDoc_FileSaveNotify(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePrePublic(iDocument, FileName, isSaveAs:=False)
+    End Function
+
+    Private Function DrawingDoc_FileSaveAsNotify2(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePrePublic(iDocument, FileName, isSaveAs:=True)
+    End Function
+
+    Private Function DrawingDoc_FileSavePostNotify(ByVal saveType As Integer, ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileSavePostPublic(iDocument, saveType, FileName)
     End Function
 
     Function DrawingDoc_DestroyNotify() As Integer

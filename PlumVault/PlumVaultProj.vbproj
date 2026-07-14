@@ -147,6 +147,7 @@
     <Compile Include="EventHandling.vb">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="LegacyImportForm.vb" />
     <Compile Include="My Project\Settings.Designer.vb">
       <AutoGen>True</AutoGen>
       <DesignTimeSharedInput>True</DesignTimeSharedInput>

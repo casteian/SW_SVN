@@ -36,6 +36,7 @@ Public Class UserControl1
 
     Private WithEvents liveChangeCheckTimer As System.Windows.Forms.Timer
     Private WithEvents graphicalSelectionSyncTimer As System.Windows.Forms.Timer
+    Private taskPaneClosing As Boolean = False
     Private WithEvents butSyncStatus As Button
     Private WithEvents chkDebugIgnoreNaming As CheckBox
     Private WithEvents onlineCheckBox As CheckBox
@@ -45,6 +46,7 @@ Public Class UserControl1
     Private WithEvents syncDebugTimingMenuItem As ToolStripMenuItem
     Private syncDebugTimingEnabled As Boolean = False
     Private WithEvents butCleanupQuick As Button
+    Private copyLegacyDataToSvnMenuItem As ToolStripMenuItem
     Private cacheAgeLabel As Label
     Private WithEvents cacheAgeTimer As System.Windows.Forms.Timer
     Private Const LAZY_LOAD_PLACEHOLDER_TEXT As String = "<load children>"
@@ -151,6 +153,67 @@ Public Class UserControl1
                 End Try
             End If
         Catch
+        End Try
+    End Sub
+
+
+    Private Sub ensureCopyLegacyDataToSvnMenuItem()
+        Try
+            If ToolStripSplitButFolder Is Nothing Then Exit Sub
+
+            If copyLegacyDataToSvnMenuItem Is Nothing Then
+                For Each existingItem As ToolStripItem In ToolStripSplitButFolder.DropDownItems
+                    If String.Equals(existingItem.Name, "copyLegacyDataToSvnMenuItem", StringComparison.OrdinalIgnoreCase) Then
+                        copyLegacyDataToSvnMenuItem = TryCast(existingItem, ToolStripMenuItem)
+                        Exit For
+                    End If
+                Next
+            End If
+
+            If copyLegacyDataToSvnMenuItem Is Nothing Then
+                Dim separator As ToolStripSeparator = Nothing
+
+                For Each existingItem As ToolStripItem In ToolStripSplitButFolder.DropDownItems
+                    If String.Equals(existingItem.Name, "legacyImportSeparator", StringComparison.OrdinalIgnoreCase) Then
+                        separator = TryCast(existingItem, ToolStripSeparator)
+                        Exit For
+                    End If
+                Next
+
+                If separator Is Nothing Then
+                    separator = New ToolStripSeparator()
+                    separator.Name = "legacyImportSeparator"
+                    ToolStripSplitButFolder.DropDownItems.Add(separator)
+                End If
+
+                copyLegacyDataToSvnMenuItem = New ToolStripMenuItem()
+                copyLegacyDataToSvnMenuItem.Name = "copyLegacyDataToSvnMenuItem"
+                copyLegacyDataToSvnMenuItem.Text = "Copy Legacy Data to SVN..."
+                copyLegacyDataToSvnMenuItem.ToolTipText = "Pack and Go an old assembly into SVN with controlled GRC27/CFD27 re-identification."
+                ToolStripSplitButFolder.DropDownItems.Add(copyLegacyDataToSvnMenuItem)
+            End If
+
+            RemoveHandler copyLegacyDataToSvnMenuItem.Click, AddressOf copyLegacyDataToSvnMenuItem_Click
+            AddHandler copyLegacyDataToSvnMenuItem.Click, AddressOf copyLegacyDataToSvnMenuItem_Click
+        Catch
+        End Try
+    End Sub
+
+    Private Sub copyLegacyDataToSvnMenuItem_Click(ByVal sender As Object, ByVal e As EventArgs)
+        Try
+            svnModule.showLegacyImportWizardPublic()
+        Catch ex As Exception
+            Try
+                iSwApp.SendMsgToUser2(
+                    "Copy Legacy Data to SVN could not start." & vbCrLf & vbCrLf & ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk)
+            Catch
+                MessageBox.Show("Copy Legacy Data to SVN could not start." & vbCrLf & vbCrLf & ex.Message,
+                                "PlumVault",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error)
+            End Try
         End Try
     End Sub
 
@@ -1262,6 +1325,8 @@ Public Class UserControl1
 
     Private Sub UserControl1_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
 
+        taskPaneClosing = False
+
         Dim docMenu As ContextMenuStrip
         Dim myrefreshItem, myCollapseItem As ToolStripMenuItem
         savedPATH = System.Environment.GetEnvironmentVariable("PATH") 'Fixes issue #47: SolidWorks Simulation breaking svn+ssh, so unable to contact repo 
@@ -1278,6 +1343,7 @@ Public Class UserControl1
         setRefreshTreeButtonNormal()
         ensureSyncStatusButton()
         removeGetLatestAllMenuItem()
+        ensureCopyLegacyDataToSvnMenuItem()
         ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
 
@@ -1307,13 +1373,38 @@ Public Class UserControl1
         'Speed fix:
         'Do NOT run SVN server checks on a timer.
         'The old live check could call svn status -u against the repo and make SOLIDWORKS feel frozen.
-        Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
+        '
+        'Shutdown safety:
+        'SOLIDWORKS can disconnect the add-in COM application object while a WinForms timer tick is
+        'already queued. Never let that expected shutdown race escape as an unhandled .NET dialog.
+        If taskPaneClosing Then Exit Sub
+        If iSwApp Is Nothing Then Exit Sub
+
+        Dim activeModDoc As ModelDoc2 = Nothing
+
+        Try
+            activeModDoc = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Catch ex As InvalidComObjectException
+            stopTaskPaneTimers()
+            Exit Sub
+        Catch ex As COMException
+            'SOLIDWORKS may be between documents, rebuilding, or shutting down.
+            'Skip this harmless visual-only tick and try again on the next interval.
+            Exit Sub
+        Catch
+            Exit Sub
+        End Try
+
         If activeModDoc Is Nothing Then Exit Sub
 
         Dim activePath As String = ""
 
         Try
             activePath = activeModDoc.GetPathName()
+        Catch ex As InvalidComObjectException
+            Exit Sub
+        Catch ex As COMException
+            Exit Sub
         Catch
             activePath = ""
         End Try
@@ -1585,12 +1676,13 @@ Public Class UserControl1
         svnModuleInitialize(iSwApp, Me, statusOfAllOpenModels)
 
         localRepoPath.Text = My.Settings.localRepoPath
-        versionLabel.Text = "Version: 2026.02.12"
+        versionLabel.Text = "Version: 2026.07.13"
 
         ToolStripSplitButFolder.DropDown.AutoClose = True
 
         ensureSyncStatusButton()
         removeGetLatestAllMenuItem()
+        ensureCopyLegacyDataToSvnMenuItem()
         ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
 
@@ -1606,8 +1698,76 @@ Public Class UserControl1
         End If
 
     End Sub
+    Private Sub stopTaskPaneTimers()
+        Try
+            If liveChangeCheckTimer IsNot Nothing Then
+                liveChangeCheckTimer.Stop()
+                liveChangeCheckTimer.Enabled = False
+            End If
+        Catch
+        End Try
+
+        Try
+            If graphicalSelectionSyncTimer IsNot Nothing Then
+                graphicalSelectionSyncTimer.Stop()
+                graphicalSelectionSyncTimer.Enabled = False
+            End If
+        Catch
+        End Try
+
+        Try
+            If cacheAgeTimer IsNot Nothing Then
+                cacheAgeTimer.Stop()
+                cacheAgeTimer.Enabled = False
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Private Sub disposeTaskPaneTimers()
+        stopTaskPaneTimers()
+
+        Try
+            If liveChangeCheckTimer IsNot Nothing Then
+                liveChangeCheckTimer.Dispose()
+                liveChangeCheckTimer = Nothing
+            End If
+        Catch
+            liveChangeCheckTimer = Nothing
+        End Try
+
+        Try
+            If graphicalSelectionSyncTimer IsNot Nothing Then
+                graphicalSelectionSyncTimer.Dispose()
+                graphicalSelectionSyncTimer = Nothing
+            End If
+        Catch
+            graphicalSelectionSyncTimer = Nothing
+        End Try
+
+        Try
+            If cacheAgeTimer IsNot Nothing Then
+                cacheAgeTimer.Dispose()
+                cacheAgeTimer = Nothing
+            End If
+        Catch
+            cacheAgeTimer = Nothing
+        End Try
+    End Sub
+
     Friend Sub beforeClose()
-        saveLocalRepoPathSettings()
+        'Mark shutdown first so an already queued timer message becomes a no-op.
+        taskPaneClosing = True
+        disposeTaskPaneTimers()
+
+        Try
+            saveLocalRepoPathSettings()
+        Catch
+        End Try
+
+        'The SwAddin owns the root SOLIDWORKS COM reference. Drop this secondary reference only
+        'after every task-pane timer has stopped so no callback can touch a disconnected RCW.
+        iSwApp = Nothing
     End Sub
 
     ' ### Get Locks
@@ -3582,6 +3742,7 @@ Public Class UserControl1
             " [Locking",
             " [Syncing",
             " [Committing",
+            " [Saving to SVN",
             " [Pending"
         }
 

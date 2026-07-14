@@ -38,6 +38,18 @@ Public Module svnModule
     Private asyncGetLocksInProgress As Boolean = False
     Private asyncCommitInProgress As Boolean = False
     Private asyncCleanupInProgress As Boolean = False
+    Private cachedConfiguredRepoPathForWorkingCopyRoot As String = ""
+    Private cachedResolvedWorkingCopyRoot As String = ""
+
+    'Automatic save -> SVN commit state.
+    'All of this runs on the SOLIDWORKS UI thread except the actual svn.exe commit process.
+    Private internalSolidWorksSaveDepth As Integer = 0
+    Private newDocumentTeamSaveWorkflowInProgress As Boolean = False
+    Private pendingAutomaticSaveCommitPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private automaticSaveCommitPreparing As Boolean = False
+    Private legacyImportInProgress As Boolean = False
+    Private Const SW_COMMAND_SAVE As Integer = 2
+    Private Const SW_COMMAND_SAVE_AS As Integer = 620
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -80,6 +92,865 @@ Public Module svnModule
         iSwApp = mySwAppPass
         statusOfAllOpenModels = statusOfAllOpenModelsPass
 
+    End Sub
+
+
+    '==========================================================================
+    ' SOLIDWORKS SAVE -> SVN COMMIT
+    '==========================================================================
+
+    Private Function automaticSaveEventsSuppressed() As Boolean
+        Return internalSolidWorksSaveDepth > 0 OrElse automaticSaveCommitPreparing OrElse legacyImportInProgress
+    End Function
+
+    Private Sub beginInternalSolidWorksSave()
+        internalSolidWorksSaveDepth += 1
+    End Sub
+
+    Private Sub endInternalSolidWorksSave()
+        If internalSolidWorksSaveDepth > 0 Then internalSolidWorksSaveDepth -= 1
+    End Sub
+
+    Private Function getCadExtensionForDocument(ByVal doc As ModelDoc2) As String
+        If doc Is Nothing Then Return ""
+
+        Try
+            Select Case CInt(doc.GetType())
+                Case swDocumentTypes_e.swDocPART
+                    Return ".SLDPRT"
+                Case swDocumentTypes_e.swDocASSEMBLY
+                    Return ".SLDASM"
+                Case swDocumentTypes_e.swDocDRAWING
+                    Return ".SLDDRW"
+            End Select
+        Catch
+        End Try
+
+        Return ""
+    End Function
+
+    Private Function isCadDocument(ByVal doc As ModelDoc2) As Boolean
+        Return Not String.IsNullOrWhiteSpace(getCadExtensionForDocument(doc))
+    End Function
+
+    Private Class SolidWorksDialogOwner
+        Implements System.Windows.Forms.IWin32Window
+
+        Private ReadOnly ownerHandle As IntPtr
+
+        Public Sub New(ByVal handleValue As IntPtr)
+            ownerHandle = handleValue
+        End Sub
+
+        Public ReadOnly Property Handle As IntPtr Implements System.Windows.Forms.IWin32Window.Handle
+            Get
+                Return ownerHandle
+            End Get
+        End Property
+    End Class
+
+    Private Function getSolidWorksDialogOwner() As System.Windows.Forms.IWin32Window
+        If iSwApp Is Nothing Then Return Nothing
+
+        Try
+            Dim frameObject As Object = iSwApp.Frame()
+            If frameObject Is Nothing Then Return Nothing
+
+            Dim hwnd As IntPtr = New IntPtr(Convert.ToInt64(frameObject.GetHWnd()))
+            If hwnd = IntPtr.Zero Then Return Nothing
+
+            Return New SolidWorksDialogOwner(hwnd)
+        Catch
+            Return Nothing
+        End Try
+    End Function
+
+    Private Function getSaveDialogFilterForDocument(ByVal doc As ModelDoc2) As String
+        Dim ext As String = getCadExtensionForDocument(doc)
+
+        Select Case ext.ToUpperInvariant()
+            Case ".SLDPRT"
+                Return "SOLIDWORKS Part (*.SLDPRT)|*.SLDPRT"
+            Case ".SLDASM"
+                Return "SOLIDWORKS Assembly (*.SLDASM)|*.SLDASM"
+            Case ".SLDDRW"
+                Return "SOLIDWORKS Drawing (*.SLDDRW)|*.SLDDRW"
+        End Select
+
+        Return "SOLIDWORKS CAD Files (*.SLDPRT;*.SLDASM;*.SLDDRW)|*.SLDPRT;*.SLDASM;*.SLDDRW"
+    End Function
+
+    Public Function handleSolidWorksSaveCommandPreNotifyPublic(ByVal command As Integer,
+                                                               ByVal userCommand As Integer) As Integer
+        'Only intercept a brand-new, never-saved CAD document. Existing Save and Save As
+        'commands continue through SOLIDWORKS and are handled by the document save events.
+        If automaticSaveEventsSuppressed() Then Return 0
+        If newDocumentTeamSaveWorkflowInProgress Then Return -1
+        If command <> SW_COMMAND_SAVE AndAlso command <> SW_COMMAND_SAVE_AS Then Return 0
+        If iSwApp Is Nothing Then Return 0
+
+        Dim doc As ModelDoc2 = Nothing
+
+        Try
+            doc = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Catch
+            doc = Nothing
+        End Try
+
+        If doc Is Nothing OrElse Not isCadDocument(doc) Then Return 0
+
+        Dim currentPath As String = ""
+
+        Try
+            currentPath = doc.GetPathName()
+        Catch
+            currentPath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(currentPath) Then Return 0
+
+        Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+            "Is this new CAD file for the Gryphon Racing SVN repository?" & vbCrLf & vbCrLf &
+            "Yes = enter the required GRC27/CFD27 name, then choose the SVN folder." & vbCrLf &
+            "No = normal SOLIDWORKS Save As for classwork or files outside SVN." & vbCrLf &
+            "Cancel = stop the save.",
+            swMessageBoxIcon_e.swMbQuestion,
+            swMessageBoxBtn_e.swMbYesNoCancel
+        )
+
+        If response = swMessageBoxResult_e.swMbHitNo Then Return 0
+        If response <> swMessageBoxResult_e.swMbHitYes Then Return -1
+
+        Dim ext As String = getCadExtensionForDocument(doc)
+        Dim titleNoExt As String = "NewFile"
+
+        Try
+            titleNoExt = Path.GetFileNameWithoutExtension(doc.GetTitle())
+        Catch
+            titleNoExt = "NewFile"
+        End Try
+
+        If String.IsNullOrWhiteSpace(titleNoExt) Then titleNoExt = "NewFile"
+
+        Dim requestedName As String = promptForValidGrc27FileName(titleNoExt & ext)
+        If String.IsNullOrWhiteSpace(requestedName) Then Return -1
+
+        newDocumentTeamSaveWorkflowInProgress = True
+
+        Try
+            If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(
+                    New MethodInvoker(Sub() performNewDocumentSvnSave(doc, requestedName))
+                )
+            Else
+                newDocumentTeamSaveWorkflowInProgress = False
+                iSwApp.SendMsgToUser2(
+                    "Save could not start because the SVN task pane is not ready.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            End If
+        Catch ex As Exception
+            newDocumentTeamSaveWorkflowInProgress = False
+            iSwApp.SendMsgToUser2(
+                "Save could not start." & vbCrLf & vbCrLf & ex.Message,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+        End Try
+
+        'Cancel the original SOLIDWORKS command. The queued workflow displays the controlled
+        'Save dialog with the compliant name already filled in.
+        Return -1
+    End Function
+
+    Private Sub performNewDocumentSvnSave(ByVal doc As ModelDoc2,
+                                          ByVal compliantFileName As String)
+        Try
+            If doc Is Nothing Then Exit Sub
+            If String.IsNullOrWhiteSpace(compliantFileName) Then Exit Sub
+
+            If Not isOnlineModeEnabled() Then
+                iSwApp.SendMsgToUser2(
+                    "Save blocked for SVN CAD." & vbCrLf & vbCrLf &
+                    "Online mode is disabled, so the plugin cannot complete the required first commit." & vbCrLf & vbCrLf &
+                    "Enable Online, then save again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Exit Sub
+            End If
+
+            Dim repoRoot As String = ""
+
+            Try
+                repoRoot = Path.GetFullPath(myUserControl.localRepoPath.Text.Trim()).TrimEnd("\"c)
+            Catch
+                repoRoot = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(repoRoot) OrElse Not Directory.Exists(repoRoot) Then
+                iSwApp.SendMsgToUser2(
+                    "Save blocked." & vbCrLf & vbCrLf &
+                    "The configured local SVN working-copy folder is unavailable.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Exit Sub
+            End If
+
+            Dim selectedPath As String = ""
+            Dim owner As System.Windows.Forms.IWin32Window = getSolidWorksDialogOwner()
+
+            Using dialog As New System.Windows.Forms.SaveFileDialog()
+                dialog.Title = "Save New Gryphon Racing SVN CAD File"
+                dialog.InitialDirectory = repoRoot
+                dialog.FileName = compliantFileName
+                dialog.Filter = getSaveDialogFilterForDocument(doc)
+                dialog.FilterIndex = 1
+                dialog.DefaultExt = getCadExtensionForDocument(doc).TrimStart("."c)
+                dialog.AddExtension = True
+                dialog.CheckPathExists = True
+                dialog.OverwritePrompt = True
+                dialog.RestoreDirectory = True
+                dialog.ValidateNames = True
+
+                Do
+                    Dim dialogResult As System.Windows.Forms.DialogResult
+
+                    If owner Is Nothing Then
+                        dialogResult = dialog.ShowDialog()
+                    Else
+                        dialogResult = dialog.ShowDialog(owner)
+                    End If
+
+                    If dialogResult <> System.Windows.Forms.DialogResult.OK Then Exit Sub
+
+                    selectedPath = dialog.FileName
+
+                    If Not isPathInsideLocalRepo(selectedPath) Then
+                        iSwApp.SendMsgToUser2(
+                            "Choose a folder inside the configured SVN working copy." & vbCrLf & vbCrLf &
+                            repoRoot,
+                            swMessageBoxIcon_e.swMbWarning,
+                            swMessageBoxBtn_e.swMbOk
+                        )
+                        dialog.InitialDirectory = repoRoot
+                        dialog.FileName = compliantFileName
+                        Continue Do
+                    End If
+
+                    If Not isVendorPartPath(selectedPath) AndAlso
+                       Not shouldIgnoreGrc27NamingConventionForDebug() AndAlso
+                       Not isValidGrc27FileName(selectedPath) Then
+
+                        iSwApp.SendMsgToUser2(
+                            "The file name must remain compliant with the GRC27/CFD27 naming convention." & vbCrLf & vbCrLf &
+                            "Required name:" & vbCrLf & compliantFileName,
+                            swMessageBoxIcon_e.swMbWarning,
+                            swMessageBoxBtn_e.swMbOk
+                        )
+                        dialog.FileName = compliantFileName
+                        Continue Do
+                    End If
+
+                    If Not automaticSaveTargetHasRequiredLock(selectedPath) Then
+                        dialog.FileName = compliantFileName
+                        Continue Do
+                    End If
+
+                    Exit Do
+                Loop
+            End Using
+
+            If String.IsNullOrWhiteSpace(selectedPath) Then Exit Sub
+
+            Dim errors As Integer = 0
+            Dim warnings As Integer = 0
+            Dim saveSucceeded As Boolean = False
+
+            beginInternalSolidWorksSave()
+            Try
+                saveSucceeded = doc.Extension.SaveAs3(
+                    selectedPath,
+                    swSaveAsVersion_e.swSaveAsCurrentVersion,
+                    swSaveAsOptions_e.swSaveAsOptions_Silent,
+                    Nothing,
+                    Nothing,
+                    errors,
+                    warnings
+                )
+            Finally
+                endInternalSolidWorksSave()
+            End Try
+
+            If Not saveSucceeded Then
+                iSwApp.SendMsgToUser2(
+                    "SOLIDWORKS could not save the new CAD file." & vbCrLf & vbCrLf &
+                    selectedPath & vbCrLf & vbCrLf &
+                    "Errors: " & errors.ToString() & vbCrLf &
+                    "Warnings: " & warnings.ToString(),
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Exit Sub
+            End If
+
+            queueAutomaticSaveCommitPath(selectedPath)
+
+        Catch ex As Exception
+            iSwApp.SendMsgToUser2(
+                "The new SVN CAD save did not complete." & vbCrLf & vbCrLf & ex.Message,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+        Finally
+            newDocumentTeamSaveWorkflowInProgress = False
+        End Try
+    End Sub
+
+    Public Function handleSolidWorksFileSavePrePublic(ByVal doc As ModelDoc2,
+                                                      ByVal requestedFileName As String,
+                                                      ByVal isSaveAs As Boolean) As Integer
+        If automaticSaveEventsSuppressed() Then Return 0
+        If doc Is Nothing Then Return 0
+
+        Dim targetPath As String = requestedFileName
+        Dim currentPath As String = ""
+
+        Try
+            currentPath = doc.GetPathName()
+        Catch
+            currentPath = ""
+        End Try
+
+        'FileSaveAsNotify2 is raised before the native Save As destination is finalized.
+        'For an existing SVN document, verify the source lock before allowing Save As.
+        'The final destination is handled by FileSavePostNotify and the guarded commit pipeline.
+        If isSaveAs Then
+            If String.IsNullOrWhiteSpace(currentPath) Then Return 0
+            If Not isCadFilePath(currentPath) Then Return 0
+            If Not isPathInsideLocalRepo(currentPath) Then Return 0
+
+            If Not isOnlineModeEnabled() Then
+                iSwApp.SendMsgToUser2(
+                    "Save As blocked for SVN CAD." & vbCrLf & vbCrLf &
+                    "Online mode is disabled, so the plugin cannot verify the source lock or complete the automatic commit.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return 1
+            End If
+
+            If Not automaticSaveTargetHasRequiredLock(currentPath) Then Return 1
+            Return 0
+        End If
+
+        If String.IsNullOrWhiteSpace(targetPath) Then targetPath = currentPath
+        If String.IsNullOrWhiteSpace(targetPath) Then Return 0
+        If Not isCadFilePath(targetPath) Then Return 0
+
+        'Never affect files outside the configured team working copy.
+        If Not isPathInsideLocalRepo(targetPath) Then Return 0
+
+        If Not isOnlineModeEnabled() Then
+            iSwApp.SendMsgToUser2(
+                "Save blocked for SVN CAD." & vbCrLf & vbCrLf &
+                "Online mode is disabled, so the plugin cannot verify the lock or complete the automatic commit." & vbCrLf & vbCrLf &
+                "Enable Online, then save again.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return 1
+        End If
+
+        If Not isVendorPartPath(targetPath) AndAlso
+           Not shouldIgnoreGrc27NamingConventionForDebug() AndAlso
+           Not isValidGrc27FileName(targetPath) Then
+
+            iSwApp.SendMsgToUser2(
+                "Save blocked." & vbCrLf & vbCrLf &
+                "This SVN CAD file does not follow the GRC27/CFD27 naming convention:" & vbCrLf &
+                Path.GetFileName(targetPath) & vbCrLf & vbCrLf &
+                "Use Save As and enter a compliant name.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return 1
+        End If
+
+        If Not automaticSaveTargetHasRequiredLock(targetPath) Then Return 1
+
+        Return 0
+    End Function
+
+    Private Function automaticSaveTargetHasRequiredLock(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not isPathInsideLocalRepo(filePath) Then Return True
+
+        'A path that does not exist yet is a valid first-save/first-commit target.
+        If Not File.Exists(filePath) Then Return True
+
+        Dim statusChar As Char = getFirstSvnStatusChar(filePath)
+
+        If statusChar = "?"c OrElse statusChar = "A"c Then Return True
+
+        If statusChar = ChrW(0) Then
+            iSwApp.SendMsgToUser2(
+                "Save blocked." & vbCrLf & vbCrLf &
+                "The plugin could not verify SVN status for:" & vbCrLf &
+                filePath & vbCrLf & vbCrLf &
+                "Run Cleanup/Sync and try again.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return False
+        End If
+
+        If userHasLocalSvnLockTokenForPath(filePath) Then Return True
+
+        iSwApp.SendMsgToUser2(
+            "Save blocked." & vbCrLf & vbCrLf &
+            "You do not own the SVN lock for:" & vbCrLf &
+            Path.GetFileName(filePath) & vbCrLf & vbCrLf &
+            "Click Get Locks first. The plugin will not save or commit a versioned SVN file without your lock.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+        Return False
+    End Function
+
+    Private Function userHasLocalSvnLockTokenForPath(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Try
+            Dim cached As SVNStatus.filePpty = Nothing
+
+            If tryFindCachedStatusProperty(filePath, cached) AndAlso cached.lock6 = "K" Then
+                Return True
+            End If
+        Catch
+        End Try
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "status --non-interactive """ & filePath & """"
+            )
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Return False
+            End If
+
+            Dim statusText As String = ""
+
+            If statusResult.output IsNot Nothing Then statusText = statusResult.output
+
+            Dim lines() As String = statusText.Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+
+                'SVN status column 6 is the working-copy lock token.
+                If line.Length >= 6 AndAlso line(5) = "K"c Then Return True
+            Next
+        Catch
+        End Try
+
+        Return False
+    End Function
+
+    Public Function handleSolidWorksFileSavePostPublic(ByVal doc As ModelDoc2,
+                                                       ByVal saveType As Integer,
+                                                       ByVal fileName As String) As Integer
+        If automaticSaveEventsSuppressed() Then Return 0
+        If doc Is Nothing Then Return 0
+
+        'Use the event filename first. For exports such as PDF/STEP, doc.GetPathName still
+        'points at the source CAD file and must not accidentally trigger a CAD commit.
+        Dim savedPath As String = fileName
+
+        If String.IsNullOrWhiteSpace(savedPath) Then
+            Try
+                savedPath = doc.GetPathName()
+            Catch
+                savedPath = ""
+            End Try
+        End If
+
+        If String.IsNullOrWhiteSpace(savedPath) Then Return 0
+        If Not isCadFilePath(savedPath) Then Return 0
+        If Not isPathInsideLocalRepo(savedPath) Then Return 0
+
+        If Not isOnlineModeEnabled() Then
+            iSwApp.SendMsgToUser2(
+                "The SOLIDWORKS save completed locally, but automatic SVN commit was not started because Online mode is disabled." & vbCrLf & vbCrLf &
+                "Enable Online and commit this file before closing SOLIDWORKS.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return 0
+        End If
+
+        Try
+            If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(
+                    New MethodInvoker(Sub() queueAutomaticSaveCommitPath(savedPath))
+                )
+            Else
+                queueAutomaticSaveCommitPath(savedPath)
+            End If
+        Catch
+            queueAutomaticSaveCommitPath(savedPath)
+        End Try
+
+        Return 0
+    End Function
+
+    Private Sub queueAutomaticSaveCommitPath(ByVal filePath As String)
+        If String.IsNullOrWhiteSpace(filePath) Then Exit Sub
+        If Not File.Exists(filePath) Then Exit Sub
+        If Not isCadFilePath(filePath) Then Exit Sub
+        If Not isPathInsideLocalRepo(filePath) Then Exit Sub
+
+        Dim normalizedPath As String = normalizeSvnPath(filePath)
+        If String.IsNullOrWhiteSpace(normalizedPath) Then normalizedPath = filePath
+
+        'HashSet coalesces repeated notifications while a commit is pending. Once the current
+        'commit has started, a later Ctrl+S remains queued for one follow-up commit.
+        pendingAutomaticSaveCommitPaths.Add(normalizedPath)
+        processPendingAutomaticSaveCommits()
+    End Sub
+
+    Private Sub processPendingAutomaticSaveCommits()
+        If asyncCommitInProgress Then Exit Sub
+        If automaticSaveCommitPreparing Then Exit Sub
+        If pendingAutomaticSaveCommitPaths.Count = 0 Then Exit Sub
+
+        Dim pathsToCommit() As String = pendingAutomaticSaveCommitPaths.ToArray()
+        pendingAutomaticSaveCommitPaths.Clear()
+
+        automaticSaveCommitPreparing = True
+
+        Dim commitStarted As Boolean = False
+
+        Try
+            commitStarted = prepareAndStartAutomaticSaveCommit(pathsToCommit)
+        Catch ex As Exception
+            commitStarted = False
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "SOLIDWORKS saved the file locally, but automatic SVN commit preparation failed." & vbCrLf & vbCrLf &
+                    ex.Message & vbCrLf & vbCrLf &
+                    "Resolve the issue and commit before closing SOLIDWORKS.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+        Finally
+            automaticSaveCommitPreparing = False
+        End Try
+
+        If Not commitStarted AndAlso pendingAutomaticSaveCommitPaths.Count > 0 Then
+            Try
+                If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                    myUserControl.BeginInvoke(New MethodInvoker(Sub() processPendingAutomaticSaveCommits()))
+                End If
+            Catch
+            End Try
+        End If
+    End Sub
+
+    Private Function prepareAndStartAutomaticSaveCommit(ByVal requestedPaths() As String) As Boolean
+        Dim commitPaths() As String = filterCommitPathsInsideRepoOnly(requestedPaths)
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        If Not prepareExternalReferencesForCommitPaths(commitPaths) Then Return False
+
+        commitPaths = expandFirstCommitAssemblyDatasetPaths(commitPaths)
+        commitPaths = expandAssemblyCommitPathsWithNewFirstCommitChildren(commitPaths)
+        commitPaths = filterCommitPathsInsideRepoOnly(commitPaths)
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        If Not validateCadPathNamesBeforeCommit(commitPaths) Then Return False
+        If Not validateNoDuplicateCadFileNamesForPaths(commitPaths) Then Return False
+        If Not commitPathsAllowedOnlyIfUpToDate(commitPaths) Then Return False
+        If Not commitAssemblyChildrenAllowedOnlyIfCachedUpToDate(commitPaths) Then Return False
+        If Not automaticSaveCommitPathsHaveRequiredLocks(commitPaths) Then Return False
+
+        'The initiating document has already been saved, but a first-commit assembly can add
+        'other open new children. Persist any dirty expanded documents before svn.exe reads them.
+        If Not saveOpenDocsForCommitPaths(commitPaths) Then Return False
+
+        makeFirstCommitCandidatePathsWritable(commitPaths)
+
+        commitPaths = expandCommitPathsWithAddedParentDirectories(commitPaths)
+        commitPaths = filterCommitPathsInsideRepoOnly(commitPaths)
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
+
+        'Capture new CAD paths before svn add changes ? to A. A mixed commit can contain
+        'an already-versioned locked assembly plus one or more brand-new children.
+        Dim firstCommitCadPaths() As String = getFirstCommitCandidateCadPaths(commitPaths)
+        Dim isInitialDataset As Boolean = allCommitPathsAreFirstCommitCandidates(commitPaths)
+
+        runSvnByArgs(commitPaths, "add", bEach:=True)
+
+        If Not svnPropset(commitPaths, "addin:release_state", "||EDIT||") Then
+            iSwApp.SendMsgToUser2(
+                "Automatic commit blocked." & vbCrLf & vbCrLf &
+                "The plugin could not set the SVN release-state property.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return False
+        End If
+
+        Dim commitMessage As String
+
+        If isInitialDataset Then
+            commitMessage = "Initial CAD commit from SOLIDWORKS save"
+        Else
+            Dim savedNames As New List(Of String)()
+
+            For Each p As String In commitPaths
+                If String.IsNullOrWhiteSpace(p) OrElse Directory.Exists(p) Then Continue For
+                savedNames.Add(Path.GetFileName(p))
+            Next
+
+            commitMessage = "Automatic SOLIDWORKS save"
+            If savedNames.Count > 0 Then commitMessage &= ": " & String.Join(", ", savedNames.Distinct().Take(8))
+        End If
+
+        startAutomaticSaveCommitBackground(commitPaths, commitMessage, isInitialDataset, firstCommitCadPaths)
+        Return True
+    End Function
+
+    Private Function automaticSaveCommitPathsHaveRequiredLocks(ByVal commitPaths() As String) As Boolean
+        If commitPaths Is Nothing Then Return False
+
+        Dim missingLocks As New List(Of String)()
+
+        For Each p As String In commitPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+            If Directory.Exists(p) Then Continue For
+            If Not File.Exists(p) Then Continue For
+            If Not isCadFilePath(p) Then Continue For
+            If isFirstCommitCandidatePath(p) Then Continue For
+
+            If Not userHasLocalSvnLockTokenForPath(p) Then
+                missingLocks.Add(p)
+            End If
+        Next
+
+        If missingLocks.Count = 0 Then Return True
+
+        iSwApp.SendMsgToUser2(
+            "Automatic commit blocked." & vbCrLf & vbCrLf &
+            "These versioned CAD files are not locked by you:" & vbCrLf &
+            stringArrToSingleStringWithNewLines(missingLocks.ToArray(), bTrimFileNames:=True, iLimit:=10) & vbCrLf &
+            "Get Locks, save again, and the plugin will commit automatically.",
+            swMessageBoxIcon_e.swMbStop,
+            swMessageBoxBtn_e.swMbOk
+        )
+
+        Return False
+    End Function
+
+    Private Sub startAutomaticSaveCommitBackground(ByVal commitPaths() As String,
+                                                   ByVal commitMessage As String,
+                                                   ByVal isInitialDataset As Boolean,
+                                                   ByVal firstCommitCadPaths() As String)
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Exit Sub
+
+        If asyncCommitInProgress Then
+            For Each p As String In commitPaths
+                If Not String.IsNullOrWhiteSpace(p) Then pendingAutomaticSaveCommitPaths.Add(p)
+            Next
+            Exit Sub
+        End If
+
+        Dim pathsForBackground() As String = CType(commitPaths.Clone(), String())
+        Dim firstCommitPathsForCompletion() As String = Nothing
+
+        If firstCommitCadPaths IsNot Nothing Then
+            firstCommitPathsForCompletion = CType(firstCommitCadPaths.Clone(), String())
+        End If
+
+        Dim savedPathForBackground As String = ""
+
+        Try
+            savedPathForBackground = myUserControl.savedPATH
+        Catch
+            savedPathForBackground = ""
+        End Try
+
+        Dim safeMessage As String = If(commitMessage, "").Replace("""", "'")
+        If String.IsNullOrWhiteSpace(safeMessage) Then safeMessage = "Automatic SOLIDWORKS save"
+
+        asyncCommitInProgress = True
+
+        'Do not alter TreeView node text during automatic Save/Ctrl+S commits.
+        'The commit runs silently; failures are still shown to the user.
+        Task.Run(
+            Sub()
+                Dim success As Boolean = False
+                Dim errorMessage As String = ""
+
+                Try
+                    Dim noUnlockArg As String = If(isInitialDataset, "", "--no-unlock ")
+                    Dim result As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                        sSVNPath,
+                        "commit --non-interactive " & noUnlockArg &
+                        "-m """ & safeMessage & """ " &
+                        quoteFilePathArgs(pathsForBackground),
+                        savedPathForBackground
+                    )
+
+                    If result.outputError IsNot Nothing AndAlso result.outputError.Trim() <> "" Then
+                        errorMessage = result.outputError.Trim()
+                    Else
+                        success = True
+                    End If
+                Catch ex As Exception
+                    success = False
+                    errorMessage = ex.Message
+                End Try
+
+                Try
+                    If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                        myUserControl.BeginInvoke(
+                            New MethodInvoker(
+                                Sub()
+                                    finishAutomaticSaveCommitOnMainThread(
+                                        pathsForBackground,
+                                        success,
+                                        errorMessage,
+                                        isInitialDataset,
+                                        firstCommitPathsForCompletion
+                                    )
+                                End Sub
+                            )
+                        )
+                    Else
+                        asyncCommitInProgress = False
+                    End If
+                Catch
+                    asyncCommitInProgress = False
+                End Try
+            End Sub
+        )
+    End Sub
+
+    Private Sub finishAutomaticSaveCommitOnMainThread(ByVal commitPaths() As String,
+                                                       ByVal success As Boolean,
+                                                       ByVal errorMessage As String,
+                                                       ByVal isInitialDataset As Boolean,
+                                                       ByVal firstCommitCadPaths() As String)
+        asyncCommitInProgress = False
+
+        Try
+            myUserControl.markCommitPendingForFilePathsPublic(commitPaths, False)
+        Catch
+        End Try
+
+        If Not success Then
+            iSwApp.SendMsgToUser2(
+                "SOLIDWORKS saved the file locally, but the automatic SVN commit did not complete." & vbCrLf & vbCrLf &
+                errorMessage & vbCrLf & vbCrLf &
+                "Your local save is still present. Resolve the SVN issue and commit before closing.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+
+            processPendingAutomaticSaveCommits()
+            Exit Sub
+        End If
+
+        Try
+            myUserControl.markCommitResultForFilePathsPublic(commitPaths, True)
+        Catch
+        End Try
+
+        Try
+            If isInitialDataset Then
+                updateStatusCacheForKnownPaths(
+                    commitPaths,
+                    forceAddDelChg1:=" ",
+                    forceLock6:=" ",
+                    forceUpToDate9:=" "
+                )
+            Else
+                'Normal automatic saves use --no-unlock, so existing user-owned locks remain held.
+                updateStatusCacheForKnownPaths(
+                    commitPaths,
+                    forceAddDelChg1:=" ",
+                    forceLock6:="K",
+                    forceUpToDate9:=" "
+                )
+
+                'New files in a mixed assembly commit are not locked yet. Correct their cache
+                'entry before the asynchronous post-commit lock request runs.
+                If firstCommitCadPaths IsNot Nothing AndAlso firstCommitCadPaths.Length > 0 Then
+                    updateStatusCacheForKnownPaths(
+                        firstCommitCadPaths,
+                        forceAddDelChg1:=" ",
+                        forceLock6:=" ",
+                        forceUpToDate9:=" "
+                    )
+                End If
+            End If
+
+            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+        Catch
+        End Try
+
+        If isInitialDataset Then
+            iSwApp.SendMsgToUser2(
+                "Initial commit completed." & vbCrLf & vbCrLf &
+                "The new CAD dataset was added and pushed to SVN automatically." & vbCrLf & vbCrLf &
+                "The plugin will now get locks so the new files remain writable.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+        Else
+            'Keep existing files writable because --no-unlock preserves the user's SVN lock.
+            Try
+                For Each p As String In commitPaths
+                    If String.IsNullOrWhiteSpace(p) OrElse Not File.Exists(p) Then Continue For
+                    If firstCommitCadPaths IsNot Nothing AndAlso firstCommitCadPaths.Any(Function(newPath) pathsAreSame(newPath, p)) Then Continue For
+
+                    File.SetAttributes(p, File.GetAttributes(p) And Not FileAttributes.ReadOnly)
+
+                    Dim openDoc As ModelDoc2 = getOpenModelByPathSafe(p)
+                    If openDoc IsNot Nothing Then openDoc.SetReadOnlyState(False)
+                Next
+            Catch
+            End Try
+        End If
+
+        'Pure first commits and mixed assembly commits both need locks on every newly-added CAD file.
+        If firstCommitCadPaths IsNot Nothing AndAlso firstCommitCadPaths.Length > 0 Then
+            Try
+                getLocksOfPathsAsync(
+                    firstCommitCadPaths,
+                    bBreakLocks:=False,
+                    bUseTortoise:=False,
+                    sMessage:="Auto-lock after automatic save commit"
+                )
+            Catch
+            End Try
+        End If
+
+        processPendingAutomaticSaveCommits()
     End Sub
 
     Private Function getOnlineCheckBoxFromControl(ByVal ctrl As Object) As System.Windows.Forms.CheckBox
@@ -2474,10 +3345,16 @@ Public Module svnModule
         Dim pdfPath As String = System.IO.Path.Combine(drawingDirectory, drawingBaseName & sInputRevision & ".pdf")
 
         iSwApp.ActivateDoc3(getTitleClean(modDoc), True, swRebuildOnActivation_e.swRebuildActiveDoc, 0)
-        bSuccess = modDoc.Extension.SaveAs3(pdfPath,
-                                swSaveAsVersion_e.swSaveAsCurrentVersion,
-                                swSaveAsOptions_e.swSaveAsOptions_Copy,
-                                Nothing, Nothing, errors, warnings)
+
+        beginInternalSolidWorksSave()
+        Try
+            bSuccess = modDoc.Extension.SaveAs3(pdfPath,
+                                    swSaveAsVersion_e.swSaveAsCurrentVersion,
+                                    swSaveAsOptions_e.swSaveAsOptions_Copy,
+                                    Nothing, Nothing, errors, warnings)
+        Finally
+            endInternalSolidWorksSave()
+        End Try
         If Not bSuccess Then
             iSwApp.SendMsgToUser2("Error: " & errors & vbCrLf & "Warnings: " & warnings & vbCrLf & "Lookup: swFileSaveError_e or swFileSaveWarning_e", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
         End If
@@ -2498,10 +3375,16 @@ Public Module svnModule
         iSwApp.ActivateDoc3(getTitleClean(modDoc), True, swRebuildOnActivation_e.swRebuildActiveDoc, 0)
         modDoc.ClearSelection2(True)
         componentDoc = iSwApp.ActiveDoc
-        bSuccess = componentDoc.Extension.SaveAs3(stepPath,
-                                       swSaveAsVersion_e.swSaveAsCurrentVersion,
-                                       swSaveAsOptions_e.swSaveAsOptions_Copy + swSaveAsOptions_e.swSaveAsOptions_AvoidRebuildOnSave,
-                                       Nothing, Nothing, errors, warnings)
+
+        beginInternalSolidWorksSave()
+        Try
+            bSuccess = componentDoc.Extension.SaveAs3(stepPath,
+                                           swSaveAsVersion_e.swSaveAsCurrentVersion,
+                                           swSaveAsOptions_e.swSaveAsOptions_Copy + swSaveAsOptions_e.swSaveAsOptions_AvoidRebuildOnSave,
+                                           Nothing, Nothing, errors, warnings)
+        Finally
+            endInternalSolidWorksSave()
+        End Try
         If Not bSuccess Then
             iSwApp.SendMsgToUser2("Error: " & errors & vbCrLf & "Warnings: " & warnings & vbCrLf & "Lookup: swFileSaveError_e or swFileSaveWarning_e", swMessageBoxIcon_e.swMbWarning, swMessageBoxBtn_e.swMbOk)
         End If
@@ -2545,17 +3428,64 @@ Public Module svnModule
         End If
     End Function
 
-    Private Function isPathInsideLocalRepo(filePath As String) As Boolean
-        If String.IsNullOrWhiteSpace(filePath) Then Return False
-        If myUserControl Is Nothing Then Return False
+    Private Function getResolvedSvnWorkingCopyRootPath() As String
+        If myUserControl Is Nothing OrElse myUserControl.localRepoPath Is Nothing Then Return ""
+
+        Dim configuredPath As String = ""
 
         Try
-            Dim repoRoot As String = Path.GetFullPath(myUserControl.localRepoPath.Text).TrimEnd("\"c)
+            configuredPath = Path.GetFullPath(myUserControl.localRepoPath.Text.Trim()).TrimEnd("\"c)
+        Catch
+            configuredPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(configuredPath) Then Return ""
+
+        If String.Equals(configuredPath,
+                         cachedConfiguredRepoPathForWorkingCopyRoot,
+                         StringComparison.OrdinalIgnoreCase) AndAlso
+           Not String.IsNullOrWhiteSpace(cachedResolvedWorkingCopyRoot) Then
+            Return cachedResolvedWorkingCopyRoot
+        End If
+
+        cachedConfiguredRepoPathForWorkingCopyRoot = configuredPath
+        cachedResolvedWorkingCopyRoot = configuredPath
+
+        Try
+            If Directory.Exists(configuredPath) Then
+                Dim infoResult As rawProcessReturn = runSvnProcess(
+                    sSVNPath,
+                    "info --show-item wc-root --non-interactive """ & configuredPath & """")
+
+                Dim outputText As String = If(infoResult.output, "").Trim()
+
+                If Not String.IsNullOrWhiteSpace(outputText) Then
+                    Dim firstLine As String = outputText.
+                        Split({vbCrLf, vbLf}, StringSplitOptions.RemoveEmptyEntries).
+                        FirstOrDefault()
+
+                    If Not String.IsNullOrWhiteSpace(firstLine) Then
+                        Dim resolvedRoot As String = Path.GetFullPath(firstLine.Trim().Trim(""""c)).TrimEnd("\"c)
+                        If Directory.Exists(resolvedRoot) Then cachedResolvedWorkingCopyRoot = resolvedRoot
+                    End If
+                End If
+            End If
+        Catch
+            'Fallback remains the folder selected in PlumVault.
+        End Try
+
+        Return cachedResolvedWorkingCopyRoot
+    End Function
+
+    Private Function isPathInsideLocalRepo(filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Try
+            Dim repoRoot As String = getResolvedSvnWorkingCopyRootPath()
             Dim fullPath As String = Path.GetFullPath(filePath).TrimEnd("\"c)
 
-            If String.Equals(fullPath, repoRoot, StringComparison.OrdinalIgnoreCase) Then
-                Return True
-            End If
+            If String.IsNullOrWhiteSpace(repoRoot) Then Return False
+            If String.Equals(fullPath, repoRoot, StringComparison.OrdinalIgnoreCase) Then Return True
 
             Return fullPath.StartsWith(repoRoot & "\", StringComparison.OrdinalIgnoreCase)
         Catch
@@ -2584,11 +3514,11 @@ Public Module svnModule
     End Function
 
     Private Function getGrc27RootPath() As String
-        Return Path.Combine(myUserControl.localRepoPath.Text.TrimEnd("\"c), "GRC27")
+        Return Path.Combine(getResolvedSvnWorkingCopyRootPath(), "GRC27")
     End Function
 
     Private Function getVendorPartsRootPath() As String
-        Return Path.Combine(myUserControl.localRepoPath.Text.TrimEnd("\"c), "Vendor Parts")
+        Return Path.Combine(getResolvedSvnWorkingCopyRootPath(), "Vendor Parts")
     End Function
 
     Private Function isPathInsideFolder(filePath As String, folderPath As String) As Boolean
@@ -2607,8 +3537,40 @@ Public Module svnModule
         End Try
     End Function
 
+    Private Function pathContainsNamedFolderSegment(ByVal fileOrFolderPath As String,
+                                                    ByVal rootFolder As String,
+                                                    ByVal requiredFolderName As String) As Boolean
+        If String.IsNullOrWhiteSpace(fileOrFolderPath) Then Return False
+        If String.IsNullOrWhiteSpace(rootFolder) Then Return False
+        If String.IsNullOrWhiteSpace(requiredFolderName) Then Return False
+
+        Try
+            Dim root As String = Path.GetFullPath(rootFolder).TrimEnd("\"c, "/"c)
+            Dim fullPath As String = Path.GetFullPath(fileOrFolderPath).TrimEnd("\"c, "/"c)
+
+            If Not String.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase) AndAlso
+               Not fullPath.StartsWith(root & Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) Then
+                Return False
+            End If
+
+            Dim relativePath As String = fullPath.Substring(root.Length).TrimStart("\"c, "/"c)
+            If String.IsNullOrWhiteSpace(relativePath) Then Return False
+
+            Dim segments() As String = relativePath.Split(New Char() {"\"c, "/"c}, StringSplitOptions.RemoveEmptyEntries)
+
+            For Each segment As String In segments
+                If String.Equals(segment, requiredFolderName, StringComparison.OrdinalIgnoreCase) Then Return True
+            Next
+        Catch
+            Return False
+        End Try
+
+        Return False
+    End Function
+
     Private Function isVendorPartPath(filePath As String) As Boolean
-        Return isPathInsideFolder(filePath, getVendorPartsRootPath())
+        Dim repoRoot As String = getResolvedSvnWorkingCopyRootPath()
+        Return pathContainsNamedFolderSegment(filePath, repoRoot, "Vendor Parts")
     End Function
 
     Private Function isCadFilePath(filePath As String) As Boolean
@@ -2626,7 +3588,7 @@ Public Module svnModule
 
         Return System.Text.RegularExpressions.Regex.IsMatch(
         fileName,
-        "^GRC27_(BR|DT|AE|FR|EL|ST|SU|WT|MI)_[A-Z]{0,3}\d+_R\d+\.(SLDPRT|SLDASM|SLDDRW)$",
+        "^(GRC|CFD)27_(BR|DT|AE|FR|EL|ST|SU|WT|MI)_[A-Z]{0,3}\d+_R\d+\.(SLDPRT|SLDASM|SLDDRW)$",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase
     )
     End Function
@@ -2645,15 +3607,15 @@ Public Module svnModule
 
         Do
             Dim inputName As String = InputBox(
-            "This file does not follow the GRC27 naming convention." & vbCrLf & vbCrLf &
+            "This file does not follow the GRC27/CFD27 naming convention." & vbCrLf & vbCrLf &
             "Original file:" & vbCrLf &
             Path.GetFileName(originalPath) & vbCrLf & vbCrLf &
             "Required format:" & vbCrLf &
-            "GRC27_CODE_00000_R# or GRC27_CODE_A0000_R# or GRC27_CODE_AB0000_R# or GRC27_CODE_ABC0000_R#" & vbCrLf & vbCrLf &
+            "PREFIX_CODE_00000_R# or PREFIX_CODE_A0000_R# or PREFIX_CODE_AB0000_R# or PREFIX_CODE_ABC0000_R# (PREFIX = GRC27 or CFD27)" & vbCrLf & vbCrLf &
             "Allowed codes:" & vbCrLf &
             "BR, DT, AE, FR, EL, ST, SU, WT, MI" & vbCrLf & vbCrLf &
             "Enter the new file name without extension:",
-            "GRC27 File Naming Required",
+            "GRC27/CFD27 File Naming Required",
             originalNameNoExt
         )
 
@@ -2672,14 +3634,14 @@ Public Module svnModule
             iSwApp.SendMsgToUser2(
             "Invalid file name." & vbCrLf & vbCrLf &
             "Please use this format:" & vbCrLf &
-            "GRC27_CODE_00000_R# or GRC27_CODE_A0000_R# or GRC27_CODE_AB0000_R# or GRC27_CODE_ABC0000_R#" & vbCrLf & vbCrLf &
+            "PREFIX_CODE_00000_R# or PREFIX_CODE_A0000_R# or PREFIX_CODE_AB0000_R# or PREFIX_CODE_ABC0000_R# (PREFIX = GRC27 or CFD27)" & vbCrLf & vbCrLf &
             "Allowed codes:" & vbCrLf &
             "BR, DT, AE, FR, EL, ST, SU, WT, MI" & vbCrLf & vbCrLf &
             "Example:" & vbCrLf &
             "GRC27_AE_00001_R1" & ext & vbCrLf &
-            "GRC27_AE_A0001_R1" & ext & vbCrLf &
+            "CFD27_AE_A0001_R1" & ext & vbCrLf &
             "GRC27_AE_AB0001_R1" & ext & vbCrLf &
-            "GRC27_AE_ABC0001_R1" & ext,
+            "CFD27_AE_ABC0001_R1" & ext,
             swMessageBoxIcon_e.swMbWarning,
             swMessageBoxBtn_e.swMbOk
 )
@@ -2866,19 +3828,26 @@ Public Module svnModule
                 activePath = activeDoc.GetPathName()
             End If
 
-            'Save a copy using the new GRC27 name.
+            'Save a copy using the new valid GRC27/CFD27 name.
             Dim errors As Integer = 0
             Dim warnings As Integer = 0
 
-            Dim saveOk As Boolean = modDoc.Extension.SaveAs3(
-            newPath,
-            swSaveAsVersion_e.swSaveAsCurrentVersion,
-            swSaveAsOptions_e.swSaveAsOptions_Silent,
-            Nothing,
-            Nothing,
-            errors,
-            warnings
-        )
+            Dim saveOk As Boolean = False
+
+            beginInternalSolidWorksSave()
+            Try
+                saveOk = modDoc.Extension.SaveAs3(
+                    newPath,
+                    swSaveAsVersion_e.swSaveAsCurrentVersion,
+                    swSaveAsOptions_e.swSaveAsOptions_Silent,
+                    Nothing,
+                    Nothing,
+                    errors,
+                    warnings
+                )
+            Finally
+                endInternalSolidWorksSave()
+            End Try
 
             If Not saveOk Then
                 iSwApp.SendMsgToUser2(
@@ -3059,7 +4028,7 @@ Public Module svnModule
             If Not isCadFilePath(docPath) Then Continue For
 
             'Debug override:
-            'Used only for testing/import cleanup. It bypasses the GRC27 naming convention prompt,
+            'Used only for testing/import cleanup. It bypasses the GRC27/CFD27 naming convention prompt,
             'but still keeps duplicate checks, repo checks, add/commit behavior, etc.
             If shouldIgnoreGrc27NamingConventionForDebug() Then Continue For
 
@@ -3071,10 +4040,10 @@ Public Module svnModule
 
             If Not isValidGrc27FileName(docPath) Then
                 Dim result As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
-                "This CAD file does not follow the GRC27 naming convention:" & vbCrLf & vbCrLf &
+                "This CAD file does not follow the GRC27/CFD27 naming convention:" & vbCrLf & vbCrLf &
                 Path.GetFileName(docPath) & vbCrLf & vbCrLf &
                 "Normal CAD must use:" & vbCrLf &
-                "GRC27_CODE_00000_R# or GRC27_CODE_A0000_R# or GRC27_CODE_AB0000_R# or GRC27_CODE_ABC0000_R#" & vbCrLf & vbCrLf &
+                "PREFIX_CODE_00000_R# or PREFIX_CODE_A0000_R# or PREFIX_CODE_AB0000_R# or PREFIX_CODE_ABC0000_R# (PREFIX = GRC27 or CFD27)" & vbCrLf & vbCrLf &
                 "Would you like to rename it now?",
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbYesNo
@@ -4080,7 +5049,12 @@ Public Module svnModule
                 CInt(swSaveAsOptions_e.swSaveAsOptions_Silent) Or
                 CInt(swSaveAsOptions_e.swSaveAsOptions_AvoidRebuildOnSave)
 
-            Return activeDoc.Save3(saveOptions, saveErrors, saveWarnings)
+            beginInternalSolidWorksSave()
+            Try
+                Return activeDoc.Save3(saveOptions, saveErrors, saveWarnings)
+            Finally
+                endInternalSolidWorksSave()
+            End Try
         Catch
             Return False
         End Try
@@ -4177,11 +5151,16 @@ Public Module svnModule
         Dim recoverySaveSucceeded As Boolean = False
 
         Try
-            recoverySaveSucceeded = activeDoc.Save3(
-                swSaveAsOptions_e.swSaveAsOptions_Silent,
-                recoveryErrors,
-                recoveryWarnings
-            )
+            beginInternalSolidWorksSave()
+            Try
+                recoverySaveSucceeded = activeDoc.Save3(
+                    swSaveAsOptions_e.swSaveAsOptions_Silent,
+                    recoveryErrors,
+                    recoveryWarnings
+                )
+            Finally
+                endInternalSolidWorksSave()
+            End Try
         Catch
             recoverySaveSucceeded = False
         End Try
@@ -4593,7 +5572,7 @@ Public Module svnModule
         Dim vendorResponse As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
     "Is this a vendor part?" & vbCrLf & vbCrLf &
     "Yes = save under Vendor Parts and keep the vendor file name." & vbCrLf &
-    "No = this is normal GRC27 CAD. It cannot go under Vendor Parts and the GRC27 naming convention will be enforced.",
+    "No = this is normal GRC27/CFD27 CAD. It cannot go under Vendor Parts and the GRC27/CFD27 naming convention will be enforced.",
     swMessageBoxIcon_e.swMbQuestion,
     swMessageBoxBtn_e.swMbYesNo
 )
@@ -4650,7 +5629,7 @@ Public Module svnModule
 
             If isVendorPartPath(destinationFolder) Then
                 iSwApp.SendMsgToUser2(
-            "Normal GRC27 CAD cannot be saved inside Vendor Parts." & vbCrLf & vbCrLf &
+            "Normal GRC27/CFD27 CAD cannot be saved inside Vendor Parts." & vbCrLf & vbCrLf &
             "Choose Yes on the vendor question if this is a standard/vendor part.",
             swMessageBoxIcon_e.swMbStop,
             swMessageBoxBtn_e.swMbOk
@@ -5132,6 +6111,28 @@ Public Module svnModule
         Return foundFirstCommitCad
     End Function
 
+    Private Function getFirstCommitCandidateCadPaths(ByVal commitPaths() As String) As String()
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each p As String In commitPaths
+            If String.IsNullOrWhiteSpace(p) Then Continue For
+            If Not File.Exists(p) Then Continue For
+            If Not isCadFilePath(p) Then Continue For
+            If Not isFirstCommitCandidatePath(p) Then Continue For
+
+            Dim normalizedPath As String = normalizeSvnPath(p)
+            If String.IsNullOrWhiteSpace(normalizedPath) Then normalizedPath = p
+
+            If seen.Add(normalizedPath) Then output.Add(normalizedPath)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
     Private Function autoCommitFirstDatasetPaths(ByVal commitPaths() As String, ByVal sCommitMessage As String) As Boolean
         If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return False
 
@@ -5420,7 +6421,16 @@ Public Module svnModule
 
         svnPropset(sModDocPathArr, "addin:release_state", "||EDIT||")
 
-        If save3AndShowErrorMessages(modDocArr) <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
+        Dim saveResult As swMessageBoxResult_e
+
+        beginInternalSolidWorksSave()
+        Try
+            saveResult = save3AndShowErrorMessages(modDocArr)
+        Finally
+            endInternalSolidWorksSave()
+        End Try
+
+        If saveResult <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
 
         'Run the upload/commit portion in the background so SolidWorks stays usable.
         'All SolidWorks API work above this point has already finished on the main thread.
@@ -5565,7 +6575,7 @@ Public Module svnModule
 
                 If openDoc IsNot Nothing Then
                     Dim result As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
-                        "This CAD file does not follow the GRC27 naming convention:" & vbCrLf & vbCrLf &
+                        "This CAD file does not follow the GRC27/CFD27 naming convention:" & vbCrLf & vbCrLf &
                         Path.GetFileName(docPath) & vbCrLf & vbCrLf &
                         "Would you like to rename it now?",
                         swMessageBoxIcon_e.swMbWarning,
@@ -5582,7 +6592,7 @@ Public Module svnModule
                 Else
                     iSwApp.SendMsgToUser2(
                         "Commit blocked." & vbCrLf & vbCrLf &
-                        "This CAD file does not follow the GRC27 naming convention:" & vbCrLf & vbCrLf &
+                        "This CAD file does not follow the GRC27/CFD27 naming convention:" & vbCrLf & vbCrLf &
                         Path.GetFileName(docPath) & vbCrLf & vbCrLf &
                         "Open the file and rename it, or enable Debug: ignore naming for testing.",
                         swMessageBoxIcon_e.swMbStop,
@@ -5825,7 +6835,16 @@ Public Module svnModule
                 Dim errors As Integer = 0
                 Dim warnings As Integer = 0
 
-                If Not doc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, errors, warnings) Then
+                Dim saveSucceeded As Boolean = False
+
+                beginInternalSolidWorksSave()
+                Try
+                    saveSucceeded = doc.Save3(swSaveAsOptions_e.swSaveAsOptions_Silent, errors, warnings)
+                Finally
+                    endInternalSolidWorksSave()
+                End Try
+
+                If Not saveSucceeded Then
                     iSwApp.SendMsgToUser2(
                         "Commit blocked." & vbCrLf & vbCrLf &
                         "Could not save the selected CAD file before commit:" & vbCrLf &
@@ -6004,6 +7023,7 @@ Public Module svnModule
             iSwApp.SendMsgToUser2("Commit did not complete." & vbCrLf & vbCrLf & errorMessage,
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk)
+            processPendingAutomaticSaveCommits()
             Exit Sub
         End If
 
@@ -6033,6 +7053,8 @@ Public Module svnModule
             End If
         Catch
         End Try
+
+        processPendingAutomaticSaveCommits()
     End Sub
 
     Private Function autoCommitFirstDatasetPathsBackground(ByVal commitPaths() As String,
@@ -7344,7 +8366,16 @@ Public Module svnModule
 
         keepNewUncommittedCadFilesWritable()
 
-        If save3AndShowErrorMessages(modDocArr) <> swMessageBoxResult_e.swMbHitYes Then Return False
+        Dim saveResult As swMessageBoxResult_e
+
+        beginInternalSolidWorksSave()
+        Try
+            saveResult = save3AndShowErrorMessages(modDocArr)
+        Finally
+            endInternalSolidWorksSave()
+        End Try
+
+        If saveResult <> swMessageBoxResult_e.swMbHitYes Then Return False
 
         keepNewUncommittedCadFilesWritable()
 
@@ -8101,6 +9132,1643 @@ Public Module svnModule
 
         Return Nothing
     End Function
+    '==========================================================================
+    ' COPY LEGACY DATA TO SVN
+    '==========================================================================
+
+    Public Sub showLegacyImportWizardPublic()
+        If iSwApp Is Nothing OrElse myUserControl Is Nothing Then Exit Sub
+
+        If asyncCommitInProgress Then
+            iSwApp.SendMsgToUser2(
+                "A Commit operation is already running." & vbCrLf & vbCrLf &
+                "Wait for it to finish before starting a legacy import.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If legacyImportInProgress Then
+            iSwApp.SendMsgToUser2(
+                "A legacy import is already in progress.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim activeDoc As ModelDoc2 = Nothing
+
+        Try
+            activeDoc = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Catch
+            activeDoc = Nothing
+        End Try
+
+        If activeDoc Is Nothing Then
+            iSwApp.SendMsgToUser2(
+                "Open the top-level legacy assembly before using Copy Legacy Data to SVN.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Try
+            If CInt(activeDoc.GetType()) <> CInt(swDocumentTypes_e.swDocASSEMBLY) Then
+                iSwApp.SendMsgToUser2(
+                    "Copy Legacy Data to SVN must be started from an open top-level assembly.",
+                    swMessageBoxIcon_e.swMbInformation,
+                    swMessageBoxBtn_e.swMbOk)
+                Exit Sub
+            End If
+        Catch
+            iSwApp.SendMsgToUser2(
+                "The active SOLIDWORKS document could not be verified as an assembly.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End Try
+
+        Dim topAssemblyPath As String = ""
+
+        Try
+            topAssemblyPath = activeDoc.GetPathName()
+        Catch
+            topAssemblyPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(topAssemblyPath) Then
+            iSwApp.SendMsgToUser2(
+                "Save the legacy top-level assembly outside SVN before starting the import.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+
+        If String.IsNullOrWhiteSpace(repoRoot) OrElse Not Directory.Exists(repoRoot) Then
+            iSwApp.SendMsgToUser2(
+                "The local SVN working-copy folder is not valid." & vbCrLf & vbCrLf &
+                "Pick any folder in your SVN working copy in PlumVault, then try again.",
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If isLegacySameOrChildPath(topAssemblyPath, repoRoot) Then
+            iSwApp.SendMsgToUser2(
+                "This command is for copying a legacy assembly from outside the SVN working copy." & vbCrLf & vbCrLf &
+                "The active assembly is already inside SVN:" & vbCrLf &
+                topAssemblyPath,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        'The destination prompt intentionally comes before the Pack and Go scan/table.
+        Dim selectedGrcDestination As String = pickLegacyGrcDestinationFolderPublic("")
+        If String.IsNullOrWhiteSpace(selectedGrcDestination) Then Exit Sub
+
+        'Vendor parts always default to the canonical Vendor Parts folder at the
+        'actual SVN working-copy root. The general vendor-path rule still accepts
+        'any deeper location containing a folder segment named Vendor Parts.
+        Dim automaticVendorDestination As String = Path.Combine(repoRoot, "Vendor Parts")
+
+        Dim errorMessage As String = ""
+        Dim plan As LegacyImportPlan = buildLegacyImportPlan(
+            activeDoc,
+            selectedGrcDestination,
+            automaticVendorDestination,
+            errorMessage)
+
+        If plan Is Nothing Then
+            If String.IsNullOrWhiteSpace(errorMessage) Then errorMessage = "The legacy assembly could not be scanned."
+
+            iSwApp.SendMsgToUser2(
+                errorMessage,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        'Prepare both destinations before the table opens. This supports folders
+        'created in Windows Explorer and ensures empty folders are actually added
+        'and committed to SVN before Pack and Go writes CAD files into them.
+        If Not prepareLegacyDestinationFolderForReview(
+            selectedGrcDestination,
+            "Create legacy CAD import destination",
+            errorMessage) Then
+
+            iSwApp.SendMsgToUser2(
+                errorMessage,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        If Not prepareLegacyDestinationFolderForReview(
+            automaticVendorDestination,
+            "Create Vendor Parts folder",
+            errorMessage) Then
+
+            iSwApp.SendMsgToUser2(
+                errorMessage,
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
+        Using wizard As New LegacyImportForm(plan)
+            wizard.ShowDialog(myUserControl)
+        End Using
+    End Sub
+
+    Private Function buildLegacyImportPlan(ByVal topAssembly As ModelDoc2,
+                                           ByVal selectedGrcDestination As String,
+                                           ByVal automaticVendorDestination As String,
+                                           ByRef errorMessage As String) As LegacyImportPlan
+        errorMessage = ""
+        If topAssembly Is Nothing Then
+            errorMessage = "The top-level assembly is not available."
+            Return Nothing
+        End If
+
+        Dim topPath As String = ""
+
+        Try
+            topPath = Path.GetFullPath(topAssembly.GetPathName())
+        Catch
+            topPath = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(topPath) Then
+            errorMessage = "The top-level assembly must be saved before it can be imported."
+            Return Nothing
+        End If
+
+        Dim sourceNames() As String = Nothing
+
+        If Not tryGetLegacyPackAndGoDocumentNames(topAssembly, sourceNames, errorMessage) Then
+            Return Nothing
+        End If
+
+        If sourceNames Is Nothing OrElse sourceNames.Length = 0 Then
+            errorMessage = "Pack and Go did not return any SOLIDWORKS files."
+            Return Nothing
+        End If
+
+        Dim plan As New LegacyImportPlan()
+        plan.SourceTopAssemblyPath = topPath
+        plan.PackAndGoSourceNames = CType(sourceNames.Clone(), String())
+        plan.LocalRepoRootFolder = getLocalRepoRootPathForLegacyImport()
+        plan.GrcRootFolder = plan.LocalRepoRootFolder
+        plan.VendorRootFolder = automaticVendorDestination
+        plan.ExistingRepoFileNames = getExistingRepoCadFileNamesForLegacyImport()
+        plan.ExistingRepoModelIds = getExistingRepoModelIdsForLegacyImport()
+
+        plan.GrcDestinationFolder = normalizeLegacyFolderPath(selectedGrcDestination)
+        plan.VendorDestinationFolder = normalizeLegacyFolderPath(automaticVendorDestination)
+
+        Dim virtualComponentKeys As HashSet(Of String) = getLegacyVirtualComponentKeys(topAssembly)
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Dim items As New List(Of LegacyImportItem)()
+
+        For Each rawSourcePath As String In sourceNames
+            If String.IsNullOrWhiteSpace(rawSourcePath) Then Continue For
+
+            Dim sourcePath As String = rawSourcePath
+
+            Try
+                If Not sourcePath.Contains("^") Then sourcePath = Path.GetFullPath(sourcePath)
+            Catch
+            End Try
+
+            If seen.Contains(sourcePath) Then Continue For
+            seen.Add(sourcePath)
+
+            Dim extension As String = ""
+
+            Try
+                extension = Path.GetExtension(sourcePath).ToUpperInvariant()
+            Catch
+                extension = ""
+            End Try
+
+            Dim sourceType As LegacyImportSourceType
+            Dim targetType As LegacyImportTargetType
+
+            Select Case extension
+                Case ".SLDASM"
+                    sourceType = LegacyImportSourceType.Assembly
+                    targetType = LegacyImportTargetType.Assembly
+                Case ".SLDPRT"
+                    sourceType = LegacyImportSourceType.Part
+                    targetType = LegacyImportTargetType.Part
+                Case ".SLDDRW"
+                    sourceType = LegacyImportSourceType.Drawing
+                    targetType = LegacyImportTargetType.Drawing
+                Case Else
+                    errorMessage =
+                        "Pack and Go found an unsupported referenced file:" & vbCrLf & vbCrLf &
+                        sourcePath & vbCrLf & vbCrLf &
+                        "Only SLDASM, SLDPRT, and SLDDRW files are supported by the legacy import table."
+                    Return Nothing
+            End Select
+
+            If isLegacySameOrChildPath(sourcePath, plan.LocalRepoRootFolder) Then
+                errorMessage =
+                    "The legacy assembly already references a file inside the SVN working copy:" & vbCrLf & vbCrLf &
+                    sourcePath & vbCrLf & vbCrLf &
+                    "For this first version of Legacy Import, remove or replace mixed SVN references before importing. " &
+                    "This prevents Pack and Go from overwriting or duplicating an existing managed file."
+                Return Nothing
+            End If
+
+            Dim proposedId As String = ""
+            Dim originalName As String = ""
+
+            Try
+                originalName = Path.GetFileName(sourcePath)
+            Catch
+                originalName = sourcePath
+            End Try
+
+            If isValidGrc27FileName(originalName) Then
+                proposedId = Path.GetFileNameWithoutExtension(originalName)
+            End If
+
+            items.Add(New LegacyImportItem With {
+                .SourcePath = sourcePath,
+                .SourceType = sourceType,
+                .TargetType = targetType,
+                .ProposedId = proposedId,
+                .FinalFileName = "",
+                .DestinationPath = "",
+                .IsChecked = False,
+                .IsValid = False,
+                .ValidationMessage = "Not checked",
+                .IsVirtualComponent = isLegacyVirtualSourcePath(sourcePath, virtualComponentKeys)
+            })
+        Next
+
+        If items.Count = 0 Then
+            errorMessage = "No supported SOLIDWORKS files were found."
+            Return Nothing
+        End If
+
+        plan.Items = items.
+            OrderByDescending(Function(item) pathsAreSame(item.SourcePath, topPath)).
+            ThenBy(Function(item) CInt(item.SourceType)).
+            ThenBy(Function(item) item.OriginalFileName, StringComparer.OrdinalIgnoreCase).
+            ToList()
+
+        Return plan
+    End Function
+
+    Private Function tryGetLegacyPackAndGoDocumentNames(ByVal topAssembly As ModelDoc2,
+                                                         ByRef sourceNames() As String,
+                                                         ByRef errorMessage As String) As Boolean
+        sourceNames = Nothing
+        errorMessage = ""
+
+        Try
+            Dim packAndGo As PackAndGo = topAssembly.Extension.GetPackAndGo()
+
+            If packAndGo Is Nothing Then
+                errorMessage = "SOLIDWORKS did not return a Pack and Go object."
+                Return False
+            End If
+
+            'Include the full legacy assembly definition in the review table.
+            packAndGo.IncludeDrawings = True
+            packAndGo.IncludeSuppressed = True
+            packAndGo.IncludeToolboxComponents = True
+
+            Try
+                packAndGo.IncludeSimulationResults = False
+            Catch
+            End Try
+
+            Dim namesObject As Object = Nothing
+
+            If Not packAndGo.GetDocumentNames(namesObject) Then
+                errorMessage = "SOLIDWORKS Pack and Go could not return the assembly document list."
+                Return False
+            End If
+
+            Dim namesArray As Array = TryCast(namesObject, Array)
+
+            If namesArray Is Nothing OrElse namesArray.Length = 0 Then
+                errorMessage = "SOLIDWORKS Pack and Go returned an empty assembly document list."
+                Return False
+            End If
+
+            Dim output As New List(Of String)()
+
+            For Each value As Object In namesArray
+                Dim valueText As String = Convert.ToString(value)
+                If Not String.IsNullOrWhiteSpace(valueText) Then output.Add(valueText)
+            Next
+
+            sourceNames = output.ToArray()
+            Return sourceNames.Length > 0
+        Catch ex As Exception
+            errorMessage = "Could not scan the legacy assembly with SOLIDWORKS Pack and Go." & vbCrLf & vbCrLf & ex.Message
+            Return False
+        End Try
+    End Function
+
+    Private Function getLegacyVirtualComponentKeys(ByVal topAssembly As ModelDoc2) As HashSet(Of String)
+        Dim output As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        If topAssembly Is Nothing Then Return output
+
+        Try
+            Dim assemblyDoc As AssemblyDoc = TryCast(topAssembly, AssemblyDoc)
+            If assemblyDoc Is Nothing Then Return output
+
+            Dim componentsObject As Object = assemblyDoc.GetComponents(False)
+            Dim componentsArray As Array = TryCast(componentsObject, Array)
+            If componentsArray Is Nothing Then Return output
+
+            For Each componentObject As Object In componentsArray
+                Dim component As Component2 = TryCast(componentObject, Component2)
+                If component Is Nothing Then Continue For
+
+                Dim isVirtual As Boolean = False
+
+                Try
+                    isVirtual = component.IsVirtual
+                Catch
+                    isVirtual = False
+                End Try
+
+                If Not isVirtual Then Continue For
+
+                Try
+                    addLegacyVirtualComponentKey(output, component.GetPathName())
+                Catch
+                End Try
+
+                Try
+                    addLegacyVirtualComponentKey(output, component.Name2)
+                Catch
+                End Try
+
+                Try
+                    Dim model As ModelDoc2 = TryCast(component.GetModelDoc2(), ModelDoc2)
+                    If model IsNot Nothing Then
+                        Try
+                            addLegacyVirtualComponentKey(output, model.GetPathName())
+                        Catch
+                        End Try
+
+                        Try
+                            addLegacyVirtualComponentKey(output, model.GetTitle())
+                        Catch
+                        End Try
+                    End If
+                Catch
+                End Try
+            Next
+        Catch
+        End Try
+
+        Return output
+    End Function
+
+    Private Sub addLegacyVirtualComponentKey(ByVal keys As HashSet(Of String),
+                                             ByVal value As String)
+        If keys Is Nothing OrElse String.IsNullOrWhiteSpace(value) Then Exit Sub
+
+        Dim cleanValue As String = value.Trim().Trim(""""c)
+        If String.IsNullOrWhiteSpace(cleanValue) Then Exit Sub
+
+        keys.Add(cleanValue)
+
+        Try
+            keys.Add(normalizeLegacySourcePath(cleanValue))
+        Catch
+        End Try
+
+        Try
+            Dim fileName As String = Path.GetFileName(cleanValue)
+            If Not String.IsNullOrWhiteSpace(fileName) Then keys.Add(fileName)
+        Catch
+        End Try
+    End Sub
+
+    Private Function isLegacyVirtualSourcePath(ByVal sourcePath As String,
+                                               ByVal virtualComponentKeys As HashSet(Of String)) As Boolean
+        If String.IsNullOrWhiteSpace(sourcePath) Then Return False
+
+        If sourcePath.Contains("^") Then Return True
+
+        Dim normalizedSource As String = normalizeLegacySourcePath(sourcePath)
+        Dim sourceFileName As String = ""
+
+        Try
+            sourceFileName = Path.GetFileName(sourcePath)
+        Catch
+            sourceFileName = ""
+        End Try
+
+        If virtualComponentKeys IsNot Nothing Then
+            If virtualComponentKeys.Contains(sourcePath) OrElse
+               virtualComponentKeys.Contains(normalizedSource) OrElse
+               (Not String.IsNullOrWhiteSpace(sourceFileName) AndAlso virtualComponentKeys.Contains(sourceFileName)) Then
+                Return True
+            End If
+        End If
+
+        'SOLIDWORKS commonly exposes embedded virtual components through a temporary
+        'AppData path in the Pack and Go document list. Treat those as virtual so the
+        'table explains the problem before SetDocumentSaveToNames is called.
+        If normalizedSource.IndexOf("\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) >= 0 Then
+            Return True
+        End If
+
+        Return False
+    End Function
+
+    Public Function pickLegacyGrcDestinationFolderPublic(ByVal currentFolder As String) As String
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+
+        Return pickLegacyDestinationFolderInternal(
+            currentFolder,
+            repoRoot,
+            "Choose where the imported assembly, parts, and drawings should be copied.",
+            rejectVendorPartsFolder:=True)
+    End Function
+
+    Public Function pickLegacyVendorDestinationFolderPublic(ByVal currentFolder As String) As String
+        'Retained for compatibility with older UI code. New imports automatically
+        'use the canonical Vendor Parts folder at the working-copy root.
+        Return Path.Combine(getLocalRepoRootPathForLegacyImport(), "Vendor Parts")
+    End Function
+
+    Private Function pickLegacyDestinationFolderInternal(ByVal currentFolder As String,
+                                                          ByVal allowedRoot As String,
+                                                          ByVal description As String,
+                                                          Optional ByVal rejectVendorPartsFolder As Boolean = False) As String
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+        Dim normalizedAllowedRoot As String = normalizeLegacyFolderPath(allowedRoot)
+        Dim normalizedRepoRoot As String = normalizeLegacyFolderPath(repoRoot)
+
+        Using dialog As New FolderBrowserDialog()
+            dialog.Description = description & vbCrLf & vbCrLf &
+                                 "You may select an existing folder or click New Folder. " &
+                                 "If the folder is new or unversioned, PlumVault will add and commit the empty folder before the import table opens." & vbCrLf & vbCrLf &
+                                 "SVN working copy:" & vbCrLf & repoRoot
+            dialog.ShowNewFolderButton = True
+
+            Dim initialPath As String = getNearestExistingLegacyFolder(currentFolder)
+
+            If String.IsNullOrWhiteSpace(initialPath) Then
+                initialPath = getNearestExistingLegacyFolder(normalizedAllowedRoot)
+            End If
+
+            If String.IsNullOrWhiteSpace(initialPath) Then initialPath = normalizedRepoRoot
+            If Directory.Exists(initialPath) Then dialog.SelectedPath = initialPath
+
+            If dialog.ShowDialog(myUserControl) <> DialogResult.OK Then Return ""
+
+            Dim selectedPath As String = normalizeLegacyFolderPath(dialog.SelectedPath)
+
+            If Not isLegacySameOrChildPath(selectedPath, normalizedAllowedRoot) Then
+                iSwApp.SendMsgToUser2(
+                    "The selected folder is outside the SVN working copy." & vbCrLf & vbCrLf &
+                    "Selected:" & vbCrLf & selectedPath & vbCrLf & vbCrLf &
+                    "SVN working-copy root:" & vbCrLf & normalizedRepoRoot,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk)
+                Return ""
+            End If
+
+            If rejectVendorPartsFolder AndAlso
+               pathContainsNamedFolderSegment(selectedPath, normalizedRepoRoot, "Vendor Parts") Then
+
+                iSwApp.SendMsgToUser2(
+                    "The normal legacy-import destination cannot be inside a Vendor Parts folder." & vbCrLf & vbCrLf &
+                    "Choose a normal design folder anywhere else inside:" & vbCrLf &
+                    normalizedRepoRoot,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk)
+                Return ""
+            End If
+
+            Return selectedPath
+        End Using
+    End Function
+
+    Private Function normalizeLegacyFolderPath(ByVal folderPath As String) As String
+        If String.IsNullOrWhiteSpace(folderPath) Then Return ""
+
+        Try
+            Return Path.GetFullPath(folderPath.Trim().Trim(""""c)).TrimEnd("\"c, "/"c)
+        Catch
+            Return folderPath.Trim().Trim(""""c).TrimEnd("\"c, "/"c)
+        End Try
+    End Function
+
+    Private Function isLegacySameOrChildPath(ByVal candidatePath As String,
+                                             ByVal requiredRoot As String) As Boolean
+        Dim candidate As String = normalizeLegacyFolderPath(candidatePath)
+        Dim root As String = normalizeLegacyFolderPath(requiredRoot)
+
+        If String.IsNullOrWhiteSpace(candidate) OrElse String.IsNullOrWhiteSpace(root) Then Return False
+        If String.Equals(candidate, root, StringComparison.OrdinalIgnoreCase) Then Return True
+
+        Return candidate.StartsWith(root & Path.DirectorySeparatorChar,
+                                    StringComparison.OrdinalIgnoreCase)
+    End Function
+
+    Private Function getNearestExistingLegacyFolder(ByVal requestedPath As String) As String
+        Dim current As String = normalizeLegacyFolderPath(requestedPath)
+
+        While Not String.IsNullOrWhiteSpace(current)
+            If Directory.Exists(current) Then Return current
+
+            Try
+                Dim parent As DirectoryInfo = Directory.GetParent(current)
+                If parent Is Nothing Then Exit While
+                current = parent.FullName
+            Catch
+                Exit While
+            End Try
+        End While
+
+        Return ""
+    End Function
+
+    Public Function validateLegacyImportItemPublic(ByVal item As LegacyImportItem,
+                                                   ByVal plan As LegacyImportPlan) As LegacyImportValidationResult
+        Dim result As New LegacyImportValidationResult With {
+            .IsValid = False,
+            .FinalFileName = "",
+            .DestinationPath = "",
+            .Message = "Validation failed."
+        }
+
+        If item Is Nothing OrElse plan Is Nothing Then
+            result.Message = "The row or import plan is missing."
+            Return result
+        End If
+
+        Dim sourceExtension As String = item.Extension
+
+        If sourceExtension <> ".SLDASM" AndAlso sourceExtension <> ".SLDPRT" AndAlso sourceExtension <> ".SLDDRW" Then
+            result.Message = "Unsupported SOLIDWORKS file extension."
+            Return result
+        End If
+
+        If String.IsNullOrWhiteSpace(item.SourcePath) Then
+            result.Message = "The original file path is blank."
+            Return result
+        End If
+
+        Dim isVirtualComponent As Boolean = item.SourcePath.Contains("^")
+
+        If Not isVirtualComponent AndAlso Not File.Exists(item.SourcePath) Then
+            result.Message = "The original file is missing or cannot be accessed."
+            Return result
+        End If
+
+        If item.IsVirtualComponent OrElse isVirtualComponent Then
+            result.Message =
+                "This is a SOLIDWORKS virtual component. Pack and Go cannot rename a virtual component. " &
+                "In the source assembly, save this virtual component to an external SLDPRT/SLDASM file first, " &
+                "then reopen Copy Legacy Data to SVN."
+            Return result
+        End If
+
+        'Hard type rule requested by the team:
+        ' - Assembly remains Assembly
+        ' - Drawing remains Drawing
+        ' - Part can only be Part or Vendor Part
+        Select Case item.SourceType
+            Case LegacyImportSourceType.Assembly
+                If item.TargetType <> LegacyImportTargetType.Assembly Then
+                    result.Message = "An assembly cannot be changed to another type."
+                    Return result
+                End If
+            Case LegacyImportSourceType.Drawing
+                If item.TargetType <> LegacyImportTargetType.Drawing Then
+                    result.Message = "A drawing cannot be changed to another type."
+                    Return result
+                End If
+            Case LegacyImportSourceType.Part
+                If item.TargetType <> LegacyImportTargetType.Part AndAlso item.TargetType <> LegacyImportTargetType.VendorPart Then
+                    result.Message = "A part can only remain Part or be changed to Vendor Part."
+                    Return result
+                End If
+        End Select
+
+        Dim normalizedId As String = normalizeLegacyProposedId(item.ProposedId, sourceExtension)
+
+        If String.IsNullOrWhiteSpace(normalizedId) Then
+            If item.TargetType = LegacyImportTargetType.VendorPart Then
+                result.Message = "Enter a vendor filename. The original descriptive filename may be used."
+            Else
+                result.Message = "Enter a GRC27 or CFD27 ID."
+            End If
+            Return result
+        End If
+
+        Dim finalFileName As String = normalizedId & sourceExtension
+
+        If containsInvalidLegacyFileNameCharacters(finalFileName) Then
+            result.Message = "The proposed filename contains a Windows-invalid character."
+            Return result
+        End If
+
+        If isWindowsReservedLegacyFileName(normalizedId) Then
+            result.Message = "The proposed filename is reserved by Windows."
+            Return result
+        End If
+
+        If item.TargetType = LegacyImportTargetType.VendorPart Then
+            If sourceExtension <> ".SLDPRT" Then
+                result.Message = "Only source part files can be imported as Vendor Part."
+                Return result
+            End If
+
+            If String.IsNullOrWhiteSpace(plan.VendorDestinationFolder) Then
+                result.Message = "Choose a Vendor Parts destination folder."
+                Return result
+            End If
+
+            Dim repoRoot As String = If(String.IsNullOrWhiteSpace(plan.LocalRepoRootFolder),
+                                        getLocalRepoRootPathForLegacyImport(),
+                                        plan.LocalRepoRootFolder)
+
+            If Not isLegacySameOrChildPath(plan.VendorDestinationFolder, repoRoot) OrElse
+               Not pathContainsNamedFolderSegment(plan.VendorDestinationFolder, repoRoot, "Vendor Parts") Then
+                result.Message =
+                    "Vendor parts may be saved anywhere inside the SVN working copy, but the path must contain a folder named Vendor Parts."
+                Return result
+            End If
+
+            result.DestinationPath = Path.Combine(plan.VendorDestinationFolder, finalFileName)
+        Else
+            If Not isValidGrc27FileName(finalFileName) Then
+                result.Message =
+                    "Invalid GRC27/CFD27 ID. Required format: " &
+                    "GRC27_CODE_00000_R# or CFD27_CODE_ABC0000_R#. " &
+                    "Allowed codes: BR, DT, AE, FR, EL, ST, SU, WT, MI."
+                Return result
+            End If
+
+            If String.IsNullOrWhiteSpace(plan.GrcDestinationFolder) Then
+                result.Message = "Choose a GRC27 destination folder."
+                Return result
+            End If
+
+            Dim repoRoot As String = If(String.IsNullOrWhiteSpace(plan.LocalRepoRootFolder),
+                                        getLocalRepoRootPathForLegacyImport(),
+                                        plan.LocalRepoRootFolder)
+
+            If Not isLegacySameOrChildPath(plan.GrcDestinationFolder, repoRoot) Then
+                result.Message = "The selected destination must be inside the SVN working copy: " & repoRoot
+                Return result
+            End If
+
+            If pathContainsNamedFolderSegment(plan.GrcDestinationFolder, repoRoot, "Vendor Parts") Then
+                result.Message = "Normal GRC27/CFD27 files cannot be saved inside a Vendor Parts folder."
+                Return result
+            End If
+
+            result.DestinationPath = Path.Combine(plan.GrcDestinationFolder, finalFileName)
+        End If
+
+        result.FinalFileName = finalFileName
+
+        If result.DestinationPath.Length >= 245 Then
+            result.Message = "The final path is too long. Choose a shorter destination folder or ID."
+            Return result
+        End If
+
+        If File.Exists(result.DestinationPath) OrElse Directory.Exists(result.DestinationPath) Then
+            result.Message = "A file or folder already exists at the proposed destination."
+            Return result
+        End If
+
+        If plan.ExistingRepoFileNames IsNot Nothing AndAlso plan.ExistingRepoFileNames.Contains(finalFileName) Then
+            result.Message = "This filename already exists somewhere in the SVN working copy. Legacy Import will not overwrite or silently reuse it."
+            Return result
+        End If
+
+        If item.TargetType = LegacyImportTargetType.Part OrElse item.TargetType = LegacyImportTargetType.Assembly Then
+            If plan.ExistingRepoModelIds IsNot Nothing AndAlso plan.ExistingRepoModelIds.Contains(normalizedId) Then
+                result.Message = "This GRC/CFD model ID is already used by a part or assembly in the SVN working copy."
+                Return result
+            End If
+        End If
+
+        Dim duplicate As LegacyImportItem = Nothing
+
+        If plan.Items IsNot Nothing Then
+            For Each otherItem As LegacyImportItem In plan.Items
+                If otherItem Is Nothing OrElse Object.ReferenceEquals(otherItem, item) Then Continue For
+
+                Dim otherId As String = normalizeLegacyProposedId(otherItem.ProposedId, otherItem.Extension)
+                If String.IsNullOrWhiteSpace(otherId) Then Continue For
+
+                Dim otherFinalName As String = otherId & otherItem.Extension
+
+                If String.Equals(otherFinalName, finalFileName, StringComparison.OrdinalIgnoreCase) Then
+                    duplicate = otherItem
+                    Exit For
+                End If
+
+                Dim thisIsModel As Boolean = item.TargetType = LegacyImportTargetType.Part OrElse item.TargetType = LegacyImportTargetType.Assembly
+                Dim otherIsModel As Boolean = otherItem.TargetType = LegacyImportTargetType.Part OrElse otherItem.TargetType = LegacyImportTargetType.Assembly
+
+                If thisIsModel AndAlso otherIsModel AndAlso String.Equals(otherId, normalizedId, StringComparison.OrdinalIgnoreCase) Then
+                    duplicate = otherItem
+                    Exit For
+                End If
+            Next
+        End If
+
+        If duplicate IsNot Nothing Then
+            result.Message = "Duplicate proposed filename. It is also assigned to: " & duplicate.OriginalFileName
+            Return result
+        End If
+
+        result.IsValid = True
+
+        Dim folderWillBeCreated As Boolean = False
+        Try
+            folderWillBeCreated = Not Directory.Exists(Path.GetDirectoryName(result.DestinationPath))
+        Catch
+            folderWillBeCreated = False
+        End Try
+
+        result.Message = If(item.TargetType = LegacyImportTargetType.VendorPart,
+                            "Valid vendor part filename and destination.",
+                            "Valid GRC27/CFD27 ID and destination.")
+
+        If folderWillBeCreated Then
+            result.Message &= " The destination folder will be created and committed automatically."
+        End If
+
+        Return result
+    End Function
+
+    Private Function expandLegacyCommitPathsWithAddedParentDirectories(ByVal commitPaths() As String,
+                                                                         ByVal repoRoot As String) As String()
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then Return Nothing
+
+        Dim normalizedRoot As String = normalizeLegacyFolderPath(repoRoot)
+        Dim output As New List(Of String)()
+
+        For Each pathValue As String In commitPaths
+            If String.IsNullOrWhiteSpace(pathValue) Then Continue For
+            If Not isLegacySameOrChildPath(pathValue, normalizedRoot) Then Continue For
+            addCommitPathIfMissing(pathValue, output)
+
+            Dim currentDirectory As String = ""
+
+            Try
+                If Directory.Exists(pathValue) Then
+                    currentDirectory = Path.GetFullPath(pathValue)
+                Else
+                    currentDirectory = Path.GetDirectoryName(Path.GetFullPath(pathValue))
+                End If
+            Catch
+                currentDirectory = ""
+            End Try
+
+            While Not String.IsNullOrWhiteSpace(currentDirectory) AndAlso
+                  isLegacySameOrChildPath(currentDirectory, normalizedRoot) AndAlso
+                  Not String.Equals(currentDirectory, normalizedRoot, StringComparison.OrdinalIgnoreCase)
+
+                Dim statusChar As Char = getFirstLegacySvnStatusCharDepthEmpty(currentDirectory, normalizedRoot)
+
+                If statusChar = "?"c Then
+                    runSvnProcess(
+                        sSVNPath,
+                        "add --parents --depth empty --force --non-interactive """ & currentDirectory & """")
+                    statusChar = getFirstLegacySvnStatusCharDepthEmpty(currentDirectory, normalizedRoot)
+                End If
+
+                If statusChar = "A"c Then addCommitPathIfMissing(currentDirectory, output)
+
+                Try
+                    Dim parent As DirectoryInfo = Directory.GetParent(currentDirectory)
+                    If parent Is Nothing Then Exit While
+                    currentDirectory = parent.FullName.TrimEnd("\"c)
+                Catch
+                    Exit While
+                End Try
+            End While
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Public Function executeLegacyImportPublic(ByVal plan As LegacyImportPlan,
+                                              ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        If plan Is Nothing OrElse plan.Items Is Nothing OrElse plan.Items.Count = 0 Then
+            errorMessage = "The legacy import plan is empty."
+            Return False
+        End If
+
+        If asyncCommitInProgress Then
+            errorMessage = "A Commit operation is already running. Wait for it to finish, then try again."
+            Return False
+        End If
+
+        If legacyImportInProgress Then
+            errorMessage = "A legacy import is already in progress."
+            Return False
+        End If
+
+        Dim virtualItems As LegacyImportItem() = plan.Items.
+            Where(Function(item) item IsNot Nothing AndAlso item.IsVirtualComponent).
+            ToArray()
+
+        If virtualItems.Length > 0 Then
+            errorMessage =
+                "The import contains SOLIDWORKS virtual components, which Pack and Go cannot rename." & vbCrLf & vbCrLf &
+                stringArrToSingleStringWithNewLines(virtualItems.Select(Function(item) item.OriginalFileName).ToArray(),
+                                                    bTrimFileNames:=False,
+                                                    iLimit:=12) & vbCrLf &
+                "Save these virtual components externally from the source assembly, then reopen Legacy Import."
+            Return False
+        End If
+
+        'Refresh the repo filename/ID cache once immediately before the authoritative check.
+        plan.ExistingRepoFileNames = getExistingRepoCadFileNamesForLegacyImport()
+        plan.ExistingRepoModelIds = getExistingRepoModelIdsForLegacyImport()
+
+        For Each item As LegacyImportItem In plan.Items
+            Dim validation As LegacyImportValidationResult = validateLegacyImportItemPublic(item, plan)
+
+            If validation Is Nothing OrElse Not validation.IsValid Then
+                errorMessage = item.OriginalFileName & vbCrLf & vbCrLf & If(validation Is Nothing, "Validation failed.", validation.Message)
+                Return False
+            End If
+
+            item.FinalFileName = validation.FinalFileName
+            item.DestinationPath = validation.DestinationPath
+            item.IsChecked = True
+            item.IsValid = True
+            item.ValidationMessage = validation.Message
+        Next
+
+        Dim topAssembly As ModelDoc2 = getOpenModelByPathSafe(plan.SourceTopAssemblyPath)
+
+        If topAssembly Is Nothing Then
+            errorMessage = "The source top-level assembly is no longer open. Reopen it and restart Legacy Import."
+            Return False
+        End If
+
+        Dim currentSourceNames() As String = Nothing
+
+        If Not tryGetLegacyPackAndGoDocumentNames(topAssembly, currentSourceNames, errorMessage) Then
+            Return False
+        End If
+
+        If Not legacyPackAndGoListsMatch(plan.PackAndGoSourceNames, currentSourceNames) Then
+            errorMessage =
+                "The assembly file list changed after the import table was opened." & vbCrLf & vbCrLf &
+                "Cancel and reopen Copy Legacy Data to SVN so the table includes the current assembly structure."
+            Return False
+        End If
+
+        Dim itemBySource As New Dictionary(Of String, LegacyImportItem)(StringComparer.OrdinalIgnoreCase)
+
+        For Each item As LegacyImportItem In plan.Items
+            itemBySource(normalizeLegacySourcePath(item.SourcePath)) = item
+        Next
+
+        Dim saveToNames(currentSourceNames.Length - 1) As String
+
+        For i As Integer = 0 To currentSourceNames.Length - 1
+            Dim sourceKey As String = normalizeLegacySourcePath(currentSourceNames(i))
+
+            If Not itemBySource.ContainsKey(sourceKey) Then
+                errorMessage = "The Pack and Go list contains a file that is not represented in the import table:" & vbCrLf & currentSourceNames(i)
+                Return False
+            End If
+
+            saveToNames(i) = itemBySource(sourceKey).DestinationPath
+        Next
+
+        Dim outputFiles() As String = plan.Items.
+            Select(Function(item) item.DestinationPath).
+            Where(Function(pathValue) Not String.IsNullOrWhiteSpace(pathValue)).
+            Distinct(StringComparer.OrdinalIgnoreCase).
+            ToArray()
+
+        If outputFiles.Length <> plan.Items.Count Then
+            errorMessage = "Two or more table rows resolve to the same final path."
+            Return False
+        End If
+
+        For Each outputPath As String In outputFiles
+            If File.Exists(outputPath) OrElse Directory.Exists(outputPath) Then
+                errorMessage = "The destination became occupied after validation:" & vbCrLf & outputPath
+                Return False
+            End If
+        Next
+
+        Dim createdDirectories As New List(Of String)()
+
+        Try
+            ensureLegacyDirectoryExists(plan.GrcDestinationFolder, createdDirectories)
+
+            If plan.Items.Any(Function(item) item.TargetType = LegacyImportTargetType.VendorPart) Then
+                ensureLegacyDirectoryExists(plan.VendorDestinationFolder, createdDirectories)
+            End If
+        Catch ex As Exception
+            errorMessage = "Could not create the selected destination folder." & vbCrLf & vbCrLf & ex.Message
+            rollbackLegacyEmptyDirectories(createdDirectories)
+            Return False
+        End Try
+
+        legacyImportInProgress = True
+        Dim packAndGoCompleted As Boolean = False
+
+        Try
+            Dim packAndGo As PackAndGo = topAssembly.Extension.GetPackAndGo()
+
+            If packAndGo Is Nothing Then
+                errorMessage = "SOLIDWORKS did not return a Pack and Go object."
+                Return False
+            End If
+
+            packAndGo.IncludeDrawings = True
+            packAndGo.IncludeSuppressed = True
+            packAndGo.IncludeToolboxComponents = True
+
+            Try
+                packAndGo.IncludeSimulationResults = False
+            Catch
+            End Try
+
+            Dim duplicateDestination As String = saveToNames.
+                GroupBy(Function(value) normalizeLegacyFolderPath(value), StringComparer.OrdinalIgnoreCase).
+                Where(Function(groupValue) groupValue.Count() > 1).
+                Select(Function(groupValue) groupValue.Key).
+                FirstOrDefault()
+
+            If Not String.IsNullOrWhiteSpace(duplicateDestination) Then
+                errorMessage = "Two Pack and Go rows resolve to the same destination:" & vbCrLf & duplicateDestination
+                Return False
+            End If
+
+            Dim saveNamesObject As Object = saveToNames
+
+            If Not packAndGo.SetDocumentSaveToNames(saveNamesObject) Then
+                Dim suspectedVirtual As String() = currentSourceNames.
+                    Where(Function(sourceName) isLegacyVirtualSourcePath(sourceName, Nothing)).
+                    Select(Function(sourceName) Path.GetFileName(sourceName)).
+                    Distinct(StringComparer.OrdinalIgnoreCase).
+                    ToArray()
+
+                errorMessage =
+                    "SOLIDWORKS rejected one or more proposed Pack and Go destination names." & vbCrLf & vbCrLf &
+                    "SOLIDWORKS requires the destination array to match the Pack and Go list exactly, does not allow duplicate destination names, " &
+                    "and does not allow a virtual component to be renamed."
+
+                If suspectedVirtual.Length > 0 Then
+                    errorMessage &= vbCrLf & vbCrLf &
+                        "Likely virtual component(s):" & vbCrLf &
+                        stringArrToSingleStringWithNewLines(suspectedVirtual, bTrimFileNames:=False, iLimit:=12) &
+                        "Save these components externally in the source assembly, then reopen Legacy Import."
+                End If
+
+                Return False
+            End If
+
+            Dim statusObject As Object = Nothing
+
+            beginInternalSolidWorksSave()
+            Try
+                statusObject = topAssembly.Extension.SavePackAndGo(packAndGo)
+            Finally
+                endInternalSolidWorksSave()
+            End Try
+
+            Dim missingOutputs As New List(Of String)()
+
+            For Each outputPath As String In outputFiles
+                If Not File.Exists(outputPath) Then missingOutputs.Add(outputPath)
+            Next
+
+            If missingOutputs.Count > 0 Then
+                errorMessage =
+                    "SOLIDWORKS Pack and Go did not create every expected file." & vbCrLf & vbCrLf &
+                    stringArrToSingleStringWithNewLines(missingOutputs.ToArray(), bTrimFileNames:=False, iLimit:=12)
+                Return False
+            End If
+
+            packAndGoCompleted = True
+        Catch ex As Exception
+            errorMessage = "SOLIDWORKS Pack and Go failed." & vbCrLf & vbCrLf & ex.Message
+            Return False
+        Finally
+            legacyImportInProgress = False
+
+            If Not packAndGoCompleted Then
+                rollbackLegacyPackAndGoOutputs(outputFiles, createdDirectories)
+            End If
+        End Try
+
+        Dim addTargetsFile As String = ""
+        Dim addResult As rawProcessReturn
+
+        Try
+            addTargetsFile = createLegacySvnTargetsFile(outputFiles, "add")
+            addResult = runSvnProcess(
+                sSVNPath,
+                "add --parents --force --non-interactive --targets """ & addTargetsFile & """")
+        Catch ex As Exception
+            errorMessage = "Could not prepare or run SVN add." & vbCrLf & vbCrLf & ex.Message
+            Return False
+        Finally
+            deleteLegacyTargetsFileQuietly(addTargetsFile)
+        End Try
+
+        If addResult.outputError IsNot Nothing AndAlso addResult.outputError.Trim() <> "" Then
+            errorMessage =
+                "Pack and Go completed, but SVN add failed." & vbCrLf & vbCrLf &
+                addResult.outputError.Trim() & vbCrLf & vbCrLf &
+                "The copied files were left in the SVN working copy so they can be recovered or cleaned up manually."
+            Return False
+        End If
+
+        If Not svnPropset(outputFiles, "addin:release_state", "||EDIT||") Then
+            errorMessage =
+                "Pack and Go completed, but PlumVault could not set the SVN release-state property." & vbCrLf & vbCrLf &
+                "The copied files were left added in the working copy and were not committed."
+            Return False
+        End If
+
+        Dim commitSeedPaths() As String = outputFiles.
+            Concat(createdDirectories).
+            Where(Function(pathValue) Not String.IsNullOrWhiteSpace(pathValue)).
+            Distinct(StringComparer.OrdinalIgnoreCase).
+            ToArray()
+
+        Dim commitPaths() As String = expandLegacyCommitPathsWithAddedParentDirectories(
+            commitSeedPaths,
+            plan.LocalRepoRootFolder)
+
+        If commitPaths Is Nothing OrElse commitPaths.Length = 0 Then
+            errorMessage = "No valid SVN commit paths remained after Pack and Go."
+            Return False
+        End If
+
+        Dim grcLockPaths() As String = plan.Items.
+            Where(Function(item) item.TargetType <> LegacyImportTargetType.VendorPart).
+            Select(Function(item) item.DestinationPath).
+            Where(Function(pathValue) File.Exists(pathValue) AndAlso isCadFilePath(pathValue)).
+            Distinct(StringComparer.OrdinalIgnoreCase).
+            ToArray()
+
+        Dim topImportedPath As String = ""
+        Dim topItem As LegacyImportItem = plan.Items.FirstOrDefault(Function(item) pathsAreSame(item.SourcePath, plan.SourceTopAssemblyPath))
+        If topItem IsNot Nothing Then topImportedPath = topItem.DestinationPath
+
+        Dim commitTargetsFile As String = ""
+
+        Try
+            commitTargetsFile = createLegacySvnTargetsFile(commitPaths, "commit")
+        Catch ex As Exception
+            errorMessage = "Could not prepare the SVN commit target list." & vbCrLf & vbCrLf & ex.Message
+            Return False
+        End Try
+
+        startLegacyImportCommitBackground(
+            commitTargetsFile,
+            outputFiles,
+            grcLockPaths,
+            topImportedPath,
+            "Legacy CAD import: " & Path.GetFileNameWithoutExtension(plan.SourceTopAssemblyPath))
+
+        Return True
+    End Function
+
+    Private Sub startLegacyImportCommitBackground(ByVal commitTargetsFile As String,
+                                                  ByVal importedCadPaths() As String,
+                                                  ByVal grcLockPaths() As String,
+                                                  ByVal topImportedAssemblyPath As String,
+                                                  ByVal commitMessage As String)
+        If String.IsNullOrWhiteSpace(commitTargetsFile) OrElse Not File.Exists(commitTargetsFile) Then Exit Sub
+
+        Dim targetsFileForBackground As String = commitTargetsFile
+        Dim cadPathsForCompletion() As String = If(importedCadPaths Is Nothing, Nothing, CType(importedCadPaths.Clone(), String()))
+        Dim lockPathsForCompletion() As String = If(grcLockPaths Is Nothing, Nothing, CType(grcLockPaths.Clone(), String()))
+        Dim safeMessage As String = If(commitMessage, "Legacy CAD import").Replace("""", "'")
+        Dim savedPathForBackground As String = ""
+
+        Try
+            savedPathForBackground = myUserControl.savedPATH
+        Catch
+            savedPathForBackground = ""
+        End Try
+
+        asyncCommitInProgress = True
+
+        Try
+            myUserControl.markCommitPendingForFilePathsPublic(cadPathsForCompletion, True, "Committing legacy import...")
+        Catch
+        End Try
+
+        Task.Run(
+            Sub()
+                Dim success As Boolean = False
+                Dim backgroundError As String = ""
+
+                Try
+                    Dim result As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                        sSVNPath,
+                        "commit --non-interactive -m """ & safeMessage & """ --targets """ & targetsFileForBackground & """",
+                        savedPathForBackground)
+
+                    If result.outputError IsNot Nothing AndAlso result.outputError.Trim() <> "" Then
+                        backgroundError = result.outputError.Trim()
+                    Else
+                        success = True
+                    End If
+                Catch ex As Exception
+                    success = False
+                    backgroundError = ex.Message
+                Finally
+                    deleteLegacyTargetsFileQuietly(targetsFileForBackground)
+                End Try
+
+                Try
+                    If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
+                        myUserControl.BeginInvoke(
+                            New MethodInvoker(
+                                Sub()
+                                    finishLegacyImportCommitOnMainThread(
+                                        cadPathsForCompletion,
+                                        lockPathsForCompletion,
+                                        topImportedAssemblyPath,
+                                        success,
+                                        backgroundError)
+                                End Sub))
+                    Else
+                        asyncCommitInProgress = False
+                    End If
+                Catch
+                    asyncCommitInProgress = False
+                End Try
+            End Sub)
+    End Sub
+
+    Private Sub finishLegacyImportCommitOnMainThread(ByVal importedCadPaths() As String,
+                                                     ByVal grcLockPaths() As String,
+                                                     ByVal topImportedAssemblyPath As String,
+                                                     ByVal success As Boolean,
+                                                     ByVal errorMessage As String)
+        asyncCommitInProgress = False
+
+        Try
+            myUserControl.markCommitPendingForFilePathsPublic(importedCadPaths, False)
+        Catch
+        End Try
+
+        If Not success Then
+            iSwApp.SendMsgToUser2(
+                "The legacy files were copied and added locally, but the SVN commit did not complete." & vbCrLf & vbCrLf &
+                errorMessage & vbCrLf & vbCrLf &
+                "SVN commits are atomic, so no partial repository commit was created. " &
+                "The local added files remain in the working copy for recovery or cleanup.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk)
+            processPendingAutomaticSaveCommits()
+            Exit Sub
+        End If
+
+        Try
+            For Each filePath As String In importedCadPaths
+                If Not File.Exists(filePath) Then Continue For
+                File.SetAttributes(filePath, File.GetAttributes(filePath) Or FileAttributes.ReadOnly)
+            Next
+        Catch
+        End Try
+
+        Try
+            myUserControl.markCommitResultForFilePathsPublic(importedCadPaths, True)
+        Catch
+        End Try
+
+        Try
+            updateStatusCacheForKnownPaths(importedCadPaths, forceAddDelChg1:=" ", forceLock6:=" ", forceUpToDate9:=" ")
+            refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+        Catch
+        End Try
+
+        Dim message As String =
+            "Legacy import committed successfully." & vbCrLf & vbCrLf &
+            "Imported files: " & If(importedCadPaths Is Nothing, 0, importedCadPaths.Length).ToString()
+
+        If Not String.IsNullOrWhiteSpace(topImportedAssemblyPath) Then
+            message &= vbCrLf & vbCrLf & "Imported top assembly:" & vbCrLf & topImportedAssemblyPath
+        End If
+
+        If grcLockPaths IsNot Nothing AndAlso grcLockPaths.Length > 0 Then
+            message &= vbCrLf & vbCrLf &
+                "PlumVault will now get locks on the imported GRC files. Vendor parts remain unlocked and read-only."
+        End If
+
+        iSwApp.SendMsgToUser2(
+            message,
+            swMessageBoxIcon_e.swMbInformation,
+            swMessageBoxBtn_e.swMbOk)
+
+        If grcLockPaths IsNot Nothing AndAlso grcLockPaths.Length > 0 Then
+            Try
+                getLocksOfPathsAsync(grcLockPaths, bBreakLocks:=False, bUseTortoise:=False, sMessage:="Auto-lock after legacy import")
+            Catch
+            End Try
+        End If
+
+        processPendingAutomaticSaveCommits()
+    End Sub
+
+    Private Function getFirstLegacySvnStatusCharDepthEmpty(ByVal targetPath As String,
+                                                           ByVal repoRoot As String) As Char
+        If String.IsNullOrWhiteSpace(targetPath) Then Return ChrW(0)
+        If Not Directory.Exists(targetPath) Then Return ChrW(0)
+        If Not isLegacySameOrChildPath(targetPath, repoRoot) Then Return ChrW(0)
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "status --depth empty --non-interactive """ & targetPath & """")
+
+            If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
+                Return ChrW(0)
+            End If
+
+            Dim statusText As String = If(statusResult.output, "").Trim()
+            If String.IsNullOrWhiteSpace(statusText) Then Return " "c
+
+            Return statusText(0)
+        Catch
+            Return ChrW(0)
+        End Try
+    End Function
+
+    Private Function getLegacyAddedDirectoryPaths(ByVal targetFolder As String,
+                                                  ByVal repoRoot As String) As String()
+        Dim output As New List(Of String)()
+        Dim currentFolder As String = normalizeLegacyFolderPath(targetFolder)
+        Dim normalizedRoot As String = normalizeLegacyFolderPath(repoRoot)
+
+        While Not String.IsNullOrWhiteSpace(currentFolder) AndAlso
+              isLegacySameOrChildPath(currentFolder, normalizedRoot) AndAlso
+              Not String.Equals(currentFolder, normalizedRoot, StringComparison.OrdinalIgnoreCase)
+
+            Dim statusChar As Char = getFirstLegacySvnStatusCharDepthEmpty(currentFolder, normalizedRoot)
+            If statusChar = "A"c Then output.Add(currentFolder)
+
+            Try
+                Dim parent As DirectoryInfo = Directory.GetParent(currentFolder)
+                If parent Is Nothing Then Exit While
+                currentFolder = parent.FullName.TrimEnd("\"c)
+            Catch
+                Exit While
+            End Try
+        End While
+
+        Return output.
+            Distinct(StringComparer.OrdinalIgnoreCase).
+            OrderBy(Function(pathValue) pathValue.Length).
+            ToArray()
+    End Function
+
+    Private Function prepareLegacyDestinationFolderForReview(ByVal folderPath As String,
+                                                             ByVal commitMessage As String,
+                                                             ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+        Dim fullFolder As String = normalizeLegacyFolderPath(folderPath)
+
+        If String.IsNullOrWhiteSpace(repoRoot) OrElse Not Directory.Exists(repoRoot) Then
+            errorMessage = "The SVN working-copy root is not available."
+            Return False
+        End If
+
+        If String.IsNullOrWhiteSpace(fullFolder) OrElse
+           Not isLegacySameOrChildPath(fullFolder, repoRoot) Then
+            errorMessage =
+                "The selected folder must be inside the SVN working copy." & vbCrLf & vbCrLf &
+                "Selected:" & vbCrLf & fullFolder & vbCrLf & vbCrLf &
+                "SVN working-copy root:" & vbCrLf & repoRoot
+            Return False
+        End If
+
+        Try
+            If Not Directory.Exists(fullFolder) Then Directory.CreateDirectory(fullFolder)
+        Catch ex As Exception
+            errorMessage = "Could not create the destination folder." & vbCrLf & vbCrLf & ex.Message
+            Return False
+        End Try
+
+        Dim initialStatus As Char = getFirstLegacySvnStatusCharDepthEmpty(fullFolder, repoRoot)
+
+        If initialStatus = " "c Then Return True
+
+        If initialStatus <> "?"c AndAlso initialStatus <> "A"c Then
+            errorMessage =
+                "PlumVault could not confirm the SVN status of the destination folder:" & vbCrLf & vbCrLf &
+                fullFolder
+            Return False
+        End If
+
+        If initialStatus = "?"c Then
+            Dim addResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "add --parents --depth empty --force --non-interactive """ & fullFolder & """")
+
+            If addResult.outputError IsNot Nothing AndAlso addResult.outputError.Trim() <> "" Then
+                errorMessage =
+                    "The folder was created, but SVN could not add it." & vbCrLf & vbCrLf &
+                    addResult.outputError.Trim()
+                Return False
+            End If
+        End If
+
+        Dim addedDirectories() As String = getLegacyAddedDirectoryPaths(fullFolder, repoRoot)
+
+        If addedDirectories Is Nothing OrElse addedDirectories.Length = 0 Then
+            Dim finalStatus As Char = getFirstLegacySvnStatusCharDepthEmpty(fullFolder, repoRoot)
+            If finalStatus = " "c Then Return True
+
+            errorMessage =
+                "The folder exists, but PlumVault could not confirm that it is versioned in SVN:" & vbCrLf & vbCrLf &
+                fullFolder
+            Return False
+        End If
+
+        Dim targetsFile As String = ""
+
+        Try
+            targetsFile = createLegacySvnTargetsFile(addedDirectories, "folders")
+
+            Dim safeMessage As String = If(String.IsNullOrWhiteSpace(commitMessage),
+                                           "Create legacy import folder",
+                                           commitMessage.Trim()).Replace("""", "'")
+
+            Dim commitResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "commit --depth empty --non-interactive -m """ & safeMessage & """ --targets """ & targetsFile & """")
+
+            If commitResult.outputError IsNot Nothing AndAlso commitResult.outputError.Trim() <> "" Then
+                errorMessage =
+                    "The folder was added locally, but SVN could not commit it." & vbCrLf & vbCrLf &
+                    commitResult.outputError.Trim() & vbCrLf & vbCrLf &
+                    "The folder remains in the working copy and may still be scheduled for addition."
+                Return False
+            End If
+        Catch ex As Exception
+            errorMessage = "Could not commit the destination folder." & vbCrLf & vbCrLf & ex.Message
+            Return False
+        Finally
+            deleteLegacyTargetsFileQuietly(targetsFile)
+        End Try
+
+        Dim verifiedStatus As Char = getFirstLegacySvnStatusCharDepthEmpty(fullFolder, repoRoot)
+
+        If verifiedStatus = "?"c OrElse verifiedStatus = "A"c OrElse verifiedStatus = ChrW(0) Then
+            errorMessage =
+                "SVN did not confirm the destination folder as committed:" & vbCrLf & vbCrLf &
+                fullFolder
+            Return False
+        End If
+
+        Return True
+    End Function
+
+    Private Function getLocalRepoRootPathForLegacyImport() As String
+        Return getResolvedSvnWorkingCopyRootPath()
+    End Function
+
+    Private Function getExistingRepoCadFileNamesForLegacyImport() As HashSet(Of String)
+        Dim output As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+
+        If String.IsNullOrWhiteSpace(repoRoot) OrElse Not Directory.Exists(repoRoot) Then Return output
+
+        Try
+            For Each filePath As String In Directory.EnumerateFiles(repoRoot, "*", SearchOption.AllDirectories)
+                If Not isCadFilePath(filePath) Then Continue For
+                output.Add(Path.GetFileName(filePath))
+            Next
+        Catch
+        End Try
+
+        Return output
+    End Function
+
+    Private Function getExistingRepoModelIdsForLegacyImport() As HashSet(Of String)
+        Dim output As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+
+        If String.IsNullOrWhiteSpace(repoRoot) OrElse Not Directory.Exists(repoRoot) Then Return output
+
+        Try
+            For Each filePath As String In Directory.EnumerateFiles(repoRoot, "*", SearchOption.AllDirectories)
+                Dim extension As String = Path.GetExtension(filePath).ToUpperInvariant()
+                If extension <> ".SLDPRT" AndAlso extension <> ".SLDASM" Then Continue For
+                If pathContainsNamedFolderSegment(filePath, repoRoot, "Vendor Parts") Then Continue For
+                output.Add(Path.GetFileNameWithoutExtension(filePath))
+            Next
+        Catch
+        End Try
+
+        Return output
+    End Function
+
+    Private Function createLegacySvnTargetsFile(ByVal paths() As String,
+                                                ByVal purpose As String) As String
+        If paths Is Nothing OrElse paths.Length = 0 Then Throw New IOException("No SVN target paths were supplied.")
+
+        Dim cleanPaths As String() = paths.
+            Where(Function(pathValue) Not String.IsNullOrWhiteSpace(pathValue)).
+            Select(Function(pathValue) Path.GetFullPath(pathValue)).
+            Distinct(StringComparer.OrdinalIgnoreCase).
+            ToArray()
+
+        If cleanPaths.Length = 0 Then Throw New IOException("No valid SVN target paths were supplied.")
+
+        Dim safePurpose As String = If(String.IsNullOrWhiteSpace(purpose), "targets", purpose.Trim())
+        Dim targetFile As String = Path.Combine(
+            Path.GetTempPath(),
+            "PlumVault_Legacy_" & safePurpose & "_" & Guid.NewGuid().ToString("N") & ".txt")
+
+        File.WriteAllLines(targetFile, cleanPaths, New System.Text.UTF8Encoding(False))
+        Return targetFile
+    End Function
+
+    Private Sub deleteLegacyTargetsFileQuietly(ByVal targetFile As String)
+        If String.IsNullOrWhiteSpace(targetFile) Then Exit Sub
+
+        Try
+            If File.Exists(targetFile) Then File.Delete(targetFile)
+        Catch
+        End Try
+    End Sub
+
+    Private Function normalizeLegacyProposedId(ByVal proposedId As String,
+                                               ByVal expectedExtension As String) As String
+        If String.IsNullOrWhiteSpace(proposedId) Then Return ""
+
+        Dim value As String = proposedId.Trim().Trim(""""c)
+        Dim actualExtension As String = ""
+
+        Try
+            actualExtension = Path.GetExtension(value)
+        Catch
+            actualExtension = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(actualExtension) Then
+            If Not String.Equals(actualExtension, expectedExtension, StringComparison.OrdinalIgnoreCase) Then Return ""
+            value = Path.GetFileNameWithoutExtension(value)
+        End If
+
+        Return value.Trim()
+    End Function
+
+    Private Function containsInvalidLegacyFileNameCharacters(ByVal fileName As String) As Boolean
+        If String.IsNullOrWhiteSpace(fileName) Then Return True
+
+        Try
+            Return fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 OrElse fileName.Contains("\") OrElse fileName.Contains("/")
+        Catch
+            Return True
+        End Try
+    End Function
+
+    Private Function isWindowsReservedLegacyFileName(ByVal baseName As String) As Boolean
+        If String.IsNullOrWhiteSpace(baseName) Then Return True
+
+        Dim normalized As String = baseName.Trim().TrimEnd("."c).ToUpperInvariant()
+        Dim reserved As String() = {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        }
+
+        Return reserved.Contains(normalized, StringComparer.OrdinalIgnoreCase)
+    End Function
+
+    Private Function sanitizeLegacyFolderName(ByVal value As String) As String
+        If String.IsNullOrWhiteSpace(value) Then Return "Legacy Assembly"
+
+        Dim invalid As Char() = Path.GetInvalidFileNameChars()
+        Dim chars As Char() = value.Trim().Select(Function(ch) If(invalid.Contains(ch), "_"c, ch)).ToArray()
+        Dim output As String = New String(chars).Trim().TrimEnd("."c)
+
+        If String.IsNullOrWhiteSpace(output) Then output = "Legacy Assembly"
+        Return output
+    End Function
+
+    Private Function normalizeLegacySourcePath(ByVal sourcePath As String) As String
+        If String.IsNullOrWhiteSpace(sourcePath) Then Return ""
+
+        If sourcePath.Contains("^") Then Return sourcePath.Trim()
+
+        Try
+            Return Path.GetFullPath(sourcePath).Trim()
+        Catch
+            Return sourcePath.Trim()
+        End Try
+    End Function
+
+    Private Function legacyPackAndGoListsMatch(ByVal originalNames() As String,
+                                               ByVal currentNames() As String) As Boolean
+        If originalNames Is Nothing OrElse currentNames Is Nothing Then Return False
+        If originalNames.Length <> currentNames.Length Then Return False
+
+        Dim originalSet As New HashSet(Of String)(originalNames.Select(Function(value) normalizeLegacySourcePath(value)), StringComparer.OrdinalIgnoreCase)
+        Dim currentSet As New HashSet(Of String)(currentNames.Select(Function(value) normalizeLegacySourcePath(value)), StringComparer.OrdinalIgnoreCase)
+
+        Return originalSet.SetEquals(currentSet)
+    End Function
+
+    Private Sub ensureLegacyDirectoryExists(ByVal folderPath As String,
+                                            ByVal createdDirectories As List(Of String))
+        If String.IsNullOrWhiteSpace(folderPath) Then Throw New IOException("Destination folder is blank.")
+
+        Dim fullFolder As String = normalizeLegacyFolderPath(folderPath)
+        Dim repoRoot As String = getLocalRepoRootPathForLegacyImport()
+
+        If Not isLegacySameOrChildPath(fullFolder, repoRoot) Then
+            Throw New IOException("Destination folder is outside the selected SVN working copy: " & fullFolder)
+        End If
+
+        If Directory.Exists(fullFolder) Then Exit Sub
+
+        Dim missingFolders As New List(Of String)()
+        Dim currentFolder As String = fullFolder
+
+        While Not String.IsNullOrWhiteSpace(currentFolder) AndAlso
+              isLegacySameOrChildPath(currentFolder, repoRoot) AndAlso
+              Not Directory.Exists(currentFolder)
+
+            missingFolders.Add(currentFolder)
+
+            Dim parent As DirectoryInfo = Directory.GetParent(currentFolder)
+            If parent Is Nothing Then Exit While
+            currentFolder = parent.FullName
+        End While
+
+        Directory.CreateDirectory(fullFolder)
+
+        If createdDirectories IsNot Nothing Then
+            For Each createdFolder As String In missingFolders.OrderBy(Function(value) value.Length)
+                If Not createdDirectories.Any(Function(existingFolder) String.Equals(existingFolder, createdFolder, StringComparison.OrdinalIgnoreCase)) Then
+                    createdDirectories.Add(createdFolder)
+                End If
+            Next
+        End If
+    End Sub
+
+    Private Sub rollbackLegacyPackAndGoOutputs(ByVal outputFiles() As String,
+                                               ByVal createdDirectories As List(Of String))
+        If outputFiles IsNot Nothing Then
+            For Each outputPath As String In outputFiles
+                Try
+                    If File.Exists(outputPath) Then
+                        File.SetAttributes(outputPath, FileAttributes.Normal)
+                        File.Delete(outputPath)
+                    End If
+                Catch
+                End Try
+            Next
+        End If
+
+        rollbackLegacyEmptyDirectories(createdDirectories)
+    End Sub
+
+    Private Sub rollbackLegacyEmptyDirectories(ByVal createdDirectories As List(Of String))
+        If createdDirectories Is Nothing Then Exit Sub
+
+        For Each folderPath As String In createdDirectories.OrderByDescending(Function(value) value.Length)
+            Try
+                If Directory.Exists(folderPath) AndAlso Not Directory.EnumerateFileSystemEntries(folderPath).Any() Then
+                    Directory.Delete(folderPath, False)
+                End If
+            Catch
+            End Try
+        Next
+    End Sub
+
+
     Public Structure rawProcessReturn
         Public output As String
         Public outputError As String

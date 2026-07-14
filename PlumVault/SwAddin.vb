@@ -231,15 +231,37 @@ Public Class SwAddin
     End Sub
 
     Public Sub RemoveTaskPane()
-        Try
-            myTaskPaneHost.beforeClose()
-            'asSettings.Settings.Item("localRepoPath").Value = myTaskPaneHost.localRepoPath.Text 'saves the local repoPath
-            myTaskPaneHost = Nothing
-            myTaskPaneView.DeleteView()
-            Marshal.ReleaseComObject(myTaskPaneView)
+        'Stop and dispose every task-pane timer before deleting the view or releasing the
+        'SOLIDWORKS application RCW. A queued WinForms Timer tick was previously able to call
+        'iSwApp.ActiveDoc after disconnect, producing InvalidComObjectException.
+        Dim hostToDispose As UserControl1 = myTaskPaneHost
+        myTaskPaneHost = Nothing
+
+        If hostToDispose IsNot Nothing Then
+            Try
+                hostToDispose.beforeClose()
+            Catch
+            End Try
+
+            Try
+                hostToDispose.Dispose()
+            Catch
+            End Try
+        End If
+
+        If myTaskPaneView IsNot Nothing Then
+            Try
+                myTaskPaneView.DeleteView()
+            Catch
+            End Try
+
+            Try
+                Marshal.ReleaseComObject(myTaskPaneView)
+            Catch
+            End Try
+
             myTaskPaneView = Nothing
-        Catch ex As Exception
-        End Try
+        End If
     End Sub
 
     Private Sub InstallMainWindowCloseGuard()
@@ -532,6 +554,7 @@ Public Class SwAddin
             AddHandler iSwApp.FileNewNotify2, AddressOf Me.SldWorks_FileNewNotify2
             AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.SldWorks_ActiveModelDocChangeNotify
             AddHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
+            AddHandler iSwApp.CommandOpenPreNotify, AddressOf Me.SldWorks_CommandOpenPreNotify
 
             If Not closeGuardHooked Then
                 AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
@@ -550,6 +573,7 @@ Public Class SwAddin
             RemoveHandler iSwApp.FileNewNotify2, AddressOf Me.SldWorks_FileNewNotify2
             RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.SldWorks_ActiveModelDocChangeNotify
             RemoveHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
+            RemoveHandler iSwApp.CommandOpenPreNotify, AddressOf Me.SldWorks_CommandOpenPreNotify
 
             If closeGuardHooked Then
                 RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
@@ -610,6 +634,11 @@ Public Class SwAddin
 
     'Function SldWorks_DocumentLoadNotify2(ByVal docTitle As String, ByVal docPath As String) As Integer
     'End Function
+
+    Private Function SldWorks_CommandOpenPreNotify(ByVal Command As Integer,
+                                                       ByVal UserCommand As Integer) As Integer
+        Return svnModule.handleSolidWorksSaveCommandPreNotifyPublic(Command, UserCommand)
+    End Function
 
     Function SldWorks_FileNewNotify2(ByVal newDoc As Object, ByVal doctype As Integer, ByVal templateName As String) As Integer
         AttachEventsToAllDocuments()
