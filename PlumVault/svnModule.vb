@@ -9,6 +9,8 @@ Imports System.Windows.Forms.LinkLabel
 Imports System.Windows.Forms.VisualStyles.VisualStyleElement
 Imports System.Xml
 Imports System.Threading.Tasks
+Imports System.Diagnostics
+Imports System.Text
 
 Public Module svnModule
     Private Class ExternalReferenceInfo
@@ -45,6 +47,18 @@ Public Module svnModule
     Private cachedConfiguredRepoPathForWorkingCopyRoot As String = ""
     Private cachedResolvedWorkingCopyRoot As String = ""
 
+    'Native SOLIDWORKS mutation gate.
+    'SOLIDWORKS COM calls that change live document state must never overlap reference
+    'relinking, save completion, tree refreshes, or lock/read-only reconciliation.
+    Private ReadOnly solidWorksNativeMutationSync As New Object()
+    Private solidWorksNativeMutationInProgress As Boolean = False
+    Private solidWorksNativeMutationDescription As String = ""
+
+    'Lightweight diagnostic log. A native SOLIDWORKS crash cannot be caught by VB.NET,
+    'so the final completed phase is written here for post-crash diagnosis.
+    Private ReadOnly operationLogSync As New Object()
+    Private operationLogFilePath As String = ""
+
     'Automatic save -> SVN commit state.
     'All of this runs on the SOLIDWORKS UI thread except the actual svn.exe commit process.
     Private internalSolidWorksSaveDepth As Integer = 0
@@ -78,6 +92,11 @@ Public Module svnModule
     'those known guard-generated cases so the close workflow may proceed to the retained-lock
     'review table without weakening protection for genuine unsaved assembly edits.
     Private ReadOnly assemblyGuardFalseDirtyCandidatePaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+    'When SOLIDWORKS leaves an assembly dirty after PlumVault has already undone a blocked
+    'assembly edit, swallow the original close message and close that verified-clean document
+    'one UI turn later with ISldWorks.QuitDoc. Only stable file paths cross the deferred boundary.
+    Private ReadOnly assemblyGuardControlledCloseQueuedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
     Private Const SW_COMMAND_SAVE As Integer = 2
     Private Const SW_COMMAND_SAVE_AS As Integer = 620
@@ -123,6 +142,132 @@ Public Module svnModule
         iSwApp = mySwAppPass
         statusOfAllOpenModels = statusOfAllOpenModelsPass
 
+        Try
+            operationLogFilePath = Path.Combine(
+                System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
+                "PlumVault",
+                "Logs",
+                "PlumVault.log"
+            )
+        Catch
+            operationLogFilePath = ""
+        End Try
+
+        writeOperationLog("PlumVault initialized.")
+    End Sub
+
+    Private Sub writeOperationLog(ByVal message As String)
+        If String.IsNullOrWhiteSpace(message) Then Exit Sub
+
+        Try
+            If String.IsNullOrWhiteSpace(operationLogFilePath) Then
+                operationLogFilePath = Path.Combine(
+                    System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
+                    "PlumVault",
+                    "Logs",
+                    "PlumVault.log"
+                )
+            End If
+
+            Dim logFolder As String = Path.GetDirectoryName(operationLogFilePath)
+            If Not String.IsNullOrWhiteSpace(logFolder) Then Directory.CreateDirectory(logFolder)
+
+            Dim line As String =
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") &
+                " | T" & System.Threading.Thread.CurrentThread.ManagedThreadId.ToString() &
+                " | " & message & System.Environment.NewLine
+
+            SyncLock operationLogSync
+                Try
+                    If File.Exists(operationLogFilePath) Then
+                        Dim logInfo As New FileInfo(operationLogFilePath)
+                        If logInfo.Length > 4L * 1024L * 1024L Then
+                            Dim archivePath As String = operationLogFilePath & ".old"
+                            Try
+                                If File.Exists(archivePath) Then File.Delete(archivePath)
+                            Catch
+                            End Try
+                            Try
+                                File.Move(operationLogFilePath, archivePath)
+                            Catch
+                            End Try
+                        End If
+                    End If
+                Catch
+                End Try
+
+                File.AppendAllText(operationLogFilePath, line)
+            End SyncLock
+        Catch
+            'Logging must never interfere with CAD work.
+        End Try
+    End Sub
+
+    Public Sub logOperationPublic(ByVal message As String)
+        writeOperationLog(message)
+    End Sub
+
+    Private Function tryBeginSolidWorksNativeMutation(ByVal description As String) As Boolean
+        SyncLock solidWorksNativeMutationSync
+            If solidWorksNativeMutationInProgress Then
+                writeOperationLog(
+                    "Native mutation deferred: " & description &
+                    "; busy with: " & solidWorksNativeMutationDescription
+                )
+                Return False
+            End If
+
+            solidWorksNativeMutationInProgress = True
+            solidWorksNativeMutationDescription = If(description, "")
+        End SyncLock
+
+        writeOperationLog("Native mutation begin: " & description)
+        Return True
+    End Function
+
+    Private Sub endSolidWorksNativeMutation(ByVal description As String)
+        SyncLock solidWorksNativeMutationSync
+            solidWorksNativeMutationInProgress = False
+            solidWorksNativeMutationDescription = ""
+        End SyncLock
+
+        writeOperationLog("Native mutation end: " & description)
+    End Sub
+
+    Public Function tryBeginSolidWorksNativeMutationPublic(ByVal description As String) As Boolean
+        Return tryBeginSolidWorksNativeMutation(description)
+    End Function
+
+    Public Sub endSolidWorksNativeMutationPublic(ByVal description As String)
+        endSolidWorksNativeMutation(description)
+    End Sub
+
+    Public Function canRunDeferredSolidWorksUiMutationPublic() As Boolean
+        SyncLock solidWorksNativeMutationSync
+            If solidWorksNativeMutationInProgress Then Return False
+        End SyncLock
+
+        If automaticSaveCommitPreparing Then Return False
+        If legacyImportInProgress Then Return False
+        If assemblyGuardUndoInProgress Then Return False
+        If closeGuardMessageShowing OrElse lockReviewMessageShowing Then Return False
+        If asyncCommitInProgress Then Return False
+
+        Return True
+    End Function
+
+    Private Sub queueDeferredFeatureTreeRefresh(ByVal assemblyPath As String)
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Exit Sub
+        If myUserControl Is Nothing Then Exit Sub
+
+        Try
+            myUserControl.queueFeatureTreeRefreshForPathsPublic(
+                New String() {assemblyPath}
+            )
+            writeOperationLog("Queued FeatureManager refresh: " & assemblyPath)
+        Catch ex As Exception
+            writeOperationLog("Could not queue FeatureManager refresh: " & ex.Message)
+        End Try
     End Sub
 
 
@@ -457,6 +602,100 @@ Public Module svnModule
         Return isSvnPathLocallyClean(filePath)
     End Function
 
+    Private Function hasAnyOpenSolidWorksDocument() As Boolean
+        If iSwApp Is Nothing Then Return False
+
+        Try
+            If iSwApp.GetDocumentCount() > 0 Then Return True
+        Catch
+        End Try
+
+        Try
+            Dim docsObj As Object = iSwApp.GetDocuments()
+            If docsObj Is Nothing Then Return False
+
+            Dim docs As Object() = CType(docsObj, Object())
+            Return docs IsNot Nothing AndAlso docs.Length > 0
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function queueGuardGeneratedFalseDirtyDocumentClose(ByVal filePath As String) As Boolean
+        If iSwApp Is Nothing OrElse myUserControl Is Nothing Then Return False
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Dim normalizedPath As String = filePath
+        Try
+            normalizedPath = Path.GetFullPath(filePath)
+        Catch
+        End Try
+
+        SyncLock assemblyGuardSync
+            If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedPath) Then Return True
+            assemblyGuardControlledCloseQueuedPaths.Add(normalizedPath)
+        End SyncLock
+
+        Dim closeAction As New System.Windows.Forms.MethodInvoker(
+            Sub()
+                Try
+                    Dim currentDoc As ModelDoc2 = getOpenModelByPathSafe(normalizedPath)
+                    If currentDoc Is Nothing Then Exit Sub
+
+                    'Re-verify at execution time. A real edit made after the guard warning must
+                    'never be discarded by this controlled-close path.
+                    If Not canTreatAssemblySaveFlagAsGuardGenerated(currentDoc, normalizedPath) Then Exit Sub
+
+                    Dim documentName As String = ""
+                    Try
+                        documentName = Path.GetFileName(normalizedPath)
+                    Catch
+                        documentName = ""
+                    End Try
+
+                    If String.IsNullOrWhiteSpace(documentName) Then
+                        Try
+                            documentName = currentDoc.GetTitle()
+                        Catch
+                            documentName = normalizedPath
+                        End Try
+                    End If
+
+                    'QuitDoc is the SOLIDWORKS API close-without-saving operation. The original
+                    'native close message has already been swallowed, so SOLIDWORKS does not show
+                    'its false Save Modified Documents prompt for this verified-clean assembly.
+                    documentLockReviewApprovedPath = normalizedPath
+                    documentLockReviewApprovedUntil = DateTime.Now.AddSeconds(10)
+                    iSwApp.QuitDoc(documentName)
+
+                    SyncLock assemblyGuardSync
+                        assemblyGuardFalseDirtyCandidatePaths.Remove(normalizedPath)
+                    End SyncLock
+                Catch
+                    'If SOLIDWORKS refuses the controlled close, leave the document open.
+                Finally
+                    SyncLock assemblyGuardSync
+                        assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+                    End SyncLock
+                End Try
+            End Sub
+        )
+
+        Try
+            If Not myUserControl.IsDisposed AndAlso myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(closeAction)
+                Return True
+            End If
+        Catch
+        End Try
+
+        SyncLock assemblyGuardSync
+            assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+        End SyncLock
+
+        Return False
+    End Function
+
     Private Function assemblyIsEditingExternalPhysicalChild(ByVal assemblyDocument As ModelDoc2,
                                                              Optional ByVal allowLockedChildDimensionFallback As Boolean = False) As Boolean
         If assemblyDocument Is Nothing Then Return False
@@ -721,11 +960,11 @@ Public Module svnModule
 
                     assemblyGuardUndoInProgress = True
                     Try
+                        'ComponentMoveNotify2 and several other assembly notifications are post-events,
+                        'so one Undo is required. Do NOT force a rebuild here: ForceRebuild3(False)
+                        'rebuilds the top assembly and every subassembly and can freeze a large car.
+                        'The SVN/tree state did not change, so a PlumVault tree refresh is also unnecessary.
                         currentAssembly.EditUndo2(1)
-                        Try
-                            currentAssembly.ForceRebuild3(False)
-                        Catch
-                        End Try
                     Finally
                         assemblyGuardUndoInProgress = False
                     End Try
@@ -736,11 +975,6 @@ Public Module svnModule
                     markAssemblyGuardFalseDirtyCandidate(currentAssembly)
 
                     showAssemblyLockRequiredMessage(currentAssembly, actionDescription, editWasUndone:=True)
-
-                    Try
-                        refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
-                    Catch
-                    End Try
                 Catch
                     assemblyGuardUndoInProgress = False
 
@@ -2129,6 +2363,10 @@ Public Module svnModule
         'do not immediately place a second lock-review dialog in front of that decision.
         If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
 
+        'With no open SOLIDWORKS documents there is no active editing session to review.
+        'Do not scan the whole working copy or offer Unlock buttons during application shutdown.
+        If Not hasAnyOpenSolidWorksDocument() Then Return False
+
         Return blockCloseForOwnedLocks(
             isClosingSolidWorks:=True,
             closingDocumentPath:=""
@@ -2335,6 +2573,14 @@ Public Module svnModule
             Return False
         End If
 
+        Dim guardGeneratedFalseDirty As Boolean = False
+        Try
+            guardGeneratedFalseDirty = activeDoc.GetSaveFlag() AndAlso
+                                       canTreatAssemblySaveFlagAsGuardGenerated(activeDoc, activePath)
+        Catch
+            guardGeneratedFalseDirty = False
+        End Try
+
         Dim blockedByUnsafeChanges As Boolean = blockCloseIfSingleDocUnsafe(activeDoc)
         If blockedByUnsafeChanges Then Return True
 
@@ -2342,10 +2588,21 @@ Public Module svnModule
         'informational lock-review table on top of that exceptional path.
         If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
 
-        Return blockCloseForOwnedLocks(
+        Dim blockedByLockReview As Boolean = blockCloseForOwnedLocks(
             isClosingSolidWorks:=False,
             closingDocumentPath:=activePath
         )
+
+        If blockedByLockReview Then Return True
+
+        If guardGeneratedFalseDirty Then
+            'SOLIDWORKS has no public API to clear GetSaveFlag. Swallow this native close
+            'message and queue a verified close-without-save instead, preventing the false
+            'Save Modified Documents dialog while preserving all genuine dirty-file checks.
+            If queueGuardGeneratedFalseDirtyDocumentClose(activePath) Then Return True
+        End If
+
+        Return False
     End Function
 
     Private Function blockCloseForOwnedLocks(ByVal isClosingSolidWorks As Boolean,
@@ -2642,13 +2899,21 @@ Public Module svnModule
         Catch
         End Try
 
-        Try
-            refreshActiveTreeAfterSvnAction(
-                bUpdateLocalLockStatus:=False,
-                bRebuildTree:=False
-            )
-        Catch
-        End Try
+        'The lock-review form can be open while documents are closing. Never touch the
+        'SOLIDWORKS tree/ActiveDoc when there are no open documents; the SVN unlock and cache
+        'update above are already complete.
+        If hasAnyOpenSolidWorksDocument() Then
+            Try
+                Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+                If activeDoc IsNot Nothing Then
+                    refreshActiveTreeAfterSvnAction(
+                        bUpdateLocalLockStatus:=False,
+                        bRebuildTree:=False
+                    )
+                End If
+            Catch
+            End Try
+        End If
 
         Return True
     End Function
@@ -6817,6 +7082,17 @@ Public Module svnModule
         Return True
     End Function
 
+    Private Sub updateRelinkedComponentDisplayNames(ByVal assy As AssemblyDoc,
+                                                     ByVal externalRefs As List(Of ExternalReferenceInfo))
+        'Intentionally no direct Component2.Name2 writes.
+        '
+        'After ReplaceReferencedDocument / ReplaceReference, previously acquired Component2
+        'RCWs can be stale even when the physical reference change succeeded. Writing Name2 at
+        'that point can enter unstable native SOLIDWORKS code. PlumVault now enables the native
+        '"Update component names when documents are replaced" preference during the relink and
+        'then requests a deferred FeatureManager refresh after the relink/save stack has returned.
+    End Sub
+
     Private Function saveRelinkedAssemblyWithoutRebuild(ByVal activeDoc As ModelDoc2,
                                                         ByRef saveErrors As Integer,
                                                         ByRef saveWarnings As Integer) As Boolean
@@ -6845,14 +7121,23 @@ Public Module svnModule
         If externalRefs Is Nothing Then Return True
         If externalRefs.Count = 0 Then Return True
 
-        Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Dim activeDoc As ModelDoc2 = Nothing
+
+        Try
+            activeDoc = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+        Catch ex As Exception
+            writeOperationLog("Relink blocked: could not read active document: " & ex.Message)
+            Return False
+        End Try
+
         If activeDoc Is Nothing Then Return False
 
-        If activeDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then
-            Return True
-        End If
+        Try
+            If activeDoc.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Return True
+        Catch
+            Return False
+        End Try
 
-        Dim assy As AssemblyDoc = CType(activeDoc, AssemblyDoc)
         Dim activeAssemblyPath As String = ""
 
         Try
@@ -6861,123 +7146,274 @@ Public Module svnModule
             activeAssemblyPath = ""
         End Try
 
-        'Fast progressive relink:
-        '  1. Try the lightweight document-reference redirect.
-        '  2. Verify the open assembly path immediately and stop if it worked.
-        '  3. Try Component2.ReplaceReference only when needed.
-        '  4. Use the selection-based ReplaceComponents command only as the last resort.
-        'The old implementation ran all three methods for every file, which could repeatedly
-        'evaluate mates and trigger rebuild/error sounds even after the first method succeeded.
-        For Each refInfo As ExternalReferenceInfo In externalRefs
-            If refInfo Is Nothing Then Continue For
-            If String.IsNullOrWhiteSpace(refInfo.oldPath) Then Continue For
-            If String.IsNullOrWhiteSpace(refInfo.newPath) Then Continue For
+        If Not tryBeginSolidWorksNativeMutation("External reference relink") Then
+            iSwApp.SendMsgToUser2(
+                "PlumVault is finishing another SOLIDWORKS document operation." & vbCrLf & vbCrLf &
+                "Wait a moment, then click Commit again.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Return False
+        End If
 
-            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+        Dim restoreUpdateComponentNamesPreference As Boolean = False
+        Dim originalUpdateComponentNamesPreference As Boolean = False
+        Dim operationSucceeded As Boolean = False
 
-            'Stage 1: cheapest path-level redirect.
+        Try
+            writeOperationLog(
+                "External relink started: " & activeAssemblyPath &
+                "; references=" & externalRefs.Count.ToString()
+            )
+
+            'Use SOLIDWORKS' native replacement-name workflow instead of directly changing
+            'Component2.Name2 on component RCWs after their references have changed.
+            Try
+                originalUpdateComponentNamesPreference =
+                    iSwApp.GetUserPreferenceToggle(
+                        CInt(swUserPreferenceToggle_e.swExtRefUpdateCompNames)
+                    )
+                restoreUpdateComponentNamesPreference = True
+
+                If Not originalUpdateComponentNamesPreference Then
+                    iSwApp.SetUserPreferenceToggle(
+                        CInt(swUserPreferenceToggle_e.swExtRefUpdateCompNames),
+                        True
+                    )
+                End If
+            Catch ex As Exception
+                writeOperationLog(
+                    "Could not temporarily enable native component-name updates: " & ex.Message
+                )
+            End Try
+
+            Dim assy As AssemblyDoc = CType(activeDoc, AssemblyDoc)
+
+            For Each refInfo As ExternalReferenceInfo In externalRefs
+                If refInfo Is Nothing Then Continue For
+                If String.IsNullOrWhiteSpace(refInfo.oldPath) Then Continue For
+                If String.IsNullOrWhiteSpace(refInfo.newPath) Then Continue For
+
+                writeOperationLog(
+                    "Relink item: " & refInfo.oldPath & " -> " & refInfo.newPath
+                )
+
+                If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+
+                If Not String.IsNullOrWhiteSpace(activeAssemblyPath) Then
+                    Try
+                        iSwApp.ReplaceReferencedDocument(
+                            activeAssemblyPath,
+                            refInfo.oldPath,
+                            refInfo.newPath
+                        )
+                    Catch ex As Exception
+                        writeOperationLog(
+                            "ReplaceReferencedDocument failed: " & ex.Message
+                        )
+                    End Try
+                End If
+
+                If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+
+                Dim componentsUsingOldPath As List(Of Component2) =
+                    getAssemblyComponentsUsingPath(assy, refInfo.oldPath)
+
+                For Each comp As Component2 In componentsUsingOldPath
+                    If comp Is Nothing Then Continue For
+
+                    Try
+                        comp.ReplaceReference(refInfo.newPath)
+                    Catch ex As Exception
+                        writeOperationLog(
+                            "Component2.ReplaceReference failed: " & ex.Message
+                        )
+                    End Try
+                Next
+
+                componentsUsingOldPath = Nothing
+
+                If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+
+                componentsUsingOldPath =
+                    getAssemblyComponentsUsingPath(assy, refInfo.oldPath)
+
+                For Each comp As Component2 In componentsUsingOldPath
+                    If comp Is Nothing Then Continue For
+
+                    Try
+                        tryAssemblyReplaceComponent(assy, comp, refInfo.newPath)
+                    Catch ex As Exception
+                        writeOperationLog(
+                            "ReplaceComponents fallback failed: " & ex.Message
+                        )
+                    End Try
+                Next
+
+                componentsUsingOldPath = Nothing
+            Next
+
+            'Discard all pre-relink document/component variables and reacquire the assembly by
+            'stable file path before save/verification.
             If Not String.IsNullOrWhiteSpace(activeAssemblyPath) Then
                 Try
-                    iSwApp.ReplaceReferencedDocument(activeAssemblyPath, refInfo.oldPath, refInfo.newPath)
-                Catch
+                    Dim reacquiredDoc As ModelDoc2 =
+                        TryCast(iSwApp.GetOpenDocumentByName(activeAssemblyPath), ModelDoc2)
+
+                    If reacquiredDoc IsNot Nothing Then activeDoc = reacquiredDoc
+                Catch ex As Exception
+                    writeOperationLog(
+                        "Could not reacquire assembly after relink: " & ex.Message
+                    )
                 End Try
             End If
 
-            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+            If activeDoc Is Nothing Then Return False
 
-            'Stage 2: update only component instances that still use the old exact full path.
-            Dim componentsUsingOldPath As List(Of Component2) =
-                getAssemblyComponentsUsingPath(assy, refInfo.oldPath)
-
-            For Each comp As Component2 In componentsUsingOldPath
-                Try
-                    comp.ReplaceReference(refInfo.newPath)
-                Catch
-                End Try
-            Next
-
-            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
-
-            'Stage 3: most disruptive/manual-style replacement, used only as a last fallback.
-            componentsUsingOldPath = getAssemblyComponentsUsingPath(assy, refInfo.oldPath)
-
-            For Each comp As Component2 In componentsUsingOldPath
-                Try
-                    tryAssemblyReplaceComponent(assy, comp, refInfo.newPath)
-                Catch
-                End Try
-            Next
-        Next
-
-        'Persist all successful path changes once, without forcing a full assembly rebuild.
-        Dim saveErrors As Integer = 0
-        Dim saveWarnings As Integer = 0
-        Dim fastSaveSucceeded As Boolean =
-            saveRelinkedAssemblyWithoutRebuild(activeDoc, saveErrors, saveWarnings)
-
-        If fastSaveSucceeded AndAlso allExternalReferencesAreRelinked(assy, externalRefs) Then
-            Return True
-        End If
-
-        'Recovery only:
-        'Some SolidWorks states do not expose the new in-memory component path until one rebuild.
-        'Run at most one full rebuild/save, and only when the lightweight path did not fully settle.
-        Try
-            activeDoc.ForceRebuild3(False)
-        Catch
-        End Try
-
-        Dim recoveryErrors As Integer = 0
-        Dim recoveryWarnings As Integer = 0
-        Dim recoverySaveSucceeded As Boolean = False
-
-        Try
-            beginInternalSolidWorksSave()
             Try
-                recoverySaveSucceeded = activeDoc.Save3(
-                    swSaveAsOptions_e.swSaveAsOptions_Silent,
-                    recoveryErrors,
-                    recoveryWarnings
-                )
-            Finally
-                endInternalSolidWorksSave()
+                assy = CType(activeDoc, AssemblyDoc)
+            Catch
+                Return False
             End Try
-        Catch
-            recoverySaveSucceeded = False
+
+            Dim saveErrors As Integer = 0
+            Dim saveWarnings As Integer = 0
+            Dim fastSaveSucceeded As Boolean =
+                saveRelinkedAssemblyWithoutRebuild(activeDoc, saveErrors, saveWarnings)
+
+            writeOperationLog(
+                "Relink fast save: success=" & fastSaveSucceeded.ToString() &
+                "; errors=" & saveErrors.ToString() &
+                "; warnings=" & saveWarnings.ToString()
+            )
+
+            If fastSaveSucceeded AndAlso
+               allExternalReferencesAreRelinked(assy, externalRefs) Then
+
+                operationSucceeded = True
+                Return True
+            End If
+
+            Try
+                activeDoc.ForceRebuild3(False)
+                writeOperationLog("Relink recovery rebuild completed.")
+            Catch ex As Exception
+                writeOperationLog("Relink recovery rebuild failed: " & ex.Message)
+            End Try
+
+            Dim recoveryErrors As Integer = 0
+            Dim recoveryWarnings As Integer = 0
+            Dim recoverySaveSucceeded As Boolean = False
+
+            Try
+                beginInternalSolidWorksSave()
+                Try
+                    recoverySaveSucceeded = activeDoc.Save3(
+                        swSaveAsOptions_e.swSaveAsOptions_Silent,
+                        recoveryErrors,
+                        recoveryWarnings
+                    )
+                Finally
+                    endInternalSolidWorksSave()
+                End Try
+            Catch ex As Exception
+                recoverySaveSucceeded = False
+                writeOperationLog("Relink recovery save failed: " & ex.Message)
+            End Try
+
+            writeOperationLog(
+                "Relink recovery save: success=" & recoverySaveSucceeded.ToString() &
+                "; errors=" & recoveryErrors.ToString() &
+                "; warnings=" & recoveryWarnings.ToString()
+            )
+
+            If recoverySaveSucceeded AndAlso
+               allExternalReferencesAreRelinked(assy, externalRefs) Then
+
+                operationSucceeded = True
+                Return True
+            End If
+
+            Dim failedMsg As New StringBuilder()
+
+            For Each refInfo As ExternalReferenceInfo In externalRefs
+                If refInfo Is Nothing Then Continue For
+                If externalReferenceIsRelinked(assy, refInfo) Then Continue For
+
+                failedMsg.AppendLine(Path.GetFileName(refInfo.oldPath))
+                failedMsg.AppendLine(refInfo.oldPath)
+                failedMsg.AppendLine("→")
+                failedMsg.AppendLine(refInfo.newPath)
+                failedMsg.AppendLine()
+            Next
+
+            If failedMsg.Length = 0 Then
+                failedMsg.AppendLine(
+                    "The references appear updated, but SOLIDWORKS could not save the assembly reliably."
+                )
+                failedMsg.AppendLine(
+                    "Fast save errors: " & saveErrors.ToString() &
+                    "; warnings: " & saveWarnings.ToString()
+                )
+                failedMsg.AppendLine(
+                    "Recovery save errors: " & recoveryErrors.ToString() &
+                    "; warnings: " & recoveryWarnings.ToString()
+                )
+            End If
+
+            iSwApp.SendMsgToUser2(
+                "Commit blocked." & vbCrLf & vbCrLf &
+                "SOLIDWORKS could not complete and save the external/vendor reference relink." &
+                vbCrLf & vbCrLf &
+                failedMsg.ToString(),
+                swMessageBoxIcon_e.swMbStop,
+                swMessageBoxBtn_e.swMbOk
+            )
+
+            Return False
+
+        Catch ex As Exception
+            writeOperationLog("External relink exception: " & ex.ToString())
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "Commit blocked." & vbCrLf & vbCrLf &
+                    "PlumVault safely stopped the external-reference operation." & vbCrLf &
+                    ex.Message,
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Return False
+
+        Finally
+            If restoreUpdateComponentNamesPreference Then
+                Try
+                    iSwApp.SetUserPreferenceToggle(
+                        CInt(swUserPreferenceToggle_e.swExtRefUpdateCompNames),
+                        originalUpdateComponentNamesPreference
+                    )
+                Catch ex As Exception
+                    writeOperationLog(
+                        "Could not restore component-name preference: " & ex.Message
+                    )
+                End Try
+            End If
+
+            endSolidWorksNativeMutation("External reference relink")
+
+            If operationSucceeded AndAlso
+               Not String.IsNullOrWhiteSpace(activeAssemblyPath) Then
+
+                queueDeferredFeatureTreeRefresh(activeAssemblyPath)
+            End If
+
+            writeOperationLog(
+                "External relink finished: success=" & operationSucceeded.ToString()
+            )
         End Try
-
-        If recoverySaveSucceeded AndAlso allExternalReferencesAreRelinked(assy, externalRefs) Then
-            Return True
-        End If
-
-        Dim failedMsg As New System.Text.StringBuilder()
-
-        For Each refInfo As ExternalReferenceInfo In externalRefs
-            If refInfo Is Nothing Then Continue For
-            If externalReferenceIsRelinked(assy, refInfo) Then Continue For
-
-            failedMsg.AppendLine(Path.GetFileName(refInfo.oldPath))
-            failedMsg.AppendLine(refInfo.oldPath)
-            failedMsg.AppendLine("→")
-            failedMsg.AppendLine(refInfo.newPath)
-            failedMsg.AppendLine()
-        Next
-
-        If failedMsg.Length = 0 Then
-            failedMsg.AppendLine("The references appear updated, but SolidWorks could not save the assembly reliably.")
-            failedMsg.AppendLine("Fast save errors: " & saveErrors.ToString() & "; warnings: " & saveWarnings.ToString())
-            failedMsg.AppendLine("Recovery save errors: " & recoveryErrors.ToString() & "; warnings: " & recoveryWarnings.ToString())
-        End If
-
-        iSwApp.SendMsgToUser2(
-            "Commit blocked." & vbCrLf & vbCrLf &
-            "SolidWorks could not complete and save the external/vendor reference relink." & vbCrLf & vbCrLf &
-            failedMsg.ToString(),
-            swMessageBoxIcon_e.swMbStop,
-            swMessageBoxBtn_e.swMbOk
-        )
-
-        Return False
     End Function
 
     Private Function verifyExternalRefsNowPointToVaultCopies(ByRef externalRefs As List(Of ExternalReferenceInfo)) As Boolean
@@ -9499,6 +9935,15 @@ Public Module svnModule
                                     Optional bBreakLocks As Boolean = False,
                                     Optional bUseTortoise As Boolean = False,
                                     Optional sMessage As String = "")
+        If Not canRunDeferredSolidWorksUiMutationPublic() Then
+            iSwApp.SendMsgToUser2(
+                "PlumVault is finishing another SOLIDWORKS document operation." & vbCrLf & vbCrLf &
+                "Wait a moment, then click Get Locks again.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk)
+            Exit Sub
+        End If
+
         If asyncGetLocksInProgress Then
             iSwApp.SendMsgToUser2(
                 "Get Locks is already running." & vbCrLf & vbCrLf &
@@ -9548,6 +9993,10 @@ Public Module svnModule
         End Try
 
         asyncGetLocksInProgress = True
+        writeOperationLog(
+            "Get Locks started: count=" & filteredPaths.Length.ToString() &
+            "; paths=" & String.Join(" | ", filteredPaths)
+        )
 
         Try
             myUserControl.markLockPendingForFilePathsPublic(filteredPaths, True, "Locking...")
@@ -9903,27 +10352,80 @@ Public Module svnModule
     Private Sub finishAsyncGetLocksOnMainThread(ByVal result As AsyncGetLocksResult)
         Try
             If result IsNot Nothing AndAlso result.AttemptedPaths IsNot Nothing Then
-                myUserControl.markLockPendingForFilePathsPublic(result.AttemptedPaths, False)
+                myUserControl.markLockPendingForFilePathsPublic(
+                    result.AttemptedPaths,
+                    False
+                )
             End If
-        Catch
+        Catch ex As Exception
+            writeOperationLog("Could not clear lock-pending UI: " & ex.Message)
         End Try
 
-        Try
-            If result IsNot Nothing AndAlso result.LockedPaths IsNot Nothing AndAlso result.LockedPaths.Length > 0 Then
-                myUserControl.forceWriteAccessForLockedFilePathsPublic(result.LockedPaths)
-                myUserControl.markLockResultForFilePathsPublic(result.LockedPaths, True, "Locked by you")
-                updateStatusCacheForKnownPaths(result.LockedPaths, forceLock6:="K", forceReleased:="||EDIT||")
-            End If
-        Catch
-        End Try
-
+        'The SVN operation has finished before any live SOLIDWORKS document mutation is queued.
         asyncGetLocksInProgress = False
 
-        If result Is Nothing Then Exit Sub
+        Try
+            If result IsNot Nothing AndAlso
+               result.LockedPaths IsNot Nothing AndAlso
+               result.LockedPaths.Length > 0 Then
+
+                updateStatusCacheForKnownPaths(
+                    result.LockedPaths,
+                    forceLock6:="K",
+                    forceReleased:="||EDIT||"
+                )
+
+                myUserControl.markLockResultForFilePathsPublic(
+                    result.LockedPaths,
+                    True,
+                    "Locked by you"
+                )
+
+                myUserControl.forceWriteAccessForLockedFilePathsPublic(
+                    result.LockedPaths
+                )
+
+                writeOperationLog(
+                    "Get Locks completed; deferred writable reconciliation queued: " &
+                    String.Join(" | ", result.LockedPaths)
+                )
+            End If
+        Catch ex As Exception
+            writeOperationLog(
+                "Get Locks main-thread completion error: " & ex.ToString()
+            )
+        End Try
+
+        If result Is Nothing Then
+            writeOperationLog("Get Locks finished with no result object.")
+            Exit Sub
+        End If
+
+        If Not result.Success Then
+            writeOperationLog("Get Locks failed: " & result.Message)
+        Else
+            writeOperationLog("Get Locks SVN phase succeeded.")
+        End If
 
         If Not String.IsNullOrWhiteSpace(result.Message) Then
-            Dim icon As swMessageBoxIcon_e = If(result.IsWarning, swMessageBoxIcon_e.swMbWarning, swMessageBoxIcon_e.swMbInformation)
-            iSwApp.SendMsgToUser2(result.Message, icon, swMessageBoxBtn_e.swMbOk)
+            Try
+                Dim icon As swMessageBoxIcon_e =
+                    If(
+                        result.IsWarning,
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxIcon_e.swMbInformation
+                    )
+
+                iSwApp.SendMsgToUser2(
+                    result.Message,
+                    icon,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch ex As Exception
+                writeOperationLog(
+                    "Could not show Get Locks completion message: " & ex.Message
+                )
+            End Try
         End If
     End Sub
 

@@ -49,6 +49,16 @@ Public Class UserControl1
     Private copyLegacyDataToSvnMenuItem As ToolStripMenuItem
     Private cacheAgeLabel As Label
     Private WithEvents cacheAgeTimer As System.Windows.Forms.Timer
+
+    'Deferred native SOLIDWORKS UI work.
+    'Never change live document read-only state or refresh FeatureManager inside an SVN
+    'completion callback. Queue stable file paths and reacquire COM objects later.
+    Private WithEvents deferredSolidWorksUiTimer As System.Windows.Forms.Timer
+    Private ReadOnly pendingWriteAccessPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private ReadOnly pendingFeatureTreeRefreshPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private deferredSolidWorksUiAttemptCount As Integer = 0
+    Private Const MAX_DEFERRED_SOLIDWORKS_UI_ATTEMPTS As Integer = 8
+
     Private Const LAZY_LOAD_PLACEHOLDER_TEXT As String = "<load children>"
     Private syncStatusInProgress As Boolean = False
     Private refreshTreeNeedsUpdate As Boolean = False
@@ -65,6 +75,13 @@ Public Class UserControl1
     Private userAdjustedTreeStart As Boolean = False
     Private batchSelectedTreeNodes As New List(Of TreeNode)()
     Private lastBatchAnchorTreeNode As TreeNode = Nothing
+
+    'Stable tree-action selection identity.
+    'TreeNode and Component2 COM objects are replaced during tree rebuilds. File actions
+    'must therefore remember the physical path the user clicked rather than requiring
+    'reference equality with an older TreeNode instance.
+    Private lastUserClickedTreePathForActions As String = ""
+    Private lastUserClickedTreeTextForActions As String = ""
 
     Private Function normalTreeTextColor() As Color
         Return Color.Black
@@ -990,6 +1007,248 @@ Public Class UserControl1
         End Try
     End Sub
 
+    'Tree nodes must not depend on long-lived SOLIDWORKS COM objects for ordinary
+    'selection and file actions. TreeNode.Clone preserves Tag references, and a Component2
+    'from a document that was closed and reopened can point to a released native object.
+    'Store the resolved physical CAD path in TreeNode.Name so clicks/actions can remain
+    'path-only and reacquire live SOLIDWORKS objects only when a graphical selection is needed.
+    Private Sub setStableTreeNodeCadPath(ByVal node As TreeNode, ByVal filePath As String)
+        If node Is Nothing Then Exit Sub
+
+        Dim normalizedPath As String = normalizeTreeActionPath(filePath)
+
+        If String.IsNullOrWhiteSpace(normalizedPath) Then
+            node.Name = ""
+        Else
+            node.Name = normalizedPath
+        End If
+    End Sub
+
+    Private Function getStableTreeNodeCadPath(ByVal node As TreeNode) As String
+        If node Is Nothing Then Return ""
+
+        Try
+            Dim storedPath As String = normalizeTreeActionPath(node.Name)
+            If Not String.IsNullOrWhiteSpace(storedPath) Then Return storedPath
+        Catch
+        End Try
+
+        Return ""
+    End Function
+
+    Private Function treeNodeRepresentsVirtualComponent(ByVal node As TreeNode) As Boolean
+        If node Is Nothing Then Return False
+
+        Try
+            Return node.Text.IndexOf("[Virtual]", StringComparison.OrdinalIgnoreCase) >= 0
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function normalizeTreeActionPath(ByVal filePath As String) As String
+        If String.IsNullOrWhiteSpace(filePath) Then Return ""
+
+        Try
+            Return Path.GetFullPath(filePath)
+        Catch
+            Return filePath.Trim()
+        End Try
+    End Function
+
+    Private Function isPhysicalCadFilePath(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        If Not File.Exists(filePath) Then Return False
+
+        Try
+            Dim extension As String = Path.GetExtension(filePath).ToUpperInvariant()
+            Return extension = ".SLDPRT" OrElse extension = ".SLDASM" OrElse extension = ".SLDDRW"
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function tryResolveTreeNodeFileActionTarget(ByVal node As TreeNode,
+                                                        ByRef targetPath As String,
+                                                        ByRef resolvedFromVirtualComponent As Boolean,
+                                                        ByRef failureReason As String) As Boolean
+        targetPath = ""
+        resolvedFromVirtualComponent = False
+        failureReason = ""
+
+        If node Is Nothing Then
+            failureReason = "No tree item is selected."
+            Return False
+        End If
+
+        If isLazyPlaceholderNode(node) Then
+            failureReason = "The selected row is a lazy-loading placeholder, not a CAD file."
+            Return False
+        End If
+
+        'Primary path: use the stable physical path captured when the live tree was built.
+        'This avoids touching a stale Component2/ModelDoc2 RCW merely because the user clicked
+        'a tree row after closing and reopening an assembly.
+        Dim stableNodePath As String = getStableTreeNodeCadPath(node)
+
+        If isPhysicalCadFilePath(stableNodePath) Then
+            targetPath = stableNodePath
+            resolvedFromVirtualComponent = treeNodeRepresentsVirtualComponent(node)
+            Return True
+        End If
+
+        Try
+            If TypeOf node.Tag Is Component2 Then
+                Dim component As Component2 = CType(node.Tag, Component2)
+
+                If isComponentVirtualSafe(component) Then
+                    resolvedFromVirtualComponent = True
+                    targetPath = getPhysicalOwnerAssemblyPathForTreeNode(node)
+
+                    If String.IsNullOrWhiteSpace(targetPath) Then
+                        failureReason = "The selected virtual component's physical owning assembly could not be resolved."
+                        Return False
+                    End If
+                Else
+                    'Critical targeting rule: a physical component resolves only to its own
+                    'document path. Never fall back to the active or parent assembly.
+                    targetPath = getSafeComponentPath(component)
+
+                    If String.IsNullOrWhiteSpace(targetPath) Then
+                        failureReason = "The selected physical component does not currently expose a file path."
+                        Return False
+                    End If
+                End If
+
+            ElseIf TypeOf node.Tag Is ModelDoc2 Then
+                Dim model As ModelDoc2 = CType(node.Tag, ModelDoc2)
+                Dim directPath As String = getSafeModelPath(model)
+
+                If isPhysicalCadFilePath(directPath) AndAlso
+                   directPath.IndexOf("\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) < 0 AndAlso
+                   Not Path.GetFileName(directPath).Contains("^") Then
+
+                    targetPath = directPath
+                Else
+                    'A virtual model opened in its own tab has no independent SVN file.
+                    'Only this positively identified virtual-model case may map to an assembly.
+                    Dim ownerDocument As ModelDoc2 = getOwningPhysicalAssemblyDocumentForVirtualModel(model)
+
+                    If ownerDocument Is Nothing Then
+                        failureReason = "The selected document could not be resolved to a physical CAD file."
+                        Return False
+                    End If
+
+                    resolvedFromVirtualComponent = True
+                    targetPath = getSafeModelPath(ownerDocument)
+                End If
+            Else
+                failureReason = "The selected tree item is not attached to a CAD document or component."
+                Return False
+            End If
+
+        Catch ex As InvalidComObjectException
+            failureReason = "The selected tree item became stale after a SOLIDWORKS refresh. Refresh the tree and select it again."
+            Return False
+        Catch ex As COMException
+            failureReason = "SOLIDWORKS could not resolve the selected tree item safely. Refresh the tree and select it again."
+            Return False
+        Catch
+            failureReason = "The selected tree item could not be resolved safely."
+            Return False
+        End Try
+
+        targetPath = normalizeTreeActionPath(targetPath)
+
+        If Not isPhysicalCadFilePath(targetPath) Then
+            failureReason = "The selected tree item does not resolve to an existing physical CAD file."
+            targetPath = ""
+            Return False
+        End If
+
+        Return True
+    End Function
+
+    Private Sub rememberExplicitTreeActionSelection(ByVal node As TreeNode)
+        lastUserClickedTreeNodeForSync = node
+        lastUserClickedTreeTextForActions = ""
+        lastUserClickedTreePathForActions = ""
+
+        If node Is Nothing Then Exit Sub
+
+        Try
+            lastUserClickedTreeTextForActions = stripStatusSuffix(node.Text)
+        Catch
+            lastUserClickedTreeTextForActions = ""
+        End Try
+
+        Dim resolvedPath As String = ""
+        Dim resolvedFromVirtual As Boolean = False
+        Dim failureReason As String = ""
+
+        If tryResolveTreeNodeFileActionTarget(node, resolvedPath, resolvedFromVirtual, failureReason) Then
+            lastUserClickedTreePathForActions = normalizeTreeActionPath(resolvedPath)
+        End If
+    End Sub
+
+    Private Function isCurrentTreeSelectionExplicitForFileAction() As Boolean
+        Try
+            If batchSelectedTreeNodes IsNot Nothing AndAlso batchSelectedTreeNodes.Count > 0 Then Return True
+            If TreeView1 Is Nothing OrElse TreeView1.SelectedNode Is Nothing Then Return False
+
+            Dim selectedNode As TreeNode = TreeView1.SelectedNode
+
+            If lastUserClickedTreeNodeForSync IsNot Nothing AndAlso
+               Object.ReferenceEquals(selectedNode, lastUserClickedTreeNodeForSync) Then
+                Return True
+            End If
+
+            If String.IsNullOrWhiteSpace(lastUserClickedTreePathForActions) Then Return False
+
+            Dim resolvedPath As String = ""
+            Dim resolvedFromVirtual As Boolean = False
+            Dim failureReason As String = ""
+
+            If Not tryResolveTreeNodeFileActionTarget(selectedNode, resolvedPath, resolvedFromVirtual, failureReason) Then Return False
+
+            Return String.Equals(
+                normalizeTreeActionPath(resolvedPath),
+                normalizeTreeActionPath(lastUserClickedTreePathForActions),
+                StringComparison.OrdinalIgnoreCase
+            )
+        Catch
+            Return False
+        End Try
+    End Function
+
+    Private Function getCurrentExplicitTreeSelectionDiagnostic(ByRef selectedText As String,
+                                                               ByRef resolvedPath As String,
+                                                               ByRef resolvedFromVirtual As Boolean,
+                                                               ByRef failureReason As String) As Boolean
+        selectedText = ""
+        resolvedPath = ""
+        resolvedFromVirtual = False
+        failureReason = ""
+
+        If TreeView1 Is Nothing OrElse TreeView1.SelectedNode Is Nothing Then
+            failureReason = "No tree item is selected."
+            Return False
+        End If
+
+        Try
+            selectedText = stripStatusSuffix(TreeView1.SelectedNode.Text)
+        Catch
+            selectedText = ""
+        End Try
+
+        Return tryResolveTreeNodeFileActionTarget(
+            TreeView1.SelectedNode,
+            resolvedPath,
+            resolvedFromVirtual,
+            failureReason
+        )
+    End Function
+
     Private Function getBatchSelectedTreeCadPathsForAction(Optional ByVal includeSingleSelectedNode As Boolean = True) As String()
         Dim output As New List(Of String)()
         Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -999,12 +1258,8 @@ Public Class UserControl1
                 For Each node As TreeNode In batchSelectedTreeNodes
                     addTreeNodePathToBatchActionList(node, seen, output)
                 Next
-            ElseIf includeSingleSelectedNode AndAlso TreeView1 IsNot Nothing AndAlso TreeView1.SelectedNode IsNot Nothing Then
-                'Only use the single tree selection for file actions if the user actually clicked it.
-                'This avoids acting on an automatically-selected root node after refresh.
-                If lastUserClickedTreeNodeForSync IsNot Nothing AndAlso Object.ReferenceEquals(TreeView1.SelectedNode, lastUserClickedTreeNodeForSync) Then
-                    addTreeNodePathToBatchActionList(TreeView1.SelectedNode, seen, output)
-                End If
+            ElseIf includeSingleSelectedNode AndAlso isCurrentTreeSelectionExplicitForFileAction() Then
+                addTreeNodePathToBatchActionList(TreeView1.SelectedNode, seen, output)
             End If
         Catch
         End Try
@@ -1020,13 +1275,14 @@ Public Class UserControl1
         If isLazyPlaceholderNode(node) Then Exit Sub
         If seen Is Nothing OrElse output Is Nothing Then Exit Sub
 
-        Dim nodePath As String = getCadPathFromTreeNode(node)
+        Dim nodePath As String = ""
+        Dim resolvedFromVirtual As Boolean = False
+        Dim failureReason As String = ""
+
+        If Not tryResolveTreeNodeFileActionTarget(node, nodePath, resolvedFromVirtual, failureReason) Then Exit Sub
         If Not isCadPathForSync(nodePath) Then Exit Sub
 
-        Try
-            nodePath = Path.GetFullPath(nodePath)
-        Catch
-        End Try
+        nodePath = normalizeTreeActionPath(nodePath)
 
         If seen.Contains(nodePath) Then Exit Sub
 
@@ -1354,6 +1610,10 @@ Public Class UserControl1
         graphicalSelectionSyncTimer = New System.Windows.Forms.Timer()
         graphicalSelectionSyncTimer.Interval = 500 'Keep the add-in tree aligned to graphical selections without SVN/server work.
         graphicalSelectionSyncTimer.Start()
+
+        deferredSolidWorksUiTimer = New System.Windows.Forms.Timer()
+        deferredSolidWorksUiTimer.Interval = 350
+        deferredSolidWorksUiTimer.Stop()
 
 
     End Sub
@@ -1722,6 +1982,14 @@ Public Class UserControl1
             End If
         Catch
         End Try
+
+        Try
+            If deferredSolidWorksUiTimer IsNot Nothing Then
+                deferredSolidWorksUiTimer.Stop()
+                deferredSolidWorksUiTimer.Enabled = False
+            End If
+        Catch
+        End Try
     End Sub
 
     Private Sub disposeTaskPaneTimers()
@@ -1753,6 +2021,18 @@ Public Class UserControl1
         Catch
             cacheAgeTimer = Nothing
         End Try
+
+        Try
+            If deferredSolidWorksUiTimer IsNot Nothing Then
+                deferredSolidWorksUiTimer.Dispose()
+                deferredSolidWorksUiTimer = Nothing
+            End If
+        Catch
+            deferredSolidWorksUiTimer = Nothing
+        End Try
+
+        pendingWriteAccessPaths.Clear()
+        pendingFeatureTreeRefreshPaths.Clear()
     End Sub
 
     Friend Sub beforeClose()
@@ -1772,20 +2052,117 @@ Public Class UserControl1
 
     ' ### Get Locks
     Private Sub ToolStripDropDownGetLocks_ButtonClick(sender As Object, e As EventArgs) Handles ToolStripDropDownButGetLocks.ButtonClick
-        Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
-        If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
-
-        'Fast path-first Get Locks behavior:
-        'Ctrl-click and Shift-click build the blue batch selection in the SVN tree.
-        'When Get Locks is clicked afterward, always use that stored batch selection.
-        'The user does NOT need to keep Ctrl or Shift held while clicking Get Locks.
-        'If there is no batch selection, this helper falls back to the exact single tree node.
+        'Resolve a deliberate SVN-tree selection before consulting ActiveDoc or the
+        'SOLIDWORKS graphics selection. A physical tree part must never silently become
+        'the active parent assembly merely because a TreeNode object was rebuilt.
+        Dim hasExplicitTreeSelection As Boolean = isCurrentTreeSelectionExplicitForFileAction()
         Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
 
         If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
+            Dim selectedText As String = ""
+            Dim resolvedPath As String = ""
+            Dim resolvedFromVirtual As Boolean = False
+            Dim failureReason As String = ""
+
+            getCurrentExplicitTreeSelectionDiagnostic(
+                selectedText,
+                resolvedPath,
+                resolvedFromVirtual,
+                failureReason
+            )
+
+            Try
+                svnModule.logOperationPublic(
+                    "Get Locks tree selection: text=" & selectedText &
+                    "; virtualOwner=" & resolvedFromVirtual.ToString() &
+                    "; resolvedTargets=" & String.Join(" | ", selectedTreePaths)
+                )
+            Catch
+            End Try
+
             getLocksOfPathsAsync(selectedTreePaths)
+
+        ElseIf hasExplicitTreeSelection Then
+            Dim selectedText As String = ""
+            Dim resolvedPath As String = ""
+            Dim resolvedFromVirtual As Boolean = False
+            Dim failureReason As String = ""
+
+            getCurrentExplicitTreeSelectionDiagnostic(
+                selectedText,
+                resolvedPath,
+                resolvedFromVirtual,
+                failureReason
+            )
+
+            If String.IsNullOrWhiteSpace(failureReason) Then
+                If Not String.IsNullOrWhiteSpace(resolvedPath) Then
+                    failureReason = "The selected CAD file is not managed by the current SVN working copy."
+                Else
+                    failureReason = "The selected tree item could not be resolved to an SVN CAD file."
+                End If
+            End If
+
+            Try
+                svnModule.logOperationPublic(
+                    "Get Locks blocked for explicit tree selection: text=" & selectedText &
+                    "; resolvedPath=" & resolvedPath &
+                    "; reason=" & failureReason
+                )
+            Catch
+            End Try
+
+            iSwApp.SendMsgToUser2(
+                "PlumVault could not safely resolve the selected tree item for Get Locks." &
+                vbCrLf & vbCrLf &
+                If(String.IsNullOrWhiteSpace(selectedText), "Selected item", selectedText) &
+                vbCrLf &
+                failureReason &
+                vbCrLf & vbCrLf &
+                "The active assembly was not used as a fallback. Refresh the tree and select the file again.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbOk
+            )
+            Exit Sub
+
         Else
-            getLocksOfDocsAsync(GetSelectedModDocList(iSwApp))
+            Dim activeDocument As ModelDoc2 = Nothing
+
+            Try
+                activeDocument = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            Catch
+                activeDocument = Nothing
+            End Try
+
+            If activeDocument Is Nothing Then
+                iSwApp.SendMsgToUser("Error: Active Document not found")
+                Exit Sub
+            End If
+
+            Dim selectedDocuments() As ModelDoc2 = GetSelectedModDocList(iSwApp)
+
+            If selectedDocuments Is Nothing OrElse selectedDocuments.Length = 0 Then
+                iSwApp.SendMsgToUser("Error: No CAD document could be resolved for Get Locks")
+                Exit Sub
+            End If
+
+            Try
+                Dim fallbackPaths As New List(Of String)()
+
+                For Each selectedDocument As ModelDoc2 In selectedDocuments
+                    If selectedDocument Is Nothing Then Continue For
+
+                    Dim selectedPath As String = getSafeModelPath(selectedDocument)
+                    If Not String.IsNullOrWhiteSpace(selectedPath) Then fallbackPaths.Add(selectedPath)
+                Next
+
+                svnModule.logOperationPublic(
+                    "Get Locks SOLIDWORKS-selection fallback: " & String.Join(" | ", fallbackPaths.ToArray())
+                )
+            Catch
+            End Try
+
+            getLocksOfDocsAsync(selectedDocuments)
         End If
 
         updateStatusStrip()
@@ -2447,6 +2824,9 @@ Public Class UserControl1
     Private Function getCadPathFromTreeNode(ByVal node As TreeNode) As String
         If node Is Nothing Then Return ""
 
+        Dim stableNodePath As String = getStableTreeNodeCadPath(node)
+        If Not String.IsNullOrWhiteSpace(stableNodePath) Then Return stableNodePath
+
         Try
             If TypeOf node.Tag Is ModelDoc2 Then
                 Dim model As ModelDoc2 = CType(node.Tag, ModelDoc2)
@@ -2730,45 +3110,137 @@ Public Class UserControl1
     ByVal e As TreeNodeMouseClickEventArgs) _
     Handles TreeView1.NodeMouseClick
 
+        Dim clickedNode As TreeNode = Nothing
+
         Try
             If e IsNot Nothing AndAlso e.Node IsNot Nothing Then
+                clickedNode = e.Node
                 clearGraphicalTreeHighlight()
-                TreeView1.SelectedNode = e.Node
-                lastUserClickedTreeNodeForSync = e.Node
+                TreeView1.SelectedNode = clickedNode
+                rememberExplicitTreeActionSelection(clickedNode)
 
                 If (ModifierKeys And Keys.Control) = Keys.Control Then
-                    toggleBatchTreeNode(e.Node)
+                    toggleBatchTreeNode(clickedNode)
                 ElseIf (ModifierKeys And Keys.Shift) = Keys.Shift Then
-                    selectBatchTreeRange(e.Node)
+                    selectBatchTreeRange(clickedNode)
                 Else
                     clearBatchTreeSelection()
-                    lastBatchAnchorTreeNode = e.Node
+                    lastBatchAnchorTreeNode = clickedNode
                 End If
             End If
         Catch
+            Exit Sub
         End Try
 
-        'Dim sText As String = e.Node.Text
-        'Dim modDoc As ModelDoc2
-        Dim comp As Component2
-        Dim activeModel As ModelDoc2 = iSwApp.ActiveDoc
-        'Dim sText As String = localRepoPath.Text & "\" & e.Node.Text
-        If activeModel Is Nothing Then Exit Sub
+        If clickedNode Is Nothing Then Exit Sub
 
-        If activeModel.GetType <> swDocumentTypes_e.swDocASSEMBLY Then Exit Sub
+        'Never call Select on the Component2 stored in TreeNode.Tag. TreeView cloning preserves
+        'that RCW even after the source assembly has been closed, and using it after reopen can
+        'crash inside native SOLIDWORKS before VB can catch an exception.
+        'Graphical highlighting is cosmetic, so queue only a stable path and reacquire a live
+        'component from the currently open assembly on the next UI turn.
+        queueSafeGraphicalSelectionForTreeNode(clickedNode)
+    End Sub
 
-        'Debug.Assert(False, sText)
-        'modDoc = activeModel.GetComponentByName(e.Node.Text)
+    Private Sub queueSafeGraphicalSelectionForTreeNode(ByVal node As TreeNode)
+        If node Is Nothing Then Exit Sub
+        If taskPaneClosing Then Exit Sub
 
+        Dim selectedPath As String = getStableTreeNodeCadPath(node)
+        If String.IsNullOrWhiteSpace(selectedPath) Then Exit Sub
 
-        'Debug.Print(TypeOf e.Node.Tag)
-        If TypeOf e.Node.Tag Is Component2 Then
-            'If e.Node.Tag.GetType.ToString = "Component2" Then
-            comp = e.Node.Tag
-            comp.Select(False)
+        'A virtual row resolves to its physical owner assembly for SVN operations. It does not
+        'have a separate physical component path that can be safely selected by this helper.
+        If treeNodeRepresentsVirtualComponent(node) Then Exit Sub
+
+        Try
+            Me.BeginInvoke(New MethodInvoker(
+                Sub()
+                    safelySelectCurrentAssemblyComponentByPath(selectedPath)
+                End Sub))
+        Catch
+        End Try
+    End Sub
+
+    Private Sub safelySelectCurrentAssemblyComponentByPath(ByVal selectedPath As String)
+        If taskPaneClosing Then Exit Sub
+        If iSwApp Is Nothing Then Exit Sub
+        If String.IsNullOrWhiteSpace(selectedPath) Then Exit Sub
+
+        Dim activeModel As ModelDoc2 = Nothing
+
+        Try
+            activeModel = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeModel Is Nothing Then Exit Sub
+            If activeModel.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Exit Sub
+        Catch
+            Exit Sub
+        End Try
+
+        Dim activePath As String = getSafeModelPath(activeModel)
+        Dim normalizedSelectedPath As String = normalizeTreeActionPath(selectedPath)
+        Dim normalizedActivePath As String = normalizeTreeActionPath(activePath)
+
+        'Clicking the top assembly row is a task-pane selection only. There is no component
+        'selection to perform, and avoiding a native call here removes the reopen crash path.
+        If Not String.IsNullOrWhiteSpace(normalizedActivePath) AndAlso
+           String.Equals(normalizedSelectedPath, normalizedActivePath, StringComparison.OrdinalIgnoreCase) Then
+            Exit Sub
         End If
 
+        Dim currentComponent As Component2 = findCurrentAssemblyComponentByPath(activeModel, normalizedSelectedPath)
+        If currentComponent Is Nothing Then Exit Sub
+
+        Try
+            currentComponent.Select(False)
+        Catch
+            'Graphical cross-highlighting is optional. Never escalate a failed native
+            'selection into a file-operation or stability problem.
+        End Try
     End Sub
+
+    Private Function findCurrentAssemblyComponentByPath(ByVal activeModel As ModelDoc2,
+                                                        ByVal selectedPath As String) As Component2
+        If activeModel Is Nothing Then Return Nothing
+        If String.IsNullOrWhiteSpace(selectedPath) Then Return Nothing
+
+        Try
+            If activeModel.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Return Nothing
+        Catch
+            Return Nothing
+        End Try
+
+        Dim assemblyDocument As AssemblyDoc = TryCast(activeModel, AssemblyDoc)
+        If assemblyDocument Is Nothing Then Return Nothing
+
+        Dim componentsObject As Object = Nothing
+
+        Try
+            componentsObject = assemblyDocument.GetComponents(False)
+        Catch
+            componentsObject = Nothing
+        End Try
+
+        Dim componentsArray As Array = TryCast(componentsObject, Array)
+        If componentsArray Is Nothing Then Return Nothing
+
+        Dim normalizedSelectedPath As String = normalizeTreeActionPath(selectedPath)
+
+        For Each componentObject As Object In componentsArray
+            Dim currentComponent As Component2 = TryCast(componentObject, Component2)
+            If currentComponent Is Nothing Then Continue For
+            If isComponentVirtualSafe(currentComponent) Then Continue For
+
+            Dim currentPath As String = normalizeTreeActionPath(getSafeComponentPath(currentComponent))
+            If String.IsNullOrWhiteSpace(currentPath) Then Continue For
+
+            If String.Equals(currentPath, normalizedSelectedPath, StringComparison.OrdinalIgnoreCase) Then
+                Return currentComponent
+            End If
+        Next
+
+        Return Nothing
+    End Function
 
     Private Sub TreeView1_BeforeExpand(sender As Object, e As TreeViewCancelEventArgs) Handles TreeView1.BeforeExpand
         Try
@@ -2825,6 +3297,19 @@ Public Class UserControl1
     Public Sub switchTreeViewToCurrentModel(Optional bRetryWithRefresh As Boolean = True)
 
         If Not onlineCheckBox.Checked Then Exit Sub
+
+        'A stored TreeView may contain Component2/ModelDoc2 RCWs from a document instance that
+        'was closed and later reopened. Rebuild the shallow current tree from the live ActiveDoc
+        'before displaying it. refreshCurrentTreeViewOnly calls back here with False, so this
+        'does not recurse and does not contact the SVN server.
+        If bRetryWithRefresh Then
+            Try
+                refreshCurrentTreeViewOnly()
+            Catch
+                TreeView1.Nodes.Clear()
+            End Try
+            Exit Sub
+        End If
 
         Dim treeNodeTemp As TreeNode
         Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc()
@@ -2921,7 +3406,10 @@ Public Class UserControl1
         Dim activeDoc As ModelDoc2 = iSwApp.ActiveDoc
 
         'Tree rebuilds can create/default-select a new root node.
-        'Clear explicit sync selection so a plain Sync click remains Level-1-only.
+        'Clear the stale TreeNode object so a plain Sync click remains Level-1-only.
+        'Do not clear lastUserClickedTreePathForActions: file actions compare the newly
+        'rebuilt visible node by stable physical path, preventing a selected part from
+        'falling back to the active parent assembly.
         lastUserClickedTreeNodeForSync = Nothing
 
         If activeDoc Is Nothing Then Exit Sub
@@ -3471,6 +3959,11 @@ Public Class UserControl1
 
             Dim missingNode As New TreeNode(buildComponentNodeText(comp, compDoc))
             missingNode.Tag = comp
+            Dim missingStablePath As String = getSafeComponentPath(comp)
+            If componentIsVirtual Then
+                missingStablePath = getPhysicalOwnerAssemblyPathForComponent(comp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+            End If
+            setStableTreeNodeCadPath(missingNode, missingStablePath)
             setNodeColorFromStatus(missingNode)
             rootNode.Nodes.Add(missingNode)
         Next
@@ -3537,6 +4030,7 @@ Public Class UserControl1
 
                 parentNode = New TreeNode(sFileNameTemp)
                 parentNode.Tag = modDocArr(i)
+                setStableTreeNodeCadPath(parentNode, getSafeModelPath(modDocArr(i)))
             End If
 
             If modDocArr(i).GetType = swDocumentTypes_e.swDocASSEMBLY Then
@@ -3662,6 +4156,11 @@ Public Class UserControl1
         If bUC Then
             parentNode = New TreeNode(buildComponentNodeText(swComp, modDocParent))
             parentNode.Tag = swComp
+            Dim parentStablePath As String = getSafeComponentPath(swComp)
+            If isComponentVirtualSafe(swComp) Then
+                parentStablePath = getPhysicalOwnerAssemblyPathForComponent(swComp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+            End If
+            setStableTreeNodeCadPath(parentNode, parentStablePath)
             setNodeColorFromStatus(parentNode)
         End If
 
@@ -3737,6 +4236,11 @@ Public Class UserControl1
 
                     childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
                     childNode.Tag = swChildComp
+                    Dim childStablePath As String = getSafeComponentPath(swChildComp)
+                    If childIsVirtual Then
+                        childStablePath = getPhysicalOwnerAssemblyPathForComponent(swChildComp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+                    End If
+                    setStableTreeNodeCadPath(childNode, childStablePath)
                     setNodeColorFromStatus(childNode)
                     addLazyPlaceholderIfNeeded(childNode)
                     parentNode.Nodes.Add(childNode)
@@ -3748,6 +4252,11 @@ Public Class UserControl1
                     If bUC Then
                         childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
                         childNode.Tag = swChildComp
+                        Dim duplicateStablePath As String = getSafeComponentPath(swChildComp)
+                        If childIsVirtual Then
+                            duplicateStablePath = getPhysicalOwnerAssemblyPathForComponent(swChildComp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+                        End If
+                        setStableTreeNodeCadPath(childNode, duplicateStablePath)
                         setNodeColorFromStatus(childNode)
                         addLazyPlaceholderIfNeeded(childNode)
                         parentNode.Nodes.Add(childNode)
@@ -3767,6 +4276,11 @@ Public Class UserControl1
                 If bUC Then
                     childNode = New TreeNode(buildComponentNodeText(swChildComp, modDocChild))
                     childNode.Tag = swChildComp
+                    Dim leafStablePath As String = getSafeComponentPath(swChildComp)
+                    If childIsVirtual Then
+                        leafStablePath = getPhysicalOwnerAssemblyPathForComponent(swChildComp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+                    End If
+                    setStableTreeNodeCadPath(childNode, leafStablePath)
                     setNodeColorFromStatus(childNode)
                     parentNode.Nodes.Add(childNode)
                 End If
@@ -3797,6 +4311,14 @@ Public Class UserControl1
 
     Private Function isTreeNodeAssembly(ByVal node As TreeNode) As Boolean
         If node Is Nothing Then Return False
+
+        Dim stablePath As String = getStableTreeNodeCadPath(node)
+        If Not String.IsNullOrWhiteSpace(stablePath) Then
+            Try
+                If String.Equals(Path.GetExtension(stablePath), ".SLDASM", StringComparison.OrdinalIgnoreCase) Then Return True
+            Catch
+            End Try
+        End If
 
         Try
             If TypeOf node.Tag Is ModelDoc2 Then
@@ -3855,11 +4377,16 @@ Public Class UserControl1
         Dim childObj As Object = Nothing
 
         Try
-            If TypeOf node.Tag Is ModelDoc2 Then
-                Dim asmDoc As AssemblyDoc = TryCast(node.Tag, AssemblyDoc)
-                If asmDoc Is Nothing Then Exit Sub
+            Dim stableNodePath As String = getStableTreeNodeCadPath(node)
+            Dim activeModel As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            Dim activeModelPath As String = getSafeModelPath(activeModel)
 
-                Dim modelDoc As ModelDoc2 = CType(node.Tag, ModelDoc2)
+            If Not String.IsNullOrWhiteSpace(stableNodePath) AndAlso
+               activeModel IsNot Nothing AndAlso
+               String.Equals(normalizeTreeActionPath(stableNodePath), normalizeTreeActionPath(activeModelPath), StringComparison.OrdinalIgnoreCase) AndAlso
+               activeModel.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+
+                Dim modelDoc As ModelDoc2 = activeModel
                 Dim confMgr As ConfigurationManager = modelDoc.ConfigurationManager
                 Dim conf As Configuration = confMgr.ActiveConfiguration
                 Dim rootComp As Component2 = conf.GetRootComponent3(True)
@@ -3867,9 +4394,14 @@ Public Class UserControl1
 
                 childObj = rootComp.GetChildren()
 
-            ElseIf TypeOf node.Tag Is Component2 Then
-                Dim comp As Component2 = CType(node.Tag, Component2)
+            ElseIf Not String.IsNullOrWhiteSpace(stableNodePath) AndAlso
+                   activeModel IsNot Nothing AndAlso
+                   activeModel.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
 
+                'Reacquire the component from the currently open assembly by stable file path.
+                'Never expand children through a Component2 copied from a stored TreeView.
+                Dim comp As Component2 = findCurrentAssemblyComponentByPath(activeModel, stableNodePath)
+                If comp Is Nothing Then Exit Sub
                 If isComponentSuppressedState(getSafeComponentSuppression(comp)) Then Exit Sub
 
                 childObj = comp.GetChildren()
@@ -3917,6 +4449,11 @@ Public Class UserControl1
 
             Dim childNode As New TreeNode(buildComponentNodeText(childComp, childDoc))
             childNode.Tag = childComp
+            Dim lazyChildStablePath As String = getSafeComponentPath(childComp)
+            If isComponentVirtualSafe(childComp) Then
+                lazyChildStablePath = getPhysicalOwnerAssemblyPathForComponent(childComp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+            End If
+            setStableTreeNodeCadPath(childNode, lazyChildStablePath)
             setNodeColorFromStatus(childNode)
             addLazyPlaceholderIfNeeded(childNode)
             node.Nodes.Add(childNode)
@@ -4355,51 +4892,361 @@ Public Class UserControl1
         Next
     End Sub
 
-    Public Sub forceWriteAccessForLockedFilePathsPublic(ByVal filePaths() As String)
+    Private Function normalizeDeferredSolidWorksPath(ByVal filePath As String) As String
+        If String.IsNullOrWhiteSpace(filePath) Then Return ""
+
+        Try
+            Return Path.GetFullPath(filePath)
+        Catch
+            Return filePath.Trim()
+        End Try
+    End Function
+
+    Private Sub ensureDeferredSolidWorksUiTimer()
+        If deferredSolidWorksUiTimer Is Nothing Then
+            deferredSolidWorksUiTimer = New System.Windows.Forms.Timer()
+            deferredSolidWorksUiTimer.Interval = 350
+        End If
+    End Sub
+
+    Private Sub startDeferredSolidWorksUiTimer()
+        If taskPaneClosing Then Exit Sub
+
+        ensureDeferredSolidWorksUiTimer()
+        deferredSolidWorksUiAttemptCount = 0
+
+        Try
+            deferredSolidWorksUiTimer.Stop()
+            deferredSolidWorksUiTimer.Start()
+        Catch
+        End Try
+    End Sub
+
+    Public Sub queueFeatureTreeRefreshForPathsPublic(ByVal filePaths() As String)
         Try
             If Me.InvokeRequired Then
-                Me.BeginInvoke(New MethodInvoker(Sub() forceWriteAccessForLockedFilePathsPublic(filePaths)))
+                Me.BeginInvoke(
+                    New MethodInvoker(
+                        Sub() queueFeatureTreeRefreshForPathsPublic(filePaths)
+                    )
+                )
                 Exit Sub
             End If
         Catch
         End Try
 
+        If taskPaneClosing Then Exit Sub
         If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
 
         For Each filePath As String In filePaths
-            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            Dim normalizedPath As String =
+                normalizeDeferredSolidWorksPath(filePath)
 
-            Try
-                If File.Exists(filePath) Then
-                    File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
-                End If
-            Catch
-            End Try
-
-            Dim doc As ModelDoc2 = Nothing
-
-            Try
-                doc = TryCast(iSwApp.GetOpenDocumentByName(filePath), ModelDoc2)
-            Catch
-                doc = Nothing
-            End Try
-
-            If doc Is Nothing Then Continue For
-
-            Try
-                doc.SetReadOnlyState(False)
-            Catch
-            End Try
-
-            'This prevents the SolidWorks "opened read-only but now writable" prompt when the user right-clicks Edit Part.
-            'It is the programmatic equivalent of the user clicking File > Reload after getting the SVN lock.
-            Try
-                If doc.IsOpenedReadOnly() Then
-                    doc.ReloadOrReplace(ReadOnly:=False, ReplaceFileName:=Nothing, DiscardChanges:=True)
-                End If
-            Catch
-            End Try
+            If normalizedPath <> "" Then
+                pendingFeatureTreeRefreshPaths.Add(normalizedPath)
+            End If
         Next
+
+        If pendingFeatureTreeRefreshPaths.Count > 0 Then
+            startDeferredSolidWorksUiTimer()
+        End If
+    End Sub
+
+    Public Sub forceWriteAccessForLockedFilePathsPublic(ByVal filePaths() As String)
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(
+                    New MethodInvoker(
+                        Sub() forceWriteAccessForLockedFilePathsPublic(filePaths)
+                    )
+                )
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If taskPaneClosing Then Exit Sub
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        For Each filePath As String In filePaths
+            Dim normalizedPath As String =
+                normalizeDeferredSolidWorksPath(filePath)
+
+            If normalizedPath = "" Then Continue For
+
+            Try
+                If File.Exists(normalizedPath) Then
+                    File.SetAttributes(
+                        normalizedPath,
+                        File.GetAttributes(normalizedPath) And Not FileAttributes.ReadOnly
+                    )
+                End If
+            Catch
+            End Try
+
+            pendingWriteAccessPaths.Add(normalizedPath)
+        Next
+
+        If pendingWriteAccessPaths.Count > 0 Then
+            Try
+                svnModule.logOperationPublic(
+                    "Queued writable-state reconciliation: " &
+                    String.Join(" | ", pendingWriteAccessPaths.ToArray())
+                )
+            Catch
+            End Try
+
+            startDeferredSolidWorksUiTimer()
+        End If
+    End Sub
+
+    Private Sub deferredSolidWorksUiTimer_Tick(
+        sender As Object,
+        e As EventArgs
+    ) Handles deferredSolidWorksUiTimer.Tick
+
+        If taskPaneClosing Then
+            Try
+                deferredSolidWorksUiTimer.Stop()
+            Catch
+            End Try
+            Exit Sub
+        End If
+
+        If iSwApp Is Nothing Then Exit Sub
+
+        Try
+            If Not svnModule.canRunDeferredSolidWorksUiMutationPublic() Then Exit Sub
+        Catch
+            Exit Sub
+        End Try
+
+        Dim acquiredMutationGate As Boolean = False
+
+        Try
+            acquiredMutationGate =
+                svnModule.tryBeginSolidWorksNativeMutationPublic(
+                    "Deferred write access / FeatureManager refresh"
+                )
+        Catch
+            acquiredMutationGate = False
+        End Try
+
+        If Not acquiredMutationGate Then Exit Sub
+
+        deferredSolidWorksUiAttemptCount += 1
+
+        Try
+            Dim writeSnapshot As String() =
+                pendingWriteAccessPaths.ToArray()
+
+            For Each filePath As String In writeSnapshot
+                Dim removeFromQueue As Boolean = False
+                Dim doc As ModelDoc2 = Nothing
+
+                Try
+                    If File.Exists(filePath) Then
+                        File.SetAttributes(
+                            filePath,
+                            File.GetAttributes(filePath) And Not FileAttributes.ReadOnly
+                        )
+                    End If
+                Catch
+                End Try
+
+                Try
+                    doc = TryCast(
+                        iSwApp.GetOpenDocumentByName(filePath),
+                        ModelDoc2
+                    )
+                Catch ex As InvalidComObjectException
+                    Exit For
+                Catch ex As COMException
+                    doc = Nothing
+                Catch
+                    doc = Nothing
+                End Try
+
+                If doc Is Nothing Then
+                    removeFromQueue = True
+                Else
+                    'A SOLIDWORKS assembly can report GetSaveFlag=True for rebuild/display-state
+                    'reasons even when no user-authored assembly change exists. The previous
+                    'robustness patch treated that flag as a reason to skip SetReadOnlyState(False),
+                    'which left legitimately locked assemblies read-only until the retry timed out.
+                    '
+                    'Changing only the read-only state does not discard or reload document data, so
+                    'it is safe to request writable access even when SOLIDWORKS currently reports a
+                    'save flag. We still reacquire the live ModelDoc2 by path, run on the UI thread,
+                    'serialize through the native-mutation gate, and never call ReloadOrReplace.
+                    Dim stateReadable As Boolean = True
+                    Dim isReadOnly As Boolean = False
+
+                    Try
+                        isReadOnly = doc.IsOpenedReadOnly()
+                    Catch
+                        stateReadable = False
+                    End Try
+
+                    If stateReadable Then
+                        If Not isReadOnly Then
+                            removeFromQueue = True
+                        Else
+                            Try
+                                If File.Exists(filePath) Then
+                                    File.SetAttributes(
+                                        filePath,
+                                        File.GetAttributes(filePath) And Not FileAttributes.ReadOnly
+                                    )
+                                End If
+                            Catch
+                            End Try
+
+                            Try
+                                doc.SetReadOnlyState(False)
+                            Catch ex As COMException
+                            Catch
+                            End Try
+
+                            Try
+                                removeFromQueue = Not doc.IsOpenedReadOnly()
+                            Catch
+                                removeFromQueue = False
+                            End Try
+                        End If
+                    End If
+                End If
+
+                If removeFromQueue Then
+                    pendingWriteAccessPaths.Remove(filePath)
+
+                    Try
+                        svnModule.logOperationPublic(
+                            "Writable-state reconciliation completed: " & filePath
+                        )
+                    Catch
+                    End Try
+                End If
+            Next
+
+            Dim refreshSnapshot As String() =
+                pendingFeatureTreeRefreshPaths.ToArray()
+
+            For Each filePath As String In refreshSnapshot
+                Dim removeFromQueue As Boolean = False
+                Dim doc As ModelDoc2 = Nothing
+
+                Try
+                    doc = TryCast(
+                        iSwApp.GetOpenDocumentByName(filePath),
+                        ModelDoc2
+                    )
+                Catch ex As InvalidComObjectException
+                    Exit For
+                Catch ex As COMException
+                    doc = Nothing
+                Catch
+                    doc = Nothing
+                End Try
+
+                If doc Is Nothing Then
+                    removeFromQueue = True
+                Else
+                    Try
+                        Dim featureManager As FeatureManager = doc.FeatureManager
+
+                        If featureManager IsNot Nothing Then
+                            featureManager.UpdateFeatureTree()
+                        End If
+
+                        doc.GraphicsRedraw2()
+                        removeFromQueue = True
+                    Catch ex As COMException
+                        removeFromQueue = False
+                    Catch
+                        removeFromQueue = False
+                    End Try
+                End If
+
+                If removeFromQueue Then
+                    pendingFeatureTreeRefreshPaths.Remove(filePath)
+
+                    Try
+                        svnModule.logOperationPublic(
+                            "Deferred FeatureManager refresh completed: " & filePath
+                        )
+                    Catch
+                    End Try
+                End If
+            Next
+
+        Finally
+            Try
+                svnModule.endSolidWorksNativeMutationPublic(
+                    "Deferred write access / FeatureManager refresh"
+                )
+            Catch
+            End Try
+        End Try
+
+        If pendingWriteAccessPaths.Count = 0 AndAlso
+           pendingFeatureTreeRefreshPaths.Count = 0 Then
+
+            deferredSolidWorksUiAttemptCount = 0
+
+            Try
+                deferredSolidWorksUiTimer.Stop()
+            Catch
+            End Try
+
+            Exit Sub
+        End If
+
+        If deferredSolidWorksUiAttemptCount >=
+           MAX_DEFERRED_SOLIDWORKS_UI_ATTEMPTS Then
+
+            Try
+                deferredSolidWorksUiTimer.Stop()
+            Catch
+            End Try
+
+            If pendingWriteAccessPaths.Count > 0 Then
+                Dim unresolvedPaths As String =
+                    String.Join(
+                        System.Environment.NewLine,
+                        pendingWriteAccessPaths.Select(
+                            Function(p As String) Path.GetFileName(p)
+                        )
+                    )
+
+                Try
+                    svnModule.logOperationPublic(
+                        "Writable-state reconciliation timed out: " &
+                        String.Join(" | ", pendingWriteAccessPaths.ToArray())
+                    )
+                Catch
+                End Try
+
+                Try
+                    iSwApp.SendMsgToUser2(
+                        "The SVN lock was obtained, but SOLIDWORKS did not safely switch " &
+                        "the following open file(s) to writable:" &
+                        vbCrLf & vbCrLf &
+                        unresolvedPaths &
+                        vbCrLf & vbCrLf &
+                        "Your locks are still valid. Close and reopen only those documents " &
+                        "before editing them.",
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                Catch
+                End Try
+            End If
+
+            pendingWriteAccessPaths.Clear()
+            pendingFeatureTreeRefreshPaths.Clear()
+            deferredSolidWorksUiAttemptCount = 0
+        End If
     End Sub
 
     Public Sub setOpenDocsReadOnlyForFilePathsPublic(ByVal filePaths() As String)

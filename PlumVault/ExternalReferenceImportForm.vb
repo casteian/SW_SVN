@@ -210,9 +210,9 @@ Public Class ExternalReferenceImportForm
         _grid.ColumnHeadersDefaultCellStyle.Font = New Font("Segoe UI", 9.5F, FontStyle.Bold)
         _grid.ColumnHeadersDefaultCellStyle.BackColor = SystemColors.Control
         _grid.DefaultCellStyle.Font = New Font("Segoe UI", 9.25F, FontStyle.Regular)
-        _grid.DefaultCellStyle.Padding = New Padding(3)
-        _grid.RowTemplate.Height = 29
-        _grid.ColumnHeadersHeight = 32
+        _grid.DefaultCellStyle.Padding = New Padding(3, 2, 3, 2)
+        _grid.RowTemplate.Height = 32
+        _grid.ColumnHeadersHeight = 34
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_OLD_NAME,
@@ -256,13 +256,18 @@ Public Class ExternalReferenceImportForm
             .Width = 235
         })
 
-        _grid.Columns.Add(New DataGridViewButtonColumn() With {
-            .Name = COL_BROWSE,
-            .HeaderText = "",
-            .Text = "Browse...",
-            .UseColumnTextForButtonValue = True,
-            .Width = 76
-        })
+        Dim browseColumn As New DataGridViewButtonColumn()
+        browseColumn.Name = COL_BROWSE
+        browseColumn.HeaderText = ""
+        browseColumn.Text = "Browse..."
+        browseColumn.UseColumnTextForButtonValue = True
+        browseColumn.Width = 92
+        browseColumn.MinimumWidth = 92
+        browseColumn.FlatStyle = FlatStyle.Standard
+        browseColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
+        browseColumn.DefaultCellStyle.Padding = New Padding(2, 1, 2, 1)
+        browseColumn.DefaultCellStyle.Font = New Font("Segoe UI", 9.0F, FontStyle.Regular)
+        _grid.Columns.Add(browseColumn)
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_FINAL_NAME,
@@ -271,20 +276,30 @@ Public Class ExternalReferenceImportForm
             .Width = 175
         })
 
-        _grid.Columns.Add(New DataGridViewButtonColumn() With {
-            .Name = COL_CHECK,
-            .HeaderText = "Check",
-            .Text = "Check",
-            .UseColumnTextForButtonValue = True,
-            .Width = 65
-        })
+        Dim checkColumn As New DataGridViewButtonColumn()
+        checkColumn.Name = COL_CHECK
+        checkColumn.HeaderText = "Check"
+        checkColumn.Text = "Check"
+        checkColumn.UseColumnTextForButtonValue = True
+        checkColumn.Width = 84
+        checkColumn.MinimumWidth = 84
+        checkColumn.FlatStyle = FlatStyle.Standard
+        checkColumn.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter
+        checkColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
+        checkColumn.DefaultCellStyle.Padding = New Padding(2, 1, 2, 1)
+        checkColumn.DefaultCellStyle.Font = New Font("Segoe UI", 9.0F, FontStyle.Regular)
+        _grid.Columns.Add(checkColumn)
 
-        _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
-            .Name = COL_STATUS,
-            .HeaderText = "Status",
-            .ReadOnly = True,
-            .Width = 62
-        })
+        Dim statusColumn As New DataGridViewTextBoxColumn()
+        statusColumn.Name = COL_STATUS
+        statusColumn.HeaderText = "Status"
+        statusColumn.ReadOnly = True
+        statusColumn.Width = 72
+        statusColumn.MinimumWidth = 72
+        statusColumn.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter
+        statusColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
+        statusColumn.DefaultCellStyle.Font = New Font("Segoe UI", 10.0F, FontStyle.Bold)
+        _grid.Columns.Add(statusColumn)
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_EXPLANATION,
