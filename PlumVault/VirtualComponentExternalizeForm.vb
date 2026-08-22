@@ -93,8 +93,13 @@ Public Class VirtualComponentExternalizeForm
 
         Me.Text = "Save Virtual Components as External SVN Files"
         Me.StartPosition = FormStartPosition.CenterParent
-        Me.MinimumSize = New Size(1180, 620)
-        Me.Size = New Size(1540, 790)
+        'The grid's fixed-width columns plus every column's own minimum add up to well
+        'over 1400px. A smaller form minimum than that guarantees columns render clipped
+        'or pushed off into horizontal scrolling the moment the window isn't at full size.
+        'Do not make the form larger than common laptop working areas at high DPI.
+        'DataGridView supplies horizontal scrolling when every column cannot fit at once.
+        Me.MinimumSize = New Size(980, 620)
+        Me.Size = New Size(1580, 790)
         Me.AutoScaleMode = AutoScaleMode.Dpi
         Me.Font = New Font("Segoe UI", 9.5F, FontStyle.Regular)
         Me.ShowIcon = False
@@ -202,31 +207,39 @@ Public Class VirtualComponentExternalizeForm
         _grid.RowTemplate.Height = 29
         _grid.ColumnHeadersHeight = 32
 
+        'Rows auto-grow to fit wrapped text (long Explanation messages) instead of
+        'silently clipping it at a fixed single-line row height.
+        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells
+
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_COMPONENT,
             .HeaderText = "Virtual component",
             .ReadOnly = True,
-            .Width = 165
+            .Width = 165,
+            .MinimumWidth = 120
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_OWNER,
             .HeaderText = "Physical owner assembly",
             .ReadOnly = True,
-            .Width = 180
+            .Width = 180,
+            .MinimumWidth = 140
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_SOURCE_TYPE,
             .HeaderText = "Type",
             .ReadOnly = True,
-            .Width = 72
+            .Width = 72,
+            .MinimumWidth = 65
         })
 
         Dim handlingColumn As New DataGridViewComboBoxColumn()
         handlingColumn.Name = COL_HANDLING
         handlingColumn.HeaderText = "Handling"
         handlingColumn.Width = 120
+        handlingColumn.MinimumWidth = 110
         handlingColumn.FlatStyle = FlatStyle.Flat
         handlingColumn.Items.Add("Save externally")
         handlingColumn.Items.Add("Keep embedded")
@@ -236,6 +249,7 @@ Public Class VirtualComponentExternalizeForm
         targetColumn.Name = COL_TARGET_TYPE
         targetColumn.HeaderText = "File type"
         targetColumn.Width = 100
+        targetColumn.MinimumWidth = 90
         targetColumn.FlatStyle = FlatStyle.Flat
         targetColumn.Items.Add("GRC CAD")
         targetColumn.Items.Add("Vendor Part")
@@ -244,13 +258,15 @@ Public Class VirtualComponentExternalizeForm
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
             .HeaderText = "New ID / filename",
-            .Width = 170
+            .Width = 170,
+            .MinimumWidth = 130
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_DESTINATION,
             .HeaderText = "Destination folder",
-            .Width = 220
+            .Width = 220,
+            .MinimumWidth = 160
         })
 
         _grid.Columns.Add(New DataGridViewButtonColumn() With {
@@ -258,14 +274,16 @@ Public Class VirtualComponentExternalizeForm
             .HeaderText = "",
             .Text = "Browse...",
             .UseColumnTextForButtonValue = True,
-            .Width = 76
+            .Width = 76,
+            .MinimumWidth = 76
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_FINAL_NAME,
             .HeaderText = "Final filename",
             .ReadOnly = True,
-            .Width = 175
+            .Width = 175,
+            .MinimumWidth = 130
         })
 
         _grid.Columns.Add(New DataGridViewButtonColumn() With {
@@ -273,23 +291,29 @@ Public Class VirtualComponentExternalizeForm
             .HeaderText = "Check",
             .Text = "Check",
             .UseColumnTextForButtonValue = True,
-            .Width = 65
+            .Width = 65,
+            .MinimumWidth = 65
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_STATUS,
             .HeaderText = "Status",
             .ReadOnly = True,
-            .Width = 62
+            .Width = 62,
+            .MinimumWidth = 62
         })
 
-        _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
+        Dim explanationColumn As New DataGridViewTextBoxColumn() With {
             .Name = COL_EXPLANATION,
             .HeaderText = "Explanation",
             .ReadOnly = True,
             .AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            .MinimumWidth = 230
-        })
+            .MinimumWidth = 260
+        }
+        'Explanation messages are full sentences. Wrap instead of clipping -
+        'AutoSizeRowsMode above grows the row to fit.
+        explanationColumn.DefaultCellStyle.WrapMode = DataGridViewTriState.True
+        _grid.Columns.Add(explanationColumn)
 
         AddHandler _grid.CellContentClick, AddressOf gridCellContentClick
         AddHandler _grid.CellValueChanged, AddressOf gridCellValueChanged

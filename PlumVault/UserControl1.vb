@@ -54,8 +54,10 @@ Public Class UserControl1
     'Never change live document read-only state or refresh FeatureManager inside an SVN
     'completion callback. Queue stable file paths and reacquire COM objects later.
     Private WithEvents deferredSolidWorksUiTimer As System.Windows.Forms.Timer
+    Private WithEvents ownedLocksWarmupTimer As System.Windows.Forms.Timer
     Private ReadOnly pendingWriteAccessPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private ReadOnly pendingFeatureTreeRefreshPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private pendingSvnTreeStructureRefresh As Boolean = False
     Private deferredSolidWorksUiAttemptCount As Integer = 0
     Private Const MAX_DEFERRED_SOLIDWORKS_UI_ATTEMPTS As Integer = 8
 
@@ -65,6 +67,7 @@ Public Class UserControl1
     Private normalRefreshTreeBackColor As Color
     Private lastLiveCheckedActivePath As String = ""
     Private lastGraphicalSelectionPath As String = ""
+    Private lastGraphicalSelectionComponentName As String = ""
     Private lastGraphicallyHighlightedTreeNode As TreeNode = Nothing
     Private ReadOnly treeSelectionBackColor As Color = Color.FromArgb(0, 82, 180)
     Private ReadOnly treeSelectionForeColor As Color = Color.White
@@ -531,6 +534,7 @@ Public Class UserControl1
             Me.AutoScaleMode = AutoScaleMode.Dpi
             Me.Font = readableUiFont(False, 9.0!)
             applyDpiFriendlySizingRecursive(Me)
+            positionFileActionsAboveRepositoryPath()
 
             If TreeView1 IsNot Nothing Then
                 TreeView1.Font = readableUiFont(False, 9.0!)
@@ -570,6 +574,71 @@ Public Class UserControl1
             ensureOnlineCheckbox()
             positionOnlineCheckboxBesideVersion()
         Catch
+        End Try
+    End Sub
+
+    Private Sub positionFileActionsAboveRepositoryPath()
+        Try
+            If FileActionToolStrip Is Nothing OrElse localRepoPath Is Nothing OrElse ToolStrip1 Is Nothing Then Exit Sub
+
+            Dim edge As Integer = uiPx(3)
+            Dim verticalGap As Integer = uiPx(5)
+            Dim availableWidth As Integer = Math.Max(uiPx(150), Me.ClientSize.Width - (edge * 2))
+
+            Me.SuspendLayout()
+
+            'ToolStrip item fonts become DPI-sized at runtime, so fixed designer Y values are
+            'not reliable. Size the action row from its actual preferred height and flow every
+            'control below it; this prevents Save As/Re-ID/Move from covering the repo path.
+            FileActionToolStrip.AutoSize = False
+            FileActionToolStrip.Left = edge
+            FileActionToolStrip.Top = edge
+            FileActionToolStrip.Width = availableWidth
+            FileActionToolStrip.Height = Math.Max(uiPx(32), FileActionToolStrip.PreferredSize.Height)
+
+            localRepoPath.Left = edge
+            localRepoPath.Top = FileActionToolStrip.Bottom + verticalGap
+            localRepoPath.Width = availableWidth
+            localRepoPath.Anchor = AnchorStyles.Top Or AnchorStyles.Left Or AnchorStyles.Right
+
+            'Version/Online used to sit at a fixed designer Y (70) chosen for the old, much
+            'narrower repo-path box. Now that the box spans the full row width, that fixed
+            'position lands on the same row and the same X range, so the two visually collide
+            'whenever DPI/font scaling makes the box even slightly taller than the designer
+            'assumed. Give Version its own row below the repo path instead of a guessed
+            'coordinate; positionOnlineCheckboxBesideVersion (called right after this) already
+            'places Online relative to versionLabel's actual position, so fixing this one
+            'anchor point fixes both.
+            If versionLabel IsNot Nothing Then
+                versionLabel.Left = edge
+                versionLabel.Top = localRepoPath.Bottom + verticalGap
+            End If
+
+            Dim toolStripTop As Integer = localRepoPath.Bottom + verticalGap
+
+            If versionLabel IsNot Nothing Then
+                toolStripTop = versionLabel.Bottom + verticalGap
+            End If
+
+            ToolStrip1.Left = edge
+            ToolStrip1.Top = toolStripTop
+            ToolStrip1.Width = Math.Min(availableWidth, uiPx(267))
+
+            'TreeView1's designer position (Y 530) assumed the old, shorter top area. Give it
+            'a safe gap below wherever the icon toolstrip actually ends now, instead of a
+            'fixed value that can leave it starting above the last icon button.
+            If TreeView1 IsNot Nothing Then
+                Dim minimumTreeTop As Integer = ToolStrip1.Bottom + verticalGap
+                If TreeView1.Top < minimumTreeTop Then TreeView1.Top = minimumTreeTop
+            End If
+
+            FileActionToolStrip.BringToFront()
+        Catch
+        Finally
+            Try
+                Me.ResumeLayout()
+            Catch
+            End Try
         End Try
     End Sub
 
@@ -1562,6 +1631,7 @@ Public Class UserControl1
             End If
         End Try
     End Sub
+
     Private Function getActiveAssemblyTreeForLiveCheck() As ModelDoc2()
         Dim activeModDoc As ModelDoc2 = iSwApp.ActiveDoc
 
@@ -1615,11 +1685,33 @@ Public Class UserControl1
         deferredSolidWorksUiTimer.Interval = 350
         deferredSolidWorksUiTimer.Stop()
 
+        'Pre-warm the whole-working-copy "do I hold any locks" scan a few seconds after
+        'startup, quietly, while the user is just getting oriented rather than waiting on
+        'a close. By the time they actually try to close SOLIDWORKS, the answer is usually
+        'already cached, so that check no longer has to run the full scan from scratch.
+        ownedLocksWarmupTimer = New System.Windows.Forms.Timer()
+        ownedLocksWarmupTimer.Interval = 4000
+        ownedLocksWarmupTimer.Start()
 
+    End Sub
+
+    Private Sub ownedLocksWarmupTimer_Tick(sender As Object, e As EventArgs) Handles ownedLocksWarmupTimer.Tick
+        Try
+            ownedLocksWarmupTimer.Stop()
+            ownedLocksWarmupTimer.Dispose()
+        Catch
+        End Try
+
+        Try
+            If taskPaneClosing Then Exit Sub
+            svnModule.refreshOwnedLocksWholeCopySnapshotPublic()
+        Catch
+        End Try
     End Sub
 
     Private Sub UserControl1_Resize(sender As Object, e As EventArgs) Handles MyBase.Resize
         Try
+            positionFileActionsAboveRepositoryPath()
             positionRefreshAndSyncButtonsBesideCommit()
             removeGetLatestAllMenuItem()
             positionOnlineCheckboxBesideVersion()
@@ -1679,11 +1771,21 @@ Public Class UserControl1
         'Client-side visual sync only:
         'If the user clicks a component in the SOLIDWORKS graphics/tree area, select the matching
         'node in the SVN task-pane tree. This does not call SVN and does not resolve components.
+        syncSvnTreeToCurrentSolidWorksSelectionPublic()
+    End Sub
+
+    Public Sub syncSvnTreeToCurrentSolidWorksSelectionPublic()
         Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(AddressOf syncSvnTreeToCurrentSolidWorksSelectionPublic))
+                Exit Sub
+            End If
+
             If iSwApp Is Nothing Then Exit Sub
             If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing OrElse TreeView1.Nodes.Count = 0 Then Exit Sub
 
-            Dim selectedPath As String = getCurrentGraphicalSelectionCadPath()
+            Dim selectedComponentName As String = ""
+            Dim selectedPath As String = getCurrentGraphicalSelectionCadPath(selectedComponentName)
 
             If String.IsNullOrWhiteSpace(selectedPath) Then Exit Sub
 
@@ -1692,15 +1794,20 @@ Public Class UserControl1
             Catch
             End Try
 
-            If String.Equals(selectedPath, lastGraphicalSelectionPath, StringComparison.OrdinalIgnoreCase) Then Exit Sub
-            lastGraphicalSelectionPath = selectedPath
-
-            selectTreeNodeByCadPath(selectedPath)
+            If String.Equals(selectedPath, lastGraphicalSelectionPath, StringComparison.OrdinalIgnoreCase) AndAlso
+               String.Equals(selectedComponentName, lastGraphicalSelectionComponentName, StringComparison.OrdinalIgnoreCase) Then Exit Sub
+            'Only remember a successful match. If a component was just imported and the SVN
+            'tree has not refreshed yet, the next event/timer tick must be allowed to retry.
+            If selectTreeNodeByCadPath(selectedPath, selectedComponentName) Then
+                lastGraphicalSelectionPath = selectedPath
+                lastGraphicalSelectionComponentName = selectedComponentName
+            End If
         Catch
         End Try
     End Sub
 
-    Private Function getCurrentGraphicalSelectionCadPath() As String
+    Private Function getCurrentGraphicalSelectionCadPath(Optional ByRef selectedComponentName As String = "") As String
+        selectedComponentName = ""
         Try
             Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
             If activeDoc Is Nothing Then Return ""
@@ -1726,6 +1833,12 @@ Public Class UserControl1
 
                 If comp Is Nothing Then Continue For
 
+                Try
+                    selectedComponentName = comp.Name2
+                Catch
+                    selectedComponentName = ""
+                End Try
+
                 Dim compPath As String = ""
 
                 Try
@@ -1744,11 +1857,12 @@ Public Class UserControl1
         Return ""
     End Function
 
-    Private Sub selectTreeNodeByCadPath(ByVal filePath As String)
-        If String.IsNullOrWhiteSpace(filePath) Then Exit Sub
+    Private Function selectTreeNodeByCadPath(ByVal filePath As String,
+                                             Optional ByVal selectedComponentName As String = "") As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
 
         Dim normalizedTarget As String = normalizePathForNodeMatch(filePath)
-        If String.IsNullOrWhiteSpace(normalizedTarget) Then Exit Sub
+        If String.IsNullOrWhiteSpace(normalizedTarget) Then Return False
 
         Dim matchedNode As TreeNode = Nothing
         Dim visitedCount As Integer = 0
@@ -1757,19 +1871,28 @@ Public Class UserControl1
             TreeView1.BeginUpdate()
 
             For Each rootNode As TreeNode In TreeView1.Nodes
-                matchedNode = findTreeNodeByCadPathRecursive(rootNode, normalizedTarget, visitedCount, 750)
+                'Large vehicle assemblies can easily exceed 750 visible/lazy nodes. This work
+                'runs only when the selected path changes and performs no SVN/server calls.
+                matchedNode = findTreeNodeByCadPathRecursive(
+                    rootNode,
+                    normalizedTarget,
+                    selectedComponentName,
+                    visitedCount,
+                    10000
+                )
                 If matchedNode IsNot Nothing Then Exit For
             Next
 
             If matchedNode Is Nothing Then
                 clearGraphicalTreeHighlight()
-                Exit Sub
+                Return False
             End If
 
             expandParentsForTreeNode(matchedNode)
             TreeView1.SelectedNode = matchedNode
             matchedNode.EnsureVisible()
             applyGraphicalTreeHighlight(matchedNode)
+            Return True
 
             'Important:
             'A graphics-area click is only a visual/tree alignment helper.
@@ -1782,10 +1905,13 @@ Public Class UserControl1
             Catch
             End Try
         End Try
-    End Sub
+
+        Return False
+    End Function
 
     Private Function findTreeNodeByCadPathRecursive(ByVal node As TreeNode,
                                                      ByVal normalizedTarget As String,
+                                                     ByVal selectedComponentName As String,
                                                      ByRef visitedCount As Integer,
                                                      ByVal maxVisitedNodes As Integer) As TreeNode
         If node Is Nothing Then Return Nothing
@@ -1794,6 +1920,23 @@ Public Class UserControl1
         If visitedCount > maxVisitedNodes Then Return Nothing
 
         Try
+            'The same physical part can occur in several subassemblies. Prefer the exact
+            'SOLIDWORKS component-instance name so the tree jumps to the selected occurrence,
+            'then fall back to physical path for older/suppressed nodes.
+            If Not String.IsNullOrWhiteSpace(selectedComponentName) AndAlso TypeOf node.Tag Is Component2 Then
+                Dim nodeComponentName As String = ""
+
+                Try
+                    nodeComponentName = CType(node.Tag, Component2).Name2
+                Catch
+                    nodeComponentName = ""
+                End Try
+
+                If String.Equals(nodeComponentName, selectedComponentName, StringComparison.OrdinalIgnoreCase) Then
+                    Return node
+                End If
+            End If
+
             Dim nodePath As String = normalizePathForNodeMatch(getCadPathFromTreeNode(node))
             If nodePath <> "" AndAlso String.Equals(nodePath, normalizedTarget, StringComparison.OrdinalIgnoreCase) Then
                 Return node
@@ -1815,7 +1958,13 @@ Public Class UserControl1
             For Each childNode As TreeNode In node.Nodes
                 If isLazyPlaceholderNode(childNode) Then Continue For
 
-                Dim found As TreeNode = findTreeNodeByCadPathRecursive(childNode, normalizedTarget, visitedCount, maxVisitedNodes)
+                Dim found As TreeNode = findTreeNodeByCadPathRecursive(
+                    childNode,
+                    normalizedTarget,
+                    selectedComponentName,
+                    visitedCount,
+                    maxVisitedNodes
+                )
                 If found IsNot Nothing Then Return found
             Next
         Catch
@@ -2031,6 +2180,15 @@ Public Class UserControl1
             deferredSolidWorksUiTimer = Nothing
         End Try
 
+        Try
+            If ownedLocksWarmupTimer IsNot Nothing Then
+                ownedLocksWarmupTimer.Dispose()
+                ownedLocksWarmupTimer = Nothing
+            End If
+        Catch
+            ownedLocksWarmupTimer = Nothing
+        End Try
+
         pendingWriteAccessPaths.Clear()
         pendingFeatureTreeRefreshPaths.Clear()
     End Sub
@@ -2197,7 +2355,12 @@ Public Class UserControl1
             Exit Sub
         End If
 
-        getLocksOfDocs(modDocArr)
+        If documentArrayContainsDrawing(selectedDocs) Then
+            Dim drawingActionPaths() As String = getCadFilePathsIncludingDrawingDependencies(selectedDocs)
+            getLocksOfPathsAsync(drawingActionPaths)
+        Else
+            getLocksOfDocs(modDocArr)
+        End If
         updateStatusStrip()
     End Sub
 
@@ -2271,7 +2434,12 @@ Public Class UserControl1
             Exit Sub
         End If
 
-        tortCommitDocs(modDocArr)
+        If documentArrayContainsDrawing(selectedDocs) Then
+            Dim drawingActionPaths() As String = getCadFilePathsIncludingDrawingDependencies(selectedDocs)
+            tortCommitPathsAsync(drawingActionPaths)
+        Else
+            tortCommitDocs(modDocArr)
+        End If
         updateStatusStrip()
     End Sub
     Private Sub dropDownCommitAll_Click(sender As Object, e As EventArgs) Handles dropDownCommitAll.Click
@@ -2296,7 +2464,13 @@ Public Class UserControl1
         If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
 
         'Optimized path: build the dependent candidate list, then the backend filters to files you actually locked.
-        unlockDocs(getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp)))
+        Dim selectedDocs() As ModelDoc2 = GetSelectedModDocList(iSwApp)
+
+        If documentArrayContainsDrawing(selectedDocs) Then
+            unlockPathsLockedOnly(getCadFilePathsIncludingDrawingDependencies(selectedDocs))
+        Else
+            unlockDocs(getComponentsOfAssemblyOptionalUpdateTree(selectedDocs))
+        End If
         updateStatusStrip()
     End Sub
     Private Sub dropDownUnlockAll_Click(sender As Object, e As EventArgs) Handles dropDownUnlockAll.Click
@@ -2344,6 +2518,18 @@ Public Class UserControl1
     Private Sub butFindComponent_Click(sender As Object, e As EventArgs) Handles butFindComponent.Click
         Dim modDocArr As ModelDoc() = GetSelectedModDocList(iSwApp)
 
+    End Sub
+
+    Private Sub ToolStripButSaveAs_Click(sender As Object, e As EventArgs) Handles ToolStripButSaveAs.Click
+        svnModule.performSaveAsButtonActionPublic()
+    End Sub
+
+    Private Sub ToolStripButReId_Click(sender As Object, e As EventArgs) Handles ToolStripButReId.Click
+        svnModule.performCadRelocationPublic(CadRelocationMode.ReId)
+    End Sub
+
+    Private Sub ToolStripButMove_Click(sender As Object, e As EventArgs) Handles ToolStripButMove.Click
+        svnModule.performCadRelocationPublic(CadRelocationMode.Move)
     End Sub
 
     ' ### Refresh
@@ -3192,7 +3378,26 @@ Public Class UserControl1
         If currentComponent Is Nothing Then Exit Sub
 
         Try
-            currentComponent.Select(False)
+            'Use the current component's modern selection API so one selection is shared by
+            'the graphics area and SOLIDWORKS FeatureManager tree. Clear the previous native
+            'selection first; otherwise a stale face/feature selection can leave the component
+            'highlighted graphically without becoming the active FeatureManager row.
+            activeModel.ClearSelection2(True)
+            Dim selectedInSolidWorks As Boolean = currentComponent.Select4(False, Nothing, False)
+
+            If Not selectedInSolidWorks Then
+                'Select4 is preferred, but retain the older API as a compatibility fallback
+                'for lightweight components in older SOLIDWORKS releases.
+                currentComponent.Select(False)
+            End If
+
+            Try
+                Dim featureManager As FeatureManager = activeModel.FeatureManager
+                If featureManager IsNot Nothing Then featureManager.UpdateFeatureTree()
+            Catch
+            End Try
+
+            activeModel.GraphicsRedraw2()
         Catch
             'Graphical cross-highlighting is optional. Never escalate a failed native
             'selection into a file-operation or stability problem.
@@ -4003,7 +4208,6 @@ Public Class UserControl1
         Dim swConfMgr As ConfigurationManager
         Dim swConf As Configuration
         Dim swRootComp As Component2
-        Dim modDocTemp As ModelDoc2
 
         Dim i, j As Integer
         j = 0
@@ -4065,18 +4269,38 @@ Public Class UserControl1
                 addModelDocIfMissing(modelDocList, modDocArr(i), bUniqueOnly)
                 j += 1
 
-                modDocTemp = iSwApp.GetOpenDocumentByName(System.IO.Path.ChangeExtension(modDocArr(i).GetPathName(), ".sldprt"))
+                'A drawing can show views of any number of differently-named parts/assemblies
+                'across its sheets (a same-named "Part.SLDPRT for Part.SLDDRW" convention is
+                'common but not guaranteed - e.g. an assembly drawing with several detail
+                'parts). Use SOLIDWORKS' own dependency walk instead of assuming a single
+                'matching-named model, so multi-reference drawings are handled correctly.
+                Dim drawingReferencedPaths As List(Of String) = getDrawingReferencedFilePaths(modDocArr(i))
 
-                If Not (modDocTemp Is Nothing) Then
-                    addModelDocIfMissing(modelDocList, modDocTemp, bUniqueOnly)
-                    j += 1
-                Else
-                    modDocTemp = iSwApp.GetOpenDocumentByName(System.IO.Path.ChangeExtension(modDocArr(i).GetPathName(), ".sldasm"))
-                    If Not (modDocTemp Is Nothing) Then
-                        addModelDocIfMissing(modelDocList, modDocTemp, bUniqueOnly)
+                For Each referencedPath As String In drawingReferencedPaths
+                    Dim referencedDoc As ModelDoc2 = Nothing
+
+                    Try
+                        referencedDoc = TryCast(iSwApp.GetOpenDocumentByName(referencedPath), ModelDoc2)
+                    Catch
+                        referencedDoc = Nothing
+                    End Try
+
+                    If referencedDoc IsNot Nothing Then
+                        addModelDocIfMissing(modelDocList, referencedDoc, bUniqueOnly)
                         j += 1
                     End If
-                End If
+
+                    'Keep drawing dependencies visible and actionable even when the referenced
+                    'model is not open. Path-first toolbar actions can Get Latest/Get Locks on
+                    'these nodes without forcing SOLIDWORKS to load a large model hierarchy.
+                    If bUpdateTreeView Then
+                        Dim dependencyNode As New TreeNode(System.IO.Path.GetFileName(referencedPath))
+                        dependencyNode.Tag = referencedDoc
+                        setStableTreeNodeCadPath(dependencyNode, referencedPath)
+                        setNodeColorFromStatus(dependencyNode)
+                        parentNode.Nodes.Add(dependencyNode)
+                    End If
+                Next
 
             Else
                 If bUpdateTreeView Then
@@ -4104,6 +4328,139 @@ Public Class UserControl1
         End If
 
         Return mdComponentArr
+    End Function
+
+    Private Function isRecognizedCadExtensionPath(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Dim ext As String = ""
+        Try
+            ext = System.IO.Path.GetExtension(filePath).ToUpperInvariant()
+        Catch
+            Return False
+        End Try
+
+        Return ext = ".SLDPRT" OrElse ext = ".SLDASM" OrElse ext = ".SLDDRW"
+    End Function
+
+    'Returns every part/assembly/drawing file the given document depends on, using
+    'SOLIDWORKS' own dependency walk (IModelDocExtension.GetDependencies) rather than
+    'guessing from filenames. Works for a drawing referencing any number of differently
+    'named models, not just one sharing the drawing's own base filename.
+    Friend Function getDrawingReferencedFilePaths(ByVal drawingDocument As ModelDoc2) As List(Of String)
+        Dim result As New List(Of String)
+        If drawingDocument Is Nothing Then Return result
+
+        Try
+            Dim modelExtension As ModelDocExtension = drawingDocument.Extension
+            If modelExtension Is Nothing Then Return result
+
+            Dim dependenciesObject As Object = modelExtension.GetDependencies(
+                True,  'Traverseflag - walk the full dependency graph, not just direct refs
+                True,  'Searchflag - resolve to full paths where possible
+                False, 'AddReadOnlyInfo - keep the returned array a plain list of paths
+                False, 'ListBrokenRefs
+                False  'AppendImportedPaths
+            )
+
+            Dim dependencyEntries As Object() = TryCast(dependenciesObject, Object())
+            If dependencyEntries Is Nothing Then Return result
+
+            Dim ownPath As String = ""
+            Try
+                ownPath = System.IO.Path.GetFullPath(drawingDocument.GetPathName())
+            Catch
+                ownPath = ""
+            End Try
+
+            Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+            'With AddReadOnlyInfo=False, GetDependencies returns repeating
+            '[reference name, resolved path] pairs. Only consume the path entry. Treating
+            'every string as a path can turn a display name such as "Part.SLDPRT" into a
+            'bogus path rooted at the add-in process's current working directory.
+            For entryIndex As Integer = 1 To dependencyEntries.Length - 1 Step 2
+                Dim entryPath As String = TryCast(dependencyEntries(entryIndex), String)
+                If String.IsNullOrWhiteSpace(entryPath) Then Continue For
+                If Not isRecognizedCadExtensionPath(entryPath) Then Continue For
+                If Not System.IO.Path.IsPathRooted(entryPath) Then Continue For
+
+                Dim normalizedPath As String = entryPath
+                Try
+                    normalizedPath = System.IO.Path.GetFullPath(entryPath)
+                Catch
+                End Try
+
+                If String.Equals(normalizedPath, ownPath, StringComparison.OrdinalIgnoreCase) Then Continue For
+                If seen.Add(normalizedPath) Then result.Add(normalizedPath)
+            Next
+        Catch
+        End Try
+
+        Return result
+    End Function
+
+    Private Function documentArrayContainsDrawing(ByVal documents() As ModelDoc2) As Boolean
+        If documents Is Nothing Then Return False
+
+        For Each document As ModelDoc2 In documents
+            If document Is Nothing Then Continue For
+
+            Try
+                If document.GetType() = swDocumentTypes_e.swDocDRAWING Then Return True
+            Catch
+            End Try
+        Next
+
+        Return False
+    End Function
+
+    'Path-first drawing workflow. Unlike ModelDoc2 arrays, this preserves dependencies that
+    'are intentionally not open in SOLIDWORKS, so With Dependents remains complete without
+    'loading every part in a large drawing/assembly hierarchy.
+    Friend Function getCadFilePathsIncludingDrawingDependencies(ByVal documents() As ModelDoc2) As String()
+        If documents Is Nothing Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each document As ModelDoc2 In documents
+            If document Is Nothing Then Continue For
+
+            Dim documentPath As String = getSafeModelPath(document)
+            If Not String.IsNullOrWhiteSpace(documentPath) Then
+                Try
+                    documentPath = System.IO.Path.GetFullPath(documentPath)
+                Catch
+                End Try
+
+                If svnModule.isPathInsideLocalRepoPublic(documentPath) AndAlso seen.Add(documentPath) Then
+                    output.Add(documentPath)
+                End If
+            End If
+
+            Try
+                If document.GetType() <> swDocumentTypes_e.swDocDRAWING Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            For Each dependencyPath As String In getDrawingReferencedFilePaths(document)
+                If String.IsNullOrWhiteSpace(dependencyPath) Then Continue For
+
+                Try
+                    dependencyPath = System.IO.Path.GetFullPath(dependencyPath)
+                Catch
+                End Try
+
+                If svnModule.isPathInsideLocalRepoPublic(dependencyPath) AndAlso seen.Add(dependencyPath) Then
+                    output.Add(dependencyPath)
+                End If
+            Next
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
     End Function
 
     Sub TraverseComponent(
@@ -4532,14 +4889,22 @@ Public Class UserControl1
             unlockDocs({modDoc})
         End Sub
         Sub unlockWithDependentsEventHandler(sender As Object, e As EventArgs)
-            myUnlockWithDependents(modDoc)
+            If modDoc IsNot Nothing AndAlso modDoc.GetType() = swDocumentTypes_e.swDocDRAWING Then
+                unlockPathsLockedOnly(parentUserControl2.getCadFilePathsIncludingDrawingDependencies(New ModelDoc2() {modDoc}))
+            Else
+                myUnlockWithDependents(modDoc)
+            End If
         End Sub
         Sub commitEventHandler(sender As Object, e As EventArgs)
             tortCommitDocsAsync({modDoc})
         End Sub
         Public Sub commitWithDependentsEventHandler(sender As Object, e As EventArgs)
             modDocArr = parentUserControl2.GetSelectedModDocList(iSwApp2)
-            tortCommitDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(modDocArr))
+            If modDoc IsNot Nothing AndAlso modDoc.GetType() = swDocumentTypes_e.swDocDRAWING Then
+                tortCommitPathsAsync(parentUserControl2.getCadFilePathsIncludingDrawingDependencies(New ModelDoc2() {modDoc}))
+            Else
+                tortCommitDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(modDocArr))
+            End If
         End Sub
         Sub getLockStealLockEventHandler(sender As Object, e As EventArgs)
             If swMessageBoxResult_e.swMbHitOk =
@@ -4556,7 +4921,11 @@ Public Class UserControl1
             getLocksOfDocsAsync({modDoc})
         End Sub
         Sub getLocksActiveWithDependentsEventHandler(sender As Object, e As EventArgs)
-            getLocksOfDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(parentUserControl2.GetSelectedModDocList(iSwApp2)))
+            If modDoc IsNot Nothing AndAlso modDoc.GetType() = swDocumentTypes_e.swDocDRAWING Then
+                getLocksOfPathsAsync(parentUserControl2.getCadFilePathsIncludingDrawingDependencies(New ModelDoc2() {modDoc}))
+            Else
+                getLocksOfDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(parentUserControl2.GetSelectedModDocList(iSwApp2)))
+            End If
         End Sub
         Sub addToRepoEventHandler(sender As Object, e As EventArgs)
 
@@ -4952,6 +5321,21 @@ Public Class UserControl1
         End If
     End Sub
 
+    Public Sub queueSvnTreeStructureRefreshPublic()
+        Try
+            If Me.InvokeRequired Then
+                Me.BeginInvoke(New MethodInvoker(AddressOf queueSvnTreeStructureRefreshPublic))
+                Exit Sub
+            End If
+        Catch
+        End Try
+
+        If taskPaneClosing Then Exit Sub
+
+        pendingSvnTreeStructureRefresh = True
+        startDeferredSolidWorksUiTimer()
+    End Sub
+
     Public Sub forceWriteAccessForLockedFilePathsPublic(ByVal filePaths() As String)
         Try
             If Me.InvokeRequired Then
@@ -5126,6 +5510,11 @@ Public Class UserControl1
                         )
                     Catch
                     End Try
+
+                    Try
+                        svnModule.noteDeferredWriteAccessResultPublic(filePath, True)
+                    Catch
+                    End Try
                 End If
             Next
 
@@ -5180,6 +5569,22 @@ Public Class UserControl1
                 End If
             Next
 
+            If pendingSvnTreeStructureRefresh Then
+                Try
+                    refreshCurrentTreeViewOnly()
+                    pendingSvnTreeStructureRefresh = False
+                    lastGraphicalSelectionPath = ""
+                    lastGraphicalSelectionComponentName = ""
+
+                    'The selected newly-added component can now be revealed immediately.
+                    syncSvnTreeToCurrentSolidWorksSelectionPublic()
+                Catch ex As COMException
+                    'Retry on the next deferred tick while SOLIDWORKS finishes the import.
+                Catch
+                    pendingSvnTreeStructureRefresh = False
+                End Try
+            End If
+
         Finally
             Try
                 svnModule.endSolidWorksNativeMutationPublic(
@@ -5190,7 +5595,8 @@ Public Class UserControl1
         End Try
 
         If pendingWriteAccessPaths.Count = 0 AndAlso
-           pendingFeatureTreeRefreshPaths.Count = 0 Then
+           pendingFeatureTreeRefreshPaths.Count = 0 AndAlso
+           Not pendingSvnTreeStructureRefresh Then
 
             deferredSolidWorksUiAttemptCount = 0
 
@@ -5235,16 +5641,25 @@ Public Class UserControl1
                         unresolvedPaths &
                         vbCrLf & vbCrLf &
                         "Your locks are still valid. Close and reopen only those documents " &
-                        "before editing them.",
+                        "before editing them." & vbCrLf & vbCrLf &
+                        "Click Sync to refresh SVN status. If a file is out of date, use Get Latest first.",
                         swMessageBoxIcon_e.swMbWarning,
                         swMessageBoxBtn_e.swMbOk
                     )
                 Catch
                 End Try
+
+                For Each unresolvedPath As String In pendingWriteAccessPaths.ToArray()
+                    Try
+                        svnModule.noteDeferredWriteAccessResultPublic(unresolvedPath, False)
+                    Catch
+                    End Try
+                Next
             End If
 
             pendingWriteAccessPaths.Clear()
             pendingFeatureTreeRefreshPaths.Clear()
+            pendingSvnTreeStructureRefresh = False
             deferredSolidWorksUiAttemptCount = 0
         End If
     End Sub

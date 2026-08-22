@@ -296,8 +296,6 @@ Public Module svnAddInUtils
             Dim drwPath As String = Path.Combine(folder, baseName & ".SLDDRW")
             If File.Exists(drwPath) Then
                 result(1) = CType(iSwApp.OpenDoc6(drwPath, swDocumentTypes_e.swDocDRAWING, swOpenDocOptions_e.swOpenDocOptions_Silent, "", 0, 0), ModelDoc2)
-                Dim myPageSetup As PageSetup = CType(result(1).PageSetup, PageSetup)
-                myPageSetup.PrinterPaperSize = 17
             End If
 
         ElseIf extension = ".SLDDRW" Then
@@ -314,9 +312,6 @@ Public Module svnAddInUtils
                     result(0) = CType(iSwApp.OpenDoc6(asmPath, swDocumentTypes_e.swDocASSEMBLY, swOpenDocOptions_e.swOpenDocOptions_Silent, "", 0, 0), ModelDoc2)
                 End If
             End If
-
-            Dim myPageSetup As PageSetup = CType(result(1).PageSetup, PageSetup)
-            myPageSetup.PrinterPaperSize = 17
 
         Else
             iSwApp.SendMsgToUser("Error. Not a part, assembly, or drawing. Exiting.")

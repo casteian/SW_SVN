@@ -40,7 +40,6 @@ Imports System.Windows.Forms
         )>
 Public Class SwAddin
     Implements SolidWorks.Interop.swpublished.SwAddin
-    Private closeGuardHooked As Boolean = False
     Private closeGuardWindowHook As SolidWorksCloseGuardWindowHook = Nothing
 
 #Region "Local Variables"
@@ -313,15 +312,6 @@ Public Class SwAddin
         End Try
     End Sub
 
-    Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
-
-        If svnModule.blockCloseIfOpenDocsUnsafe() Then
-            Return 1
-        End If
-
-        Return 0
-    End Function
-
     'Public Sub AddCommandMgr()
 
     '    Dim cmdGroup As ICommandGroup
@@ -556,11 +546,6 @@ Public Class SwAddin
             AddHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
             AddHandler iSwApp.CommandOpenPreNotify, AddressOf Me.SldWorks_CommandOpenPreNotify
 
-            If Not closeGuardHooked Then
-                AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
-                closeGuardHooked = True
-            End If
-
         Catch e As Exception
             Console.WriteLine(e.Message)
         End Try
@@ -575,11 +560,6 @@ Public Class SwAddin
             RemoveHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
             RemoveHandler iSwApp.CommandOpenPreNotify, AddressOf Me.SldWorks_CommandOpenPreNotify
 
-            If closeGuardHooked Then
-                RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
-                closeGuardHooked = False
-            End If
-
         Catch e As Exception
             Console.WriteLine(e.Message)
         End Try
@@ -591,6 +571,12 @@ Public Class SwAddin
         While Not modDoc Is Nothing
             If Not openDocs.Contains(modDoc) Then
                 AttachModelDocEventHandler(modDoc)
+            Else
+                'An already-open document can acquire another native window/model view
+                '(for example Edit Part -> Open Part in New Window). Refresh its lightweight
+                'view hooks as well as attaching handlers for genuinely new documents.
+                Dim existingHandler As DocumentEventHandler = TryCast(openDocs.Item(modDoc), DocumentEventHandler)
+                If existingHandler IsNot Nothing Then existingHandler.ConnectModelViews()
             End If
             modDoc = modDoc.GetNext()
         End While
@@ -629,7 +615,9 @@ Public Class SwAddin
 
 #Region "Event Handlers"
     Function SldWorks_ActiveDocChangeNotify() As Integer
-        'TODO: Add your implementation here
+        AttachEventsToAllDocuments()
+        svnModule.reconcileWriteAccessForActiveDocumentPublic()
+        Return 0
     End Function
 
     'Function SldWorks_DocumentLoadNotify2(ByVal docTitle As String, ByVal docPath As String) As Integer
@@ -637,7 +625,7 @@ Public Class SwAddin
 
     Private Function SldWorks_CommandOpenPreNotify(ByVal Command As Integer,
                                                        ByVal UserCommand As Integer) As Integer
-        Return svnModule.handleSolidWorksSaveCommandPreNotifyPublic(Command, UserCommand)
+        Return svnModule.handleSolidWorksCommandOpenPreNotifyPublic(Command, UserCommand)
     End Function
 
     Function SldWorks_FileNewNotify2(ByVal newDoc As Object, ByVal doctype As Integer, ByVal templateName As String) As Integer
@@ -647,11 +635,13 @@ Public Class SwAddin
     End Function
 
     Function SldWorks_ActiveModelDocChangeNotify() As Integer
+        AttachEventsToAllDocuments()
         myTaskPaneHost.switchTreeViewToCurrentModel()
 
         'Dim mycontextmenu As New UserControl1.myContextMenuClass(iSwApp.ActiveDoc, iSwApp)
         'myTaskPaneHost.ContextMenuStrip.Items.AddRange({mycontextmenu.openLabel})
 
+        Return 0
     End Function
 
     Function SldWorks_FileOpenPostNotify(ByVal FileName As String) As Integer

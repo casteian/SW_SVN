@@ -144,6 +144,7 @@
     <Compile Include="AssemblyInfo.vb">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="CadRelocationReviewForm.vb" />
     <Compile Include="CloseLockReviewForm.vb" />
     <Compile Include="EventHandling.vb">
       <SubType>Code</SubType>

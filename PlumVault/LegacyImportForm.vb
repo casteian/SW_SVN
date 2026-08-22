@@ -116,8 +116,14 @@ Public Class LegacyImportForm
 
         Me.Text = "Copy Legacy Data to SVN"
         Me.StartPosition = FormStartPosition.CenterParent
-        Me.MinimumSize = New Size(1050, 620)
-        Me.Size = New Size(1320, 760)
+
+        'The grid's fixed-width columns plus every column's own minimum add up to
+        'roughly 1170px. A smaller form minimum than that guarantees columns render
+        'clipped or pushed off into horizontal scrolling the moment the window isn't
+        'at full size.
+        'Keep usable on smaller/high-DPI displays; the grid can scroll horizontally.
+        Me.MinimumSize = New Size(980, 620)
+        Me.Size = New Size(1400, 760)
         Me.AutoScaleMode = AutoScaleMode.Dpi
         Me.Font = SystemFonts.MessageBoxFont
         Me.ShowIcon = False
@@ -298,13 +304,15 @@ Public Class LegacyImportForm
             .Name = COL_SOURCE_TYPE,
             .HeaderText = "Source type",
             .ReadOnly = True,
-            .Width = 90
+            .Width = 90,
+            .MinimumWidth = 80
         }
 
         Dim targetTypeColumn As New DataGridViewComboBoxColumn() With {
             .Name = COL_TARGET_TYPE,
             .HeaderText = "Import type",
             .Width = 110,
+            .MinimumWidth = 100,
             .DisplayStyle = DataGridViewComboBoxDisplayStyle.DropDownButton,
             .FlatStyle = FlatStyle.Standard
         }
@@ -330,7 +338,8 @@ Public Class LegacyImportForm
             .HeaderText = "Check",
             .Text = "Check",
             .UseColumnTextForButtonValue = True,
-            .Width = 68
+            .Width = 68,
+            .MinimumWidth = 68
         }
 
         Dim statusColumn As New DataGridViewTextBoxColumn() With {
@@ -338,6 +347,7 @@ Public Class LegacyImportForm
             .HeaderText = "Status",
             .ReadOnly = True,
             .Width = 62,
+            .MinimumWidth = 62,
             .DefaultCellStyle = New DataGridViewCellStyle() With {
                 .Alignment = DataGridViewContentAlignment.MiddleCenter,
                 .Font = New Font(SystemFonts.MessageBoxFont.FontFamily, 12.0F, FontStyle.Bold)

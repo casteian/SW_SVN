@@ -12,9 +12,11 @@ End Enum
 Public Class CloseLockReviewItem
     Public Property FilePath As String = ""
     Public Property IsSafeToUnlock As Boolean = True
-    Public Property StateText As String = "Saved and committed"
+    Public Property StateText As String = "Clean; nothing to commit"
     Public Property IsStillLocked As Boolean = True
     Public Property ResultText As String = "Lock retained"
+    Public Property CanCommit As Boolean = False
+    Public Property CanRevert As Boolean = False
 End Class
 
 Public Class CloseLockReviewForm
@@ -30,6 +32,7 @@ Public Class CloseLockReviewForm
     Private ReadOnly continueButton As New Button()
 
     Private unlockInProgress As Boolean = False
+    Private pendingCommitPath As String = ""
 
     'Explicit fonts prevent SOLIDWORKS/system font inheritance from producing
     'thin or oddly scaled text on high-DPI displays.
@@ -74,6 +77,7 @@ Public Class CloseLockReviewForm
         reviewItems = If(items, Enumerable.Empty(Of CloseLockReviewItem)()).ToList()
         closingSolidWorks = isClosingSolidWorks
 
+        AddHandler svnModule.CloseReviewCommitCompleted, AddressOf CloseReviewCommitCompleted
         InitializeWindow()
         PopulateRows()
         UpdateFooter()
@@ -85,8 +89,11 @@ Public Class CloseLockReviewForm
                   "Review SVN Locks Before Closing File")
 
         StartPosition = FormStartPosition.CenterScreen
-        MinimumSize = New Size(920, 430)
-        Size = New Size(1120, 560)
+
+        'Keep the dialog usable on smaller/high-DPI displays. The grid scrolls horizontally
+        'when the working area cannot show every decision column at once.
+        MinimumSize = New Size(900, 430)
+        Size = New Size(1180, 560)
         ShowIcon = False
         ShowInTaskbar = False
         MaximizeBox = True
@@ -113,8 +120,9 @@ Public Class CloseLockReviewForm
         headerLabel.Text =
             "You still have SVN locks on the files below. While a lock is held, edit access is reserved to you." &
             Environment.NewLine &
-            "Verify whether you still need each lock. It is recommended to unlock a file once your edits are complete. " &
-            "You may retain any lock you still need and continue closing." &
+            "For each changed file, Commit to keep your work or Revert to discard it. Unlock files whose work is complete. " &
+            "You may retain any lock you still need. Continuing close is the final decision: saved local SVN changes remain on disk, " &
+            "but unsaved changes still only in SOLIDWORKS will be discarded without another Save/Don't Save prompt." &
             Environment.NewLine &
             "Yellow rows are still locked. Green rows have been successfully unlocked."
         rootLayout.Controls.Add(headerLabel, 0, 0)
@@ -147,10 +155,10 @@ Public Class CloseLockReviewForm
 
         continueButton.AutoSize = True
         continueButton.Font = buttonUiFont
-        continueButton.MinimumSize = New Size(220, 38)
+        continueButton.MinimumSize = New Size(285, 38)
         continueButton.Text = If(closingSolidWorks,
-                                 "Continue closing SOLIDWORKS",
-                                 "Continue closing file")
+                                 "Close SOLIDWORKS — no further saves",
+                                 "Close file — no further saves")
         AddHandler continueButton.Click, AddressOf ContinueButton_Click
         buttonPanel.Controls.Add(continueButton, 2, 0)
 
@@ -158,6 +166,7 @@ Public Class CloseLockReviewForm
         CancelButton = returnButton
 
         AddHandler FormClosing, AddressOf CloseLockReviewForm_FormClosing
+        AddHandler FormClosed, AddressOf CloseLockReviewForm_FormClosed
     End Sub
 
     Private Sub ConfigureGrid()
@@ -185,7 +194,7 @@ Public Class CloseLockReviewForm
         Dim fileNameColumn As New DataGridViewTextBoxColumn()
         fileNameColumn.Name = "FileName"
         fileNameColumn.HeaderText = "File"
-        fileNameColumn.Width = 240
+        fileNameColumn.Width = 190
         fileNameColumn.MinimumWidth = 150
         grid.Columns.Add(fileNameColumn)
 
@@ -193,27 +202,50 @@ Public Class CloseLockReviewForm
         locationColumn.Name = "Location"
         locationColumn.HeaderText = "Location"
         locationColumn.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
-        locationColumn.MinimumWidth = 280
+        locationColumn.MinimumWidth = 220
         grid.Columns.Add(locationColumn)
 
         Dim stateColumn As New DataGridViewTextBoxColumn()
         stateColumn.Name = "State"
         stateColumn.HeaderText = "SVN state"
-        stateColumn.Width = 170
+        stateColumn.Width = 180
+        stateColumn.MinimumWidth = 130
         grid.Columns.Add(stateColumn)
+
+        Dim commitColumn As New DataGridViewButtonColumn()
+        commitColumn.Name = "Commit"
+        commitColumn.HeaderText = "Commit"
+        commitColumn.UseColumnTextForButtonValue = False
+        commitColumn.Width = 90
+        commitColumn.MinimumWidth = 90
+        grid.Columns.Add(commitColumn)
+
+        Dim revertColumn As New DataGridViewButtonColumn()
+        revertColumn.Name = "Revert"
+        revertColumn.HeaderText = "Discard"
+        revertColumn.UseColumnTextForButtonValue = False
+        revertColumn.Width = 90
+        revertColumn.MinimumWidth = 90
+        grid.Columns.Add(revertColumn)
 
         Dim unlockColumn As New DataGridViewButtonColumn()
         unlockColumn.Name = "Unlock"
-        unlockColumn.HeaderText = "Action"
+        unlockColumn.HeaderText = "Release"
         unlockColumn.Text = "Unlock"
         unlockColumn.UseColumnTextForButtonValue = False
-        unlockColumn.Width = 100
+        unlockColumn.Width = 95
+        unlockColumn.MinimumWidth = 95
         grid.Columns.Add(unlockColumn)
 
         Dim resultColumn As New DataGridViewTextBoxColumn()
         resultColumn.Name = "Result"
         resultColumn.HeaderText = "Result"
-        resultColumn.Width = 220
+        resultColumn.Width = 240
+        resultColumn.MinimumWidth = 160
+        'Result messages can be a full sentence (e.g. "This file has no committable local
+        'change"). Wrap instead of silently clipping it - AutoSizeRowsMode already grows
+        'the row height to fit wrapped text.
+        resultColumn.DefaultCellStyle.WrapMode = DataGridViewTriState.True
         grid.Columns.Add(resultColumn)
 
         AddHandler grid.CellContentClick, AddressOf Grid_CellContentClick
@@ -234,11 +266,15 @@ Public Class CloseLockReviewForm
             End Try
 
             Dim buttonText As String = If(item.IsSafeToUnlock, "Unlock", "Return first")
+            Dim commitText As String = If(item.CanCommit, "Commit", "—")
+            Dim revertText As String = If(item.CanRevert, "Revert", "—")
 
             Dim rowIndex As Integer = grid.Rows.Add(
                 fileName,
                 folderPath,
                 item.StateText,
+                commitText,
+                revertText,
                 buttonText,
                 item.ResultText
             )
@@ -301,11 +337,21 @@ Public Class CloseLockReviewForm
     Private Sub Grid_CellContentClick(sender As Object, e As DataGridViewCellEventArgs)
         If unlockInProgress Then Exit Sub
         If e.RowIndex < 0 Then Exit Sub
-        If e.ColumnIndex <> grid.Columns("Unlock").Index Then Exit Sub
-
         Dim row As DataGridViewRow = grid.Rows(e.RowIndex)
         Dim item As CloseLockReviewItem = TryCast(row.Tag, CloseLockReviewItem)
         If item Is Nothing Then Exit Sub
+
+        If e.ColumnIndex = grid.Columns("Commit").Index Then
+            StartCommitForItem(row, item)
+            Exit Sub
+        End If
+
+        If e.ColumnIndex = grid.Columns("Revert").Index Then
+            RevertItem(row, item)
+            Exit Sub
+        End If
+
+        If e.ColumnIndex <> grid.Columns("Unlock").Index Then Exit Sub
 
         If Not item.IsStillLocked Then
             row.Cells("Result").Value = "Already unlocked"
@@ -350,6 +396,177 @@ Public Class CloseLockReviewForm
             item.ResultText = ex.Message
             row.Cells("Result").Value = ex.Message
             row.Cells("Result").Style.ForeColor = Color.DarkRed
+        Finally
+            unlockInProgress = False
+            UseWaitCursor = False
+            returnButton.Enabled = True
+            continueButton.Enabled = True
+            UpdateFooter()
+        End Try
+    End Sub
+
+    Private Sub StartCommitForItem(ByVal row As DataGridViewRow,
+                                   ByVal item As CloseLockReviewItem)
+        If Not item.CanCommit Then
+            row.Cells("Result").Value = "This file has no committable local change"
+            Exit Sub
+        End If
+
+        Dim errorMessage As String = ""
+
+        unlockInProgress = True
+        pendingCommitPath = item.FilePath
+        returnButton.Enabled = False
+        continueButton.Enabled = False
+        grid.Enabled = False
+        item.ResultText = "Preparing commit..."
+        row.Cells("Result").Value = item.ResultText
+        row.Cells("Result").Style.ForeColor = Color.DarkGoldenrod
+        grid.Refresh()
+
+        If Not svnModule.commitPathFromCloseReviewPublic(item.FilePath, errorMessage) Then
+            row.Cells("Result").Value = If(String.IsNullOrWhiteSpace(errorMessage),
+                                            "Commit could not be started",
+                                            errorMessage)
+            row.Cells("Result").Style.ForeColor = Color.DarkRed
+            pendingCommitPath = ""
+            unlockInProgress = False
+            returnButton.Enabled = True
+            continueButton.Enabled = True
+            grid.Enabled = True
+            Exit Sub
+        End If
+
+        item.ResultText = "Commit started"
+        row.Cells("Result").Value = "Finish the TortoiseSVN commit; this table will refresh"
+    End Sub
+
+    Private Sub CloseReviewCommitCompleted(ByVal committedPaths() As String,
+                                           ByVal success As Boolean,
+                                           ByVal errorMessage As String)
+        If String.IsNullOrWhiteSpace(pendingCommitPath) Then Exit Sub
+        If committedPaths Is Nothing OrElse
+           Not committedPaths.Any(Function(pathValue) PathsAreSame(pathValue, pendingCommitPath)) Then Exit Sub
+
+        Dim completedPath As String = pendingCommitPath
+        Dim row As DataGridViewRow = grid.Rows.Cast(Of DataGridViewRow)().FirstOrDefault(
+            Function(candidate)
+                Dim candidateItem As CloseLockReviewItem = TryCast(candidate.Tag, CloseLockReviewItem)
+                Return candidateItem IsNot Nothing AndAlso PathsAreSame(candidateItem.FilePath, completedPath)
+            End Function)
+
+        Dim item As CloseLockReviewItem = If(row Is Nothing, Nothing, TryCast(row.Tag, CloseLockReviewItem))
+
+        Try
+            If item Is Nothing Then Exit Try
+
+            If Not success Then
+                item.ResultText = If(String.IsNullOrWhiteSpace(errorMessage),
+                                     "Commit did not complete",
+                                     errorMessage)
+                row.Cells("Result").Value = item.ResultText
+                row.Cells("Result").Style.ForeColor = Color.DarkRed
+                Exit Try
+            End If
+
+            Dim querySucceeded As Boolean = False
+            Dim refreshError As String = ""
+            Dim refreshed As CloseLockReviewItem = svnModule.refreshPathFromCloseReviewPublic(
+                completedPath,
+                querySucceeded,
+                refreshError
+            )
+
+            If Not querySucceeded Then
+                'The commit itself was verified clean. Be conservative about the lock until
+                'a local status refresh proves whether TortoiseSVN released or retained it.
+                item.IsSafeToUnlock = True
+                item.CanCommit = False
+                item.CanRevert = False
+                item.StateText = "Committed; lock status needs refresh"
+                item.ResultText = refreshError
+            ElseIf refreshed Is Nothing Then
+                item.IsSafeToUnlock = True
+                item.IsStillLocked = False
+                item.CanCommit = False
+                item.CanRevert = False
+                item.StateText = "Committed; lock released"
+                item.ResultText = "Committed successfully"
+            Else
+                item.IsSafeToUnlock = refreshed.IsSafeToUnlock
+                item.IsStillLocked = refreshed.IsStillLocked
+                item.CanCommit = refreshed.CanCommit
+                item.CanRevert = refreshed.CanRevert
+                item.StateText = refreshed.StateText
+                item.ResultText = If(refreshed.IsSafeToUnlock,
+                                     "Committed; lock retained",
+                                     refreshed.ResultText)
+            End If
+
+            row.Cells("State").Value = item.StateText
+            row.Cells("Commit").Value = If(item.CanCommit, "Commit", "—")
+            row.Cells("Revert").Value = If(item.CanRevert, "Revert", "—")
+            row.Cells("Unlock").Value = If(item.IsStillLocked AndAlso item.IsSafeToUnlock,
+                                            "Unlock",
+                                            If(item.IsStillLocked, "Return first", "Unlocked"))
+            row.Cells("Result").Value = item.ResultText
+            ApplyRowVisualState(row, item)
+        Finally
+            pendingCommitPath = ""
+            unlockInProgress = False
+            returnButton.Enabled = True
+            continueButton.Enabled = True
+            grid.Enabled = True
+            UpdateFooter()
+        End Try
+    End Sub
+
+    Private Shared Function PathsAreSame(ByVal firstPath As String,
+                                         ByVal secondPath As String) As Boolean
+        If String.IsNullOrWhiteSpace(firstPath) OrElse String.IsNullOrWhiteSpace(secondPath) Then Return False
+
+        Try
+            Return String.Equals(Path.GetFullPath(firstPath),
+                                 Path.GetFullPath(secondPath),
+                                 StringComparison.OrdinalIgnoreCase)
+        Catch
+            Return String.Equals(firstPath, secondPath, StringComparison.OrdinalIgnoreCase)
+        End Try
+    End Function
+
+    Private Sub RevertItem(ByVal row As DataGridViewRow,
+                           ByVal item As CloseLockReviewItem)
+        If Not item.CanRevert Then
+            row.Cells("Result").Value = "This file has no local change to revert"
+            Exit Sub
+        End If
+
+        Dim errorMessage As String = ""
+
+        Try
+            unlockInProgress = True
+            UseWaitCursor = True
+            returnButton.Enabled = False
+            continueButton.Enabled = False
+            row.Cells("Result").Value = "Waiting for revert confirmation..."
+            grid.Refresh()
+
+            If svnModule.revertPathFromCloseReviewPublic(item.FilePath, errorMessage) Then
+                item.IsSafeToUnlock = True
+                item.CanCommit = False
+                item.CanRevert = False
+                item.StateText = "Reverted; no local changes"
+                item.ResultText = "Reverted; lock retained"
+                row.Cells("State").Value = item.StateText
+                row.Cells("Commit").Value = "—"
+                row.Cells("Revert").Value = "—"
+                row.Cells("Unlock").Value = "Unlock"
+                row.Cells("Result").Value = item.ResultText
+                ApplyRowVisualState(row, item)
+            ElseIf Not String.IsNullOrWhiteSpace(errorMessage) Then
+                row.Cells("Result").Value = errorMessage
+                row.Cells("Result").Style.ForeColor = Color.DarkRed
+            End If
         Finally
             unlockInProgress = False
             UseWaitCursor = False
@@ -412,5 +629,9 @@ Public Class CloseLockReviewForm
         If DialogResult <> DialogResult.OK Then
             _decision = CloseLockReviewDecision.ReturnToSolidWorks
         End If
+    End Sub
+
+    Private Sub CloseLockReviewForm_FormClosed(sender As Object, e As FormClosedEventArgs)
+        RemoveHandler svnModule.CloseReviewCommitCompleted, AddressOf CloseReviewCommitCompleted
     End Sub
 End Class

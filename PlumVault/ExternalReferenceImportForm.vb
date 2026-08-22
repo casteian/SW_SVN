@@ -105,8 +105,14 @@ Public Class ExternalReferenceImportForm
 
         Me.Text = "Copy Referenced CAD into SVN"
         Me.StartPosition = FormStartPosition.CenterParent
-        Me.MinimumSize = New Size(1120, 620)
-        Me.Size = New Size(1500, 780)
+
+        'The grid's fixed-width columns plus every column's own minimum add up to well
+        'over 1300px. A smaller form minimum than that guarantees columns render clipped
+        'or pushed off into horizontal scrolling the moment the window isn't at full size.
+        'Keep the dialog usable on 1366px laptops and at 125%/150% DPI. The grid has a
+        'horizontal scrollbar for widths below the ideal all-columns-visible size.
+        Me.MinimumSize = New Size(980, 620)
+        Me.Size = New Size(1560, 780)
         Me.AutoScaleMode = AutoScaleMode.Dpi
         Me.Font = New Font("Segoe UI", 9.5F, FontStyle.Regular)
         Me.ShowIcon = False
@@ -214,31 +220,39 @@ Public Class ExternalReferenceImportForm
         _grid.RowTemplate.Height = 32
         _grid.ColumnHeadersHeight = 34
 
+        'Rows auto-grow to fit wrapped text (long Explanation messages, long paths)
+        'instead of silently clipping it at a fixed single-line row height.
+        _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells
+
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_OLD_NAME,
             .HeaderText = "Old file name",
             .ReadOnly = True,
-            .Width = 165
+            .Width = 165,
+            .MinimumWidth = 120
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_ORIGINAL_PATH,
             .HeaderText = "Original path",
             .ReadOnly = True,
-            .Width = 235
+            .Width = 235,
+            .MinimumWidth = 160
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_SOURCE_TYPE,
             .HeaderText = "Source type",
             .ReadOnly = True,
-            .Width = 78
+            .Width = 78,
+            .MinimumWidth = 70
         })
 
         Dim targetColumn As New DataGridViewComboBoxColumn()
         targetColumn.Name = COL_TARGET_TYPE
         targetColumn.HeaderText = "Import type"
         targetColumn.Width = 105
+        targetColumn.MinimumWidth = 95
         targetColumn.FlatStyle = FlatStyle.Flat
         targetColumn.Items.Add("GRC CAD")
         targetColumn.Items.Add("Vendor Part")
@@ -247,13 +261,15 @@ Public Class ExternalReferenceImportForm
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
             .HeaderText = "New ID / filename",
-            .Width = 170
+            .Width = 170,
+            .MinimumWidth = 130
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_DESTINATION,
             .HeaderText = "Destination folder",
-            .Width = 235
+            .Width = 235,
+            .MinimumWidth = 160
         })
 
         Dim browseColumn As New DataGridViewButtonColumn()
@@ -273,7 +289,8 @@ Public Class ExternalReferenceImportForm
             .Name = COL_FINAL_NAME,
             .HeaderText = "Final filename",
             .ReadOnly = True,
-            .Width = 175
+            .Width = 175,
+            .MinimumWidth = 130
         })
 
         Dim checkColumn As New DataGridViewButtonColumn()
@@ -301,13 +318,18 @@ Public Class ExternalReferenceImportForm
         statusColumn.DefaultCellStyle.Font = New Font("Segoe UI", 10.0F, FontStyle.Bold)
         _grid.Columns.Add(statusColumn)
 
-        _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
+        Dim explanationColumn As New DataGridViewTextBoxColumn() With {
             .Name = COL_EXPLANATION,
             .HeaderText = "Explanation",
             .ReadOnly = True,
             .AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            .MinimumWidth = 210
-        })
+            .MinimumWidth = 260
+        }
+        'Explanation messages are full sentences (e.g. "Vendor parts may be saved anywhere
+        'inside the working copy, but the path must contain a folder named Vendor Parts.").
+        'Wrap instead of clipping - AutoSizeRowsMode above grows the row to fit.
+        explanationColumn.DefaultCellStyle.WrapMode = DataGridViewTriState.True
+        _grid.Columns.Add(explanationColumn)
 
         AddHandler _grid.CellContentClick, AddressOf gridCellContentClick
         AddHandler _grid.CellValueChanged, AddressOf gridCellValueChanged
@@ -518,7 +540,8 @@ Public Class ExternalReferenceImportForm
             Return False
         End If
 
-        If String.IsNullOrWhiteSpace(item.SourcePath) OrElse Not File.Exists(item.SourcePath) Then
+        If String.IsNullOrWhiteSpace(item.SourcePath) OrElse
+           Not svnModule.canMaterializeExternalReferencePublic(item.SourcePath) Then
             message = "The original referenced file is missing or cannot be accessed."
             Return False
         End If

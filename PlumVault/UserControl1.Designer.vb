@@ -33,7 +33,11 @@ Partial Class UserControl1
         Me.TopToolStripPanel = New System.Windows.Forms.ToolStripPanel()
         Me.RightToolStripPanel = New System.Windows.Forms.ToolStripPanel()
         Me.LeftToolStripPanel = New System.Windows.Forms.ToolStripPanel()
+        Me.FileActionToolStrip = New System.Windows.Forms.ToolStrip()
         Me.ToolStrip1 = New System.Windows.Forms.ToolStrip()
+        Me.ToolStripButSaveAs = New System.Windows.Forms.ToolStripButton()
+        Me.ToolStripButReId = New System.Windows.Forms.ToolStripButton()
+        Me.ToolStripButMove = New System.Windows.Forms.ToolStripButton()
         Me.ToolStripSplitButFolder = New System.Windows.Forms.ToolStripSplitButton()
         Me.PickSVNFolderToolStripMenuItem = New System.Windows.Forms.ToolStripMenuItem()
         Me.OpenFolderPickerToolStripMenuItem = New System.Windows.Forms.ToolStripMenuItem()
@@ -72,6 +76,7 @@ Partial Class UserControl1
         Me.ContextMenu1 = New System.Windows.Forms.ContextMenu()
         Me.ContextMenu2 = New System.Windows.Forms.ContextMenu()
         Me.versionLabel = New System.Windows.Forms.Label()
+        Me.FileActionToolStrip.SuspendLayout()
         Me.ToolStrip1.SuspendLayout()
         Me.SuspendLayout()
         '
@@ -80,6 +85,7 @@ Partial Class UserControl1
         Me.TreeView1.Anchor = CType((((System.Windows.Forms.AnchorStyles.Top Or System.Windows.Forms.AnchorStyles.Bottom) _
             Or System.Windows.Forms.AnchorStyles.Left) _
             Or System.Windows.Forms.AnchorStyles.Right), System.Windows.Forms.AnchorStyles)
+        Me.TreeView1.HideSelection = False
         Me.TreeView1.Location = New System.Drawing.Point(3, 530)
         Me.TreeView1.Margin = New System.Windows.Forms.Padding(2)
         Me.TreeView1.MinimumSize = New System.Drawing.Size(168, 131)
@@ -93,7 +99,7 @@ Partial Class UserControl1
         '
         'localRepoPath
         '
-        Me.localRepoPath.Location = New System.Drawing.Point(3, 2)
+        Me.localRepoPath.Location = New System.Drawing.Point(3, 42)
         Me.localRepoPath.Margin = New System.Windows.Forms.Padding(2)
         Me.localRepoPath.Name = "localRepoPath"
         Me.localRepoPath.Size = New System.Drawing.Size(360, 26)
@@ -184,6 +190,20 @@ Partial Class UserControl1
         Me.LeftToolStripPanel.RowMargin = New System.Windows.Forms.Padding(4, 0, 0, 0)
         Me.LeftToolStripPanel.Size = New System.Drawing.Size(0, 0)
         '
+        'FileActionToolStrip
+        '
+        Me.FileActionToolStrip.CanOverflow = False
+        Me.FileActionToolStrip.Dock = System.Windows.Forms.DockStyle.None
+        Me.FileActionToolStrip.GripStyle = System.Windows.Forms.ToolStripGripStyle.Hidden
+        Me.FileActionToolStrip.Items.AddRange(New System.Windows.Forms.ToolStripItem() {Me.ToolStripButSaveAs, Me.ToolStripButReId, Me.ToolStripButMove})
+        Me.FileActionToolStrip.LayoutStyle = System.Windows.Forms.ToolStripLayoutStyle.HorizontalStackWithOverflow
+        Me.FileActionToolStrip.Location = New System.Drawing.Point(3, 2)
+        Me.FileActionToolStrip.Name = "FileActionToolStrip"
+        Me.FileActionToolStrip.Padding = New System.Windows.Forms.Padding(2)
+        Me.FileActionToolStrip.Size = New System.Drawing.Size(181, 36)
+        Me.FileActionToolStrip.Stretch = True
+        Me.FileActionToolStrip.TabIndex = 24
+        '
         'ToolStrip1
         '
         Me.ToolStrip1.CanOverflow = False
@@ -192,7 +212,7 @@ Partial Class UserControl1
         Me.ToolStrip1.ImageScalingSize = New System.Drawing.Size(36, 50)
         Me.ToolStrip1.Items.AddRange(New System.Windows.Forms.ToolStripItem() {Me.ToolStripSplitButFolder, Me.ToolStripDropDownButGetLocks, Me.ToolStripDropDownButCommit, Me.ToolStripDropDownButUnlock, Me.ToolStripDropDownButGetLatest, Me.ToolStripDropDownButReleases})
         Me.ToolStrip1.LayoutStyle = System.Windows.Forms.ToolStripLayoutStyle.VerticalStackWithOverflow
-        Me.ToolStrip1.Location = New System.Drawing.Point(3, 48)
+        Me.ToolStrip1.Location = New System.Drawing.Point(3, 72)
         Me.ToolStrip1.MaximumSize = New System.Drawing.Size(267, 533)
         Me.ToolStrip1.MinimumSize = New System.Drawing.Size(67, 133)
         Me.ToolStrip1.Name = "ToolStrip1"
@@ -200,6 +220,42 @@ Partial Class UserControl1
         Me.ToolStrip1.Size = New System.Drawing.Size(181, 479)
         Me.ToolStrip1.Stretch = True
         Me.ToolStrip1.TabIndex = 0
+        '
+        'ToolStripButSaveAs
+        '
+        Me.ToolStripButSaveAs.AutoSize = False
+        Me.ToolStripButSaveAs.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text
+        Me.ToolStripButSaveAs.Font = New System.Drawing.Font("Segoe UI", 8.0!, System.Drawing.FontStyle.Bold)
+        Me.ToolStripButSaveAs.Margin = New System.Windows.Forms.Padding(0)
+        Me.ToolStripButSaveAs.Name = "ToolStripButSaveAs"
+        Me.ToolStripButSaveAs.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
+        Me.ToolStripButSaveAs.Size = New System.Drawing.Size(57, 30)
+        Me.ToolStripButSaveAs.Text = "Save As"
+        Me.ToolStripButSaveAs.ToolTipText = "Save the active document under a new GRC27/CFD27-compliant name into the SVN working copy"
+        '
+        'ToolStripButReId
+        '
+        Me.ToolStripButReId.AutoSize = False
+        Me.ToolStripButReId.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text
+        Me.ToolStripButReId.Font = New System.Drawing.Font("Segoe UI", 8.0!, System.Drawing.FontStyle.Bold)
+        Me.ToolStripButReId.Margin = New System.Windows.Forms.Padding(0)
+        Me.ToolStripButReId.Name = "ToolStripButReId"
+        Me.ToolStripButReId.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
+        Me.ToolStripButReId.Size = New System.Drawing.Size(57, 30)
+        Me.ToolStripButReId.Text = "Re-ID"
+        Me.ToolStripButReId.ToolTipText = "Rename the active CAD file and safely update locked assemblies and drawings that reference it"
+        '
+        'ToolStripButMove
+        '
+        Me.ToolStripButMove.AutoSize = False
+        Me.ToolStripButMove.DisplayStyle = System.Windows.Forms.ToolStripItemDisplayStyle.Text
+        Me.ToolStripButMove.Font = New System.Drawing.Font("Segoe UI", 8.0!, System.Drawing.FontStyle.Bold)
+        Me.ToolStripButMove.Margin = New System.Windows.Forms.Padding(0)
+        Me.ToolStripButMove.Name = "ToolStripButMove"
+        Me.ToolStripButMove.Padding = New System.Windows.Forms.Padding(2, 0, 2, 0)
+        Me.ToolStripButMove.Size = New System.Drawing.Size(57, 30)
+        Me.ToolStripButMove.Text = "Move"
+        Me.ToolStripButMove.ToolTipText = "Move the active CAD file and safely update locked assemblies and drawings that reference it"
         '
         'ToolStripSplitButFolder
         '
@@ -485,6 +541,7 @@ Partial Class UserControl1
         Me.AutoScaleMode = System.Windows.Forms.AutoScaleMode.None
         Me.AutoScroll = True
         Me.Controls.Add(Me.versionLabel)
+        Me.Controls.Add(Me.FileActionToolStrip)
         Me.Controls.Add(Me.ToolStrip1)
         Me.Controls.Add(Me.butFindComponent)
         Me.Controls.Add(Me.butRefresh)
@@ -494,6 +551,8 @@ Partial Class UserControl1
         Me.Controls.Add(Me.TreeView1)
         Me.Name = "UserControl1"
         Me.Size = New System.Drawing.Size(696, 895)
+        Me.FileActionToolStrip.ResumeLayout(False)
+        Me.FileActionToolStrip.PerformLayout()
         Me.ToolStrip1.ResumeLayout(False)
         Me.ToolStrip1.PerformLayout()
         Me.ResumeLayout(False)
@@ -507,6 +566,10 @@ Partial Class UserControl1
     Friend WithEvents butRefresh As Windows.Forms.Button
     Friend WithEvents butFindComponent As Button
     Friend WithEvents ToolStrip1 As ToolStrip
+    Friend WithEvents FileActionToolStrip As ToolStrip
+    Friend WithEvents ToolStripButSaveAs As ToolStripButton
+    Friend WithEvents ToolStripButReId As ToolStripButton
+    Friend WithEvents ToolStripButMove As ToolStripButton
     Friend WithEvents ToolStripDropDownButGetLocks As ToolStripSplitButton
     Friend WithEvents dropDownGetLocksWithDependents As ToolStripMenuItem
     Friend WithEvents ToolStripDropDownButCommit As ToolStripSplitButton

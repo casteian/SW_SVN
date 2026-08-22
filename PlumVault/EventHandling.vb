@@ -271,19 +271,46 @@ Public Class DocumentEventHandler
     End Function
 
     Function ConnectModelViews() As Boolean
-        Dim iModelView As ModelView
-        iModelView = iDocument.GetFirstModelView()
+        Dim iModelView As ModelView = Nothing
+
+        Try
+            iModelView = iDocument.GetFirstModelView()
+        Catch
+            Return False
+        End Try
 
         While (Not iModelView Is Nothing)
-            If Not openModelViews.Contains(iModelView) Then
-                Dim mView As New DocView()
-                mView.Init(userAddin, iModelView, Me)
-                mView.AttachEventHandlers()
-                openModelViews.Add(iModelView, mView)
-            End If
+            ConnectModelView(iModelView)
 
-            iModelView = iModelView.GetNext
+            Try
+                iModelView = iModelView.GetNext
+            Catch
+                iModelView = Nothing
+            End Try
         End While
+
+        Return True
+    End Function
+
+    'A document can gain another ModelView after its document event handler has already
+    'been installed (notably Edit Part -> Open Part in New Window). ViewNewNotify2 supplies
+    'that new view directly, so attach the close guard immediately instead of waiting for
+    'the document to be reopened.
+    Protected Function ConnectModelView(ByVal viewObject As Object) As Boolean
+        Dim modelView As ModelView = TryCast(viewObject, ModelView)
+        If modelView Is Nothing Then Return False
+
+        Try
+            If openModelViews.Contains(modelView) Then Return True
+
+            Dim mView As New DocView()
+            mView.Init(userAddin, modelView, Me)
+            mView.AttachEventHandlers()
+            openModelViews.Add(modelView, mView)
+            Return True
+        Catch
+            Return False
+        End Try
     End Function
 
     Function DisconnectModelViews() As Boolean
@@ -345,6 +372,7 @@ Public Class PartEventHandler
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+        AddHandler iPart.ViewNewNotify2, AddressOf Me.PartDoc_ViewNewNotify2
         AddHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
         AddHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
         AddHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
@@ -363,6 +391,7 @@ Public Class PartEventHandler
 
         Try
             RemoveHandler iPart.DestroyNotify, AddressOf Me.PartDoc_DestroyNotify
+            RemoveHandler iPart.ViewNewNotify2, AddressOf Me.PartDoc_ViewNewNotify2
             RemoveHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
             RemoveHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
             RemoveHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
@@ -427,6 +456,11 @@ Public Class PartEventHandler
         Return 0
     End Function
 
+    Private Function PartDoc_ViewNewNotify2(ByVal newView As Object) As Integer
+        ConnectModelView(newView)
+        Return 0
+    End Function
+
     Function PartDoc_NewSelectionNotify() As Integer
 
     End Function
@@ -438,6 +472,7 @@ Public Class AssemblyEventHandler
 
     Dim WithEvents iAssembly As AssemblyDoc
     Dim swAddin As SwAddin
+    Private lastKnownComponentCount As Integer = -1
 
     Overrides Function Init(ByVal sw As SldWorks, ByVal addin As SwAddin, ByVal model As ModelDoc2) As Boolean
         userAddin = addin
@@ -445,10 +480,12 @@ Public Class AssemblyEventHandler
         iDocument = iAssembly
         iSwApp = sw
         swAddin = addin
+        lastKnownComponentCount = getAssemblyComponentCountSafe()
     End Function
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iAssembly.DestroyNotify, AddressOf Me.AssemblyDoc_DestroyNotify
+        AddHandler iAssembly.ViewNewNotify2, AddressOf Me.AssemblyDoc_ViewNewNotify2
         AddHandler iAssembly.FileSaveNotify, AddressOf Me.AssemblyDoc_FileSaveNotify
         AddHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
         AddHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
@@ -464,8 +501,14 @@ Public Class AssemblyEventHandler
 
         AddHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
         AddHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
+        AddHandler iAssembly.ComponentVisibleChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisibleChangeNotify
         AddHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
         AddHandler iAssembly.ComponentDisplayStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentDisplayStateChangeNotify
+        AddHandler iAssembly.BodyVisibleChangeNotify, AddressOf Me.AssemblyDoc_BodyVisibleChangeNotify
+        AddHandler iAssembly.RegenNotify, AddressOf Me.AssemblyDoc_RegenNotify
+        AddHandler iAssembly.RegenPostNotify, AddressOf Me.AssemblyDoc_RegenPostNotify
+        AddHandler iAssembly.BeginInContextEditNotify, AddressOf Me.AssemblyDoc_BeginInContextEditNotify
+        AddHandler iAssembly.EndInContextEditNotify, AddressOf Me.AssemblyDoc_EndInContextEditNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         'AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.AssemblyDoc_ActiveModelDocChangeNotify
@@ -480,6 +523,7 @@ Public Class AssemblyEventHandler
 
         Try
             RemoveHandler iAssembly.DestroyNotify, AddressOf Me.AssemblyDoc_DestroyNotify
+            RemoveHandler iAssembly.ViewNewNotify2, AddressOf Me.AssemblyDoc_ViewNewNotify2
             RemoveHandler iAssembly.FileSaveNotify, AddressOf Me.AssemblyDoc_FileSaveNotify
             RemoveHandler iAssembly.FileSaveAsNotify2, AddressOf Me.AssemblyDoc_FileSaveAsNotify2
             RemoveHandler iAssembly.FileSavePostNotify, AddressOf Me.AssemblyDoc_FileSavePostNotify
@@ -491,8 +535,14 @@ Public Class AssemblyEventHandler
             RemoveHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
             RemoveHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
             RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
+            RemoveHandler iAssembly.ComponentVisibleChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisibleChangeNotify
             RemoveHandler iAssembly.ComponentVisualPropertiesChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisiblePropertiesChangeNotify
             RemoveHandler iAssembly.ComponentDisplayStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentDisplayStateChangeNotify
+            RemoveHandler iAssembly.BodyVisibleChangeNotify, AddressOf Me.AssemblyDoc_BodyVisibleChangeNotify
+            RemoveHandler iAssembly.RegenNotify, AddressOf Me.AssemblyDoc_RegenNotify
+            RemoveHandler iAssembly.RegenPostNotify, AddressOf Me.AssemblyDoc_RegenPostNotify
+            RemoveHandler iAssembly.BeginInContextEditNotify, AddressOf Me.AssemblyDoc_BeginInContextEditNotify
+            RemoveHandler iAssembly.EndInContextEditNotify, AddressOf Me.AssemblyDoc_EndInContextEditNotify
             RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
         Catch
             'The SOLIDWORKS document may already have released its COM connection.
@@ -532,12 +582,26 @@ Public Class AssemblyEventHandler
     End Function
 
     Function AssemblyDoc_DestroyNotify() As Integer
+        svnModule.clearInContextEditSessionPublic(iDocument)
         ScheduleDetachEventHandlers()
+        Return 0
+    End Function
+
+    Private Function AssemblyDoc_ViewNewNotify2(ByVal newView As Object) As Integer
+        ConnectModelView(newView)
         Return 0
     End Function
 
     Function AssemblyDoc_NewSelectionNotify() As Integer
         svnModule.noteAssemblySelectionContextPublic(iDocument)
+
+        Try
+            If swAddin IsNot Nothing AndAlso swAddin.myTaskPaneHost IsNot Nothing Then
+                swAddin.myTaskPaneHost.syncSvnTreeToCurrentSolidWorksSelectionPublic()
+            End If
+        Catch
+        End Try
+
         Return 0
     End Function
 
@@ -552,8 +616,38 @@ Public Class AssemblyEventHandler
         svnModule.handleAssemblyOwnedEditPostPublic(
             iDocument,
             "assembly-level modification",
-            allowLockedChildDimensionFallback:=True
+            allowLockedChildDimensionFallback:=True,
+            allowRecentlyEndedInContextEdit:=True,
+            allowDisplayOnlyFallback:=True
         )
+        Return 0
+    End Function
+
+    'RegenNotify/RegenPostNotify bracket a Rebuild. A Rebuild that only recomputes this
+    'assembly from an already-correctly-updated child raises ModifyNotify with no structural
+    'edit of this assembly, so the edit guard must not treat it as an unlocked modification.
+    Function AssemblyDoc_RegenNotify() As Integer
+        svnModule.beginAssemblyRebuildPublic(iDocument)
+        Return 0
+    End Function
+
+    Function AssemblyDoc_RegenPostNotify() As Integer
+        svnModule.endAssemblyRebuildPublic(iDocument)
+        Return 0
+    End Function
+
+    'BeginInContextEditNotify/EndInContextEditNotify fire specifically for "Edit Part"
+    'in-context editing from the assembly window. GetEditTarget can already be Nothing again
+    'by the time ModifyNotify for the edit itself arrives (e.g. right after exiting edit
+    'mode), which previously made a fully authorized edit to a locked child look like an
+    'unlocked assembly edit and get falsely blocked/flagged.
+    Function AssemblyDoc_BeginInContextEditNotify(ByVal docBeingEdited As Object, ByVal docType As Integer) As Integer
+        svnModule.noteInContextEditBeganPublic(iDocument, TryCast(docBeingEdited, ModelDoc2))
+        Return 0
+    End Function
+
+    Function AssemblyDoc_EndInContextEditNotify(ByVal docBeingEdited As Object, ByVal docType As Integer) As Integer
+        svnModule.noteInContextEditEndedPublic(iDocument, TryCast(docBeingEdited, ModelDoc2))
         Return 0
     End Function
 
@@ -563,8 +657,36 @@ Public Class AssemblyEventHandler
     End Function
 
     Private Function AssemblyDoc_AddItemNotify(ByVal EntityType As Integer, ByVal itemName As String) As Integer
-        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "adding " & itemName)
+        svnModule.handleAssemblyOwnedEditPostPublic(
+            iDocument,
+            "adding " & itemName,
+            addedEntityType:=EntityType,
+            addedItemName:=itemName
+        )
+
+        Dim currentComponentCount As Integer = getAssemblyComponentCountSafe()
+
+        If currentComponentCount > lastKnownComponentCount Then
+            Try
+                If swAddin IsNot Nothing AndAlso swAddin.myTaskPaneHost IsNot Nothing Then
+                    swAddin.myTaskPaneHost.queueSvnTreeStructureRefreshPublic()
+                End If
+            Catch
+            End Try
+        End If
+
+        If currentComponentCount >= 0 Then lastKnownComponentCount = currentComponentCount
         Return 0
+    End Function
+
+    Private Function getAssemblyComponentCountSafe() As Integer
+        Try
+            'Count-only API avoids allocating/walking the full component array on every
+            'AddItemNotify in a large assembly.
+            Return iAssembly.GetComponentCount(False)
+        Catch
+            Return -1
+        End Try
     End Function
 
     Private Function AssemblyDoc_DeleteItemPreNotify(ByVal EntityType As Integer, ByVal itemName As String) As Integer
@@ -618,7 +740,12 @@ Public Class AssemblyEventHandler
 
         modDoc = component.GetModelDoc
 
-        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "changing component visual properties")
+        'Appearance/transparency is a local display preference, not a geometry or structural
+        'edit - a user commonly changes it just to see or measure something more clearly
+        'while locked out of the assembly (e.g. editing one specific part in context).
+        'Allowed without the assembly lock, same reasoning already applied to suppress/
+        'unsuppress: it cannot be saved to a read-only, unlocked file anyway.
+        svnModule.noteAssemblyDisplayOnlyChangePublic(iDocument)
         Return ComponentStateChange(modDoc)
 
     End Function
@@ -650,9 +777,25 @@ Public Class AssemblyEventHandler
 
         modDoc = component.GetModelDoc
 
-        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "changing a component display state")
+        'Hide/show and display-state changes are local viewing preferences, not geometry or
+        'structural edits - allowed without the assembly lock for the same reason as
+        'suppress/unsuppress and visual-properties changes above (e.g. hiding surrounding
+        'components just to take a measurement while locked out of the assembly).
+        svnModule.noteAssemblyDisplayOnlyChangePublic(iDocument)
         Return ComponentStateChange(modDoc)
 
+    End Function
+
+    Public Function AssemblyDoc_ComponentVisibleChangeNotify() As Integer
+        'Hide/show is explicitly non-structural and may be used for inspection or measurement.
+        svnModule.noteAssemblyDisplayOnlyChangePublic(iDocument)
+        Return 0
+    End Function
+
+    Public Function AssemblyDoc_BodyVisibleChangeNotify() As Integer
+        'Likewise allow temporary body visibility changes without an assembly lock.
+        svnModule.noteAssemblyDisplayOnlyChangePublic(iDocument)
+        Return 0
     End Function
 End Class
 
@@ -671,6 +814,7 @@ Public Class DrawingEventHandler
 
     Overrides Function AttachEventHandlers() As Boolean
         AddHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
+        AddHandler iDrawing.ViewNewNotify2, AddressOf Me.DrawingDoc_ViewNewNotify2
         AddHandler iDrawing.FileSaveNotify, AddressOf Me.DrawingDoc_FileSaveNotify
         AddHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
         AddHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
@@ -679,6 +823,8 @@ Public Class DrawingEventHandler
 
         SolidWorksCtrlWCloseGuardKeyboardHook.Install()
         ConnectModelViews()
+
+        svnModule.queueDrawingReferenceFreshnessCheckPublic(iDocument)
     End Function
 
     Overrides Function DetachEventHandlers() As Boolean
@@ -686,6 +832,7 @@ Public Class DrawingEventHandler
 
         Try
             RemoveHandler iDrawing.DestroyNotify, AddressOf Me.DrawingDoc_DestroyNotify
+            RemoveHandler iDrawing.ViewNewNotify2, AddressOf Me.DrawingDoc_ViewNewNotify2
             RemoveHandler iDrawing.FileSaveNotify, AddressOf Me.DrawingDoc_FileSaveNotify
             RemoveHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
             RemoveHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
@@ -722,6 +869,11 @@ Public Class DrawingEventHandler
 
     Function DrawingDoc_DestroyNotify() As Integer
         ScheduleDetachEventHandlers()
+        Return 0
+    End Function
+
+    Private Function DrawingDoc_ViewNewNotify2(ByVal newView As Object) As Integer
+        ConnectModelView(newView)
         Return 0
     End Function
 
@@ -803,6 +955,13 @@ Public Class DocView
         AddHandler iModelView.DestroyNotify2, AddressOf Me.ModelView_DestroyNotify2
         AddHandler iModelView.RepaintNotify, AddressOf Me.ModelView_RepaintNotify
 
+        EnsureDocumentWindowCloseGuards()
+        Return True
+    End Function
+
+    Private Sub EnsureDocumentWindowCloseGuards()
+        If detachStarted OrElse docWindowCloseGuards.Count > 0 Then Exit Sub
+
         Try
             Dim hwnd As IntPtr = IntPtr.Zero
 
@@ -819,7 +978,7 @@ Public Class DocView
         Catch
             docWindowCloseGuards.Clear()
         End Try
-    End Function
+    End Sub
 
     Private Sub HookDocumentWindowAndParents(startHwnd As IntPtr)
         Dim currentHwnd As IntPtr = startHwnd
@@ -951,6 +1110,9 @@ Public Class DocView
     End Function
 
     Function ModelView_RepaintNotify(ByVal repaintTYpe As Integer) As Integer
-
+        'Some SOLIDWORKS releases raise ViewNewNotify2 before the native view HWND exists.
+        'The first repaint is a cheap, deterministic retry and avoids a polling timer.
+        EnsureDocumentWindowCloseGuards()
+        Return 0
     End Function
 End Class
