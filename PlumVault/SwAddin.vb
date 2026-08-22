@@ -672,10 +672,30 @@ Public Class SwAddin
 
         Protected Overrides Sub WndProc(ByRef m As Message)
             If m.Msg = WM_CLOSE Then
-                If svnModule.blockCloseIfOpenDocsUnsafe() Then
-                    'Block SolidWorks from closing.
+                Try
+                    If svnModule.blockCloseIfOpenDocsUnsafe() Then
+                        'Block SolidWorks from closing.
+                        Return
+                    End If
+                Catch ex As Exception
+                    'The verified application-close path can intentionally close dirty
+                    'documents without saving after the review table. If verification itself
+                    'throws, never fall through to that destructive path.
+                    Try
+                        MessageBox.Show(
+                            "SOLIDWORKS close was cancelled because PlumVault could not verify every open document." &
+                            vbCrLf & vbCrLf &
+                            "Click Sync and try again. If this repeats, disable the PlumVault add-in before closing SOLIDWORKS." &
+                            vbCrLf & vbCrLf & ex.Message,
+                            "PlumVault could not verify close",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning
+                        )
+                    Catch
+                    End Try
+
                     Return
-                End If
+                End Try
             End If
 
             MyBase.WndProc(m)

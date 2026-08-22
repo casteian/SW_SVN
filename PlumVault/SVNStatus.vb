@@ -543,7 +543,10 @@ Public Class SVNStatus
                 reloadOrReplaceResult = fp(index(i)).modDoc.ReloadOrReplace(
                     ReadOnly:=True, ReplaceFileName:=Nothing, DiscardChanges:=True)
                 Debug.Print(fp(index(i)).filename & " - Reload/Replace Result: " & reloadOrReplaceResult)
-                fp(i).bReconnect = False 'reset it
+                'index() can be a filtered/reordered subset. Reset the same entry that was
+                'actually reattached, not fp(i), or a different document can remain marked
+                'detached and be reloaded unexpectedly by a later SVN operation.
+                fp(index(i)).bReconnect = False
             End If
         Next
     End Sub

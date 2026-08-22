@@ -37,10 +37,24 @@ Friend NotInheritable Class SolidWorksCloseGuardCoordinator
 
         Try
             blocked = svnModule.blockCloseIfActiveDocUnsafe()
-        Catch
-            'Do not crash SOLIDWORKS because the safety check itself failed.
-            'The document-level close events are cleanup-only and never return invalid cancel codes.
-            blocked = False
+        Catch ex As Exception
+            'A failed pre-close check is not evidence that the file is safe. Fail closed and
+            'give one actionable message instead of allowing the native close/save dialogs to
+            'take over after PlumVault lost track of the document state.
+            blocked = True
+
+            Try
+                MessageBox.Show(
+                    "The file close was cancelled because PlumVault could not verify its save and lock state." &
+                    vbCrLf & vbCrLf &
+                    "Click Sync and try again. If this repeats, disable the PlumVault add-in before closing SOLIDWORKS." &
+                    vbCrLf & vbCrLf & ex.Message,
+                    "PlumVault could not verify close",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                )
+            Catch
+            End Try
         Finally
             SyncLock closeCheckSync
                 lastDecisionBlocked = blocked
@@ -495,8 +509,10 @@ Public Class AssemblyEventHandler
         'events are safely undone one UI turn later when the assembly is not locked.
         AddHandler iAssembly.ModifyNotify, AddressOf Me.AssemblyDoc_ModifyNotify
         AddHandler iAssembly.ComponentMoveNotify2, AddressOf Me.AssemblyDoc_ComponentMoveNotify2
+        AddHandler iAssembly.ComponentReorganizeNotify, AddressOf Me.AssemblyDoc_ComponentReorganizeNotify
         AddHandler iAssembly.AddItemNotify, AddressOf Me.AssemblyDoc_AddItemNotify
         AddHandler iAssembly.DeleteItemPreNotify, AddressOf Me.AssemblyDoc_DeleteItemPreNotify
+        AddHandler iAssembly.PreRenameItemNotify, AddressOf Me.AssemblyDoc_PreRenameItemNotify
         AddHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
 
         AddHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
@@ -530,8 +546,10 @@ Public Class AssemblyEventHandler
             RemoveHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
             RemoveHandler iAssembly.ModifyNotify, AddressOf Me.AssemblyDoc_ModifyNotify
             RemoveHandler iAssembly.ComponentMoveNotify2, AddressOf Me.AssemblyDoc_ComponentMoveNotify2
+            RemoveHandler iAssembly.ComponentReorganizeNotify, AddressOf Me.AssemblyDoc_ComponentReorganizeNotify
             RemoveHandler iAssembly.AddItemNotify, AddressOf Me.AssemblyDoc_AddItemNotify
             RemoveHandler iAssembly.DeleteItemPreNotify, AddressOf Me.AssemblyDoc_DeleteItemPreNotify
+            RemoveHandler iAssembly.PreRenameItemNotify, AddressOf Me.AssemblyDoc_PreRenameItemNotify
             RemoveHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
             RemoveHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
             RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
@@ -618,7 +636,9 @@ Public Class AssemblyEventHandler
             "assembly-level modification",
             allowLockedChildDimensionFallback:=True,
             allowRecentlyEndedInContextEdit:=True,
-            allowDisplayOnlyFallback:=True
+            allowDisplayOnlyFallback:=True,
+            allowRebuildModifyFallback:=True,
+            allowActiveChildEditContext:=True
         )
         Return 0
     End Function
@@ -652,7 +672,24 @@ Public Class AssemblyEventHandler
     End Function
 
     Private Function AssemblyDoc_ComponentMoveNotify2(ByRef Components As Object) As Integer
-        svnModule.handleAssemblyOwnedEditPostPublic(iDocument, "moving or rotating an assembly component")
+        svnModule.handleAssemblyOwnedEditPostPublic(
+            iDocument,
+            "moving or rotating an assembly component",
+            allowActiveChildEditContext:=True
+        )
+        Return 0
+    End Function
+
+    Private Function AssemblyDoc_ComponentReorganizeNotify(ByVal sourceName As String,
+                                                            ByVal targetName As String) As Integer
+        'Dragging a component into/out of a FeatureManager folder is persisted in the assembly
+        'file even though geometry does not move. ComponentMoveNotify2 does not cover this tree
+        'reorganization, so guard its purpose-built event explicitly.
+        svnModule.handleAssemblyOwnedEditPostPublic(
+            iDocument,
+            "reorganizing " & sourceName & " in the FeatureManager tree",
+            allowActiveChildEditContext:=True
+        )
         Return 0
     End Function
 
@@ -661,7 +698,8 @@ Public Class AssemblyEventHandler
             iDocument,
             "adding " & itemName,
             addedEntityType:=EntityType,
-            addedItemName:=itemName
+            addedItemName:=itemName,
+            allowActiveChildEditContext:=True
         )
 
         Dim currentComponentCount As Integer = getAssemblyComponentCountSafe()
@@ -691,6 +729,12 @@ Public Class AssemblyEventHandler
 
     Private Function AssemblyDoc_DeleteItemPreNotify(ByVal EntityType As Integer, ByVal itemName As String) As Integer
         Return svnModule.blockAssemblyOwnedEditPrePublic(iDocument, "deleting " & itemName)
+    End Function
+
+    Private Function AssemblyDoc_PreRenameItemNotify(ByVal EntityType As Integer,
+                                                      ByVal oldName As String,
+                                                      ByVal newName As String) As Integer
+        Return svnModule.blockAssemblyOwnedEditPrePublic(iDocument, "renaming " & oldName)
     End Function
 
     Private Function AssemblyDoc_DimensionChangeNotify(ByVal displayDim As Object) As Integer

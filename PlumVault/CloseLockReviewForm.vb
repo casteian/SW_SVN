@@ -33,6 +33,7 @@ Public Class CloseLockReviewForm
 
     Private unlockInProgress As Boolean = False
     Private pendingCommitPath As String = ""
+    Private pendingRevertPath As String = ""
 
     'Explicit fonts prevent SOLIDWORKS/system font inheritance from producing
     'thin or oddly scaled text on high-DPI displays.
@@ -78,6 +79,7 @@ Public Class CloseLockReviewForm
         closingSolidWorks = isClosingSolidWorks
 
         AddHandler svnModule.CloseReviewCommitCompleted, AddressOf CloseReviewCommitCompleted
+        AddHandler svnModule.CloseReviewRevertCompleted, AddressOf CloseReviewRevertCompleted
         InitializeWindow()
         PopulateRows()
         UpdateFooter()
@@ -92,7 +94,12 @@ Public Class CloseLockReviewForm
 
         'Keep the dialog usable on smaller/high-DPI displays. The grid scrolls horizontally
         'when the working area cannot show every decision column at once.
-        MinimumSize = New Size(900, 430)
+        'Width must actually fit the sum of the grid's own column MinimumWidths (150+220+130+
+        '90+90+120+160=960) plus the root layout's 14px side padding and the grid's own
+        'border/scrollbar margin - otherwise the rightmost columns (Result, Unlock), which
+        'carry the messages needed to safely resolve a lock, can be clipped or scrolled away
+        'at the form's minimum size.
+        MinimumSize = New Size(1020, 430)
         Size = New Size(1180, 560)
         ShowIcon = False
         ShowInTaskbar = False
@@ -233,8 +240,8 @@ Public Class CloseLockReviewForm
         unlockColumn.HeaderText = "Release"
         unlockColumn.Text = "Unlock"
         unlockColumn.UseColumnTextForButtonValue = False
-        unlockColumn.Width = 95
-        unlockColumn.MinimumWidth = 95
+        unlockColumn.Width = 120
+        unlockColumn.MinimumWidth = 120
         grid.Columns.Add(unlockColumn)
 
         Dim resultColumn As New DataGridViewTextBoxColumn()
@@ -543,35 +550,124 @@ Public Class CloseLockReviewForm
 
         Dim errorMessage As String = ""
 
-        Try
-            unlockInProgress = True
-            UseWaitCursor = True
-            returnButton.Enabled = False
-            continueButton.Enabled = False
-            row.Cells("Result").Value = "Waiting for revert confirmation..."
-            grid.Refresh()
+        unlockInProgress = True
+        pendingRevertPath = item.FilePath
+        returnButton.Enabled = False
+        continueButton.Enabled = False
+        grid.Enabled = False
+        row.Cells("Result").Value = "Waiting for discard confirmation..."
+        grid.Refresh()
 
-            If svnModule.revertPathFromCloseReviewPublic(item.FilePath, errorMessage) Then
-                item.IsSafeToUnlock = True
-                item.CanCommit = False
-                item.CanRevert = False
-                item.StateText = "Reverted; no local changes"
-                item.ResultText = "Reverted; lock retained"
-                row.Cells("State").Value = item.StateText
-                row.Cells("Commit").Value = "—"
-                row.Cells("Revert").Value = "—"
-                row.Cells("Unlock").Value = "Unlock"
-                row.Cells("Result").Value = item.ResultText
-                ApplyRowVisualState(row, item)
-            ElseIf Not String.IsNullOrWhiteSpace(errorMessage) Then
+        If svnModule.revertPathFromCloseReviewPublic(item.FilePath, errorMessage) Then
+            UseWaitCursor = True
+            row.Cells("Result").Value = "Discarding changes and reloading the SOLIDWORKS file..."
+            Exit Sub
+        End If
+
+        Try
+            If Not String.IsNullOrWhiteSpace(errorMessage) Then
+                item.ResultText = errorMessage
                 row.Cells("Result").Value = errorMessage
-                row.Cells("Result").Style.ForeColor = Color.DarkRed
+                row.Cells("Result").Style.ForeColor = If(errorMessage.StartsWith("Discard cancelled", StringComparison.OrdinalIgnoreCase),
+                                                           Color.DarkGoldenrod,
+                                                           Color.DarkRed)
             End If
         Finally
+            pendingRevertPath = ""
             unlockInProgress = False
             UseWaitCursor = False
             returnButton.Enabled = True
             continueButton.Enabled = True
+            grid.Enabled = True
+            UpdateFooter()
+        End Try
+    End Sub
+
+    Private Sub CloseReviewRevertCompleted(ByVal revertedPath As String,
+                                           ByVal success As Boolean,
+                                           ByVal errorMessage As String)
+        If String.IsNullOrWhiteSpace(pendingRevertPath) Then Exit Sub
+        If Not PathsAreSame(revertedPath, pendingRevertPath) Then Exit Sub
+
+        Dim completedPath As String = pendingRevertPath
+        Dim row As DataGridViewRow = grid.Rows.Cast(Of DataGridViewRow)().FirstOrDefault(
+            Function(candidate)
+                Dim candidateItem As CloseLockReviewItem = TryCast(candidate.Tag, CloseLockReviewItem)
+                Return candidateItem IsNot Nothing AndAlso PathsAreSame(candidateItem.FilePath, completedPath)
+            End Function)
+        Dim item As CloseLockReviewItem = If(row Is Nothing, Nothing, TryCast(row.Tag, CloseLockReviewItem))
+
+        Try
+            If item Is Nothing Then Exit Try
+
+            If Not success Then
+                'A discard can fail after changing one layer (for example SVN reverted the
+                'disk file but SOLIDWORKS could not reload it). Never turn that partial result
+                'into permission to release the lock. Keep the original actions available for
+                'a deliberate retry, but require the user to return to the document first.
+                item.IsSafeToUnlock = False
+                item.ResultText = If(String.IsNullOrWhiteSpace(errorMessage),
+                                     "Discard did not complete; no Release was attempted",
+                                     errorMessage)
+                row.Cells("Unlock").Value = If(item.IsStillLocked, "Return first", "Unlocked")
+                row.Cells("Result").Value = item.ResultText
+                row.Cells("Result").Style.ForeColor = Color.DarkRed
+                ApplyRowVisualState(row, item)
+                Exit Try
+            End If
+
+            Dim querySucceeded As Boolean = False
+            Dim refreshError As String = ""
+            Dim refreshed As CloseLockReviewItem = svnModule.refreshPathFromCloseReviewPublic(
+                completedPath,
+                querySucceeded,
+                refreshError
+            )
+
+            If Not querySucceeded Then
+                'The discard routine verified both the SOLIDWORKS SaveFlag and local SVN
+                'status before reporting success, but a failed lock refresh means we no longer
+                'know whether Release is applicable. Fail closed until the next review/refresh.
+                item.IsSafeToUnlock = False
+                item.CanCommit = False
+                item.CanRevert = False
+                item.StateText = "Discarded; lock status needs refresh"
+                item.ResultText = If(String.IsNullOrWhiteSpace(refreshError),
+                                     "Return to SOLIDWORKS and refresh SVN status",
+                                     refreshError)
+            ElseIf refreshed Is Nothing Then
+                item.IsSafeToUnlock = True
+                item.IsStillLocked = False
+                item.CanCommit = False
+                item.CanRevert = False
+                item.StateText = "Changes discarded; no lock held"
+                item.ResultText = "Discarded successfully"
+            Else
+                item.IsSafeToUnlock = refreshed.IsSafeToUnlock
+                item.IsStillLocked = refreshed.IsStillLocked
+                item.CanCommit = refreshed.CanCommit
+                item.CanRevert = refreshed.CanRevert
+                item.StateText = refreshed.StateText
+                item.ResultText = If(refreshed.IsSafeToUnlock,
+                                     "Changes discarded; lock retained",
+                                     refreshed.ResultText)
+            End If
+
+            row.Cells("State").Value = item.StateText
+            row.Cells("Commit").Value = If(item.CanCommit, "Commit", "—")
+            row.Cells("Revert").Value = If(item.CanRevert, "Revert", "—")
+            row.Cells("Unlock").Value = If(item.IsStillLocked AndAlso item.IsSafeToUnlock,
+                                            "Unlock",
+                                            If(item.IsStillLocked, "Return first", "Unlocked"))
+            row.Cells("Result").Value = item.ResultText
+            ApplyRowVisualState(row, item)
+        Finally
+            pendingRevertPath = ""
+            unlockInProgress = False
+            UseWaitCursor = False
+            returnButton.Enabled = True
+            continueButton.Enabled = True
+            grid.Enabled = True
             UpdateFooter()
         End Try
     End Sub
@@ -597,10 +693,17 @@ Public Class CloseLockReviewForm
         If unsafeCount > 0 Then
             footerLabel.Text &=
                 "    Attention required: " & unsafeCount.ToString() &
-                " file(s) still have local SVN changes."
+                " file(s) still have unsaved or local changes."
             footerLabel.ForeColor = Color.DarkRed
+
+            continueButton.Text = If(closingSolidWorks,
+                                     "Discard remaining changes and close SOLIDWORKS",
+                                     "Discard remaining changes and close file")
         Else
             footerLabel.ForeColor = SystemColors.ControlText
+            continueButton.Text = If(closingSolidWorks,
+                                     "Close SOLIDWORKS — no further saves",
+                                     "Close file — no further saves")
         End If
     End Sub
 
@@ -614,6 +717,24 @@ Public Class CloseLockReviewForm
 
     Private Sub ContinueButton_Click(sender As Object, e As EventArgs)
         If unlockInProgress Then Exit Sub
+
+        Dim unsafeCount As Integer = reviewItems.FindAll(Function(item) Not item.IsSafeToUnlock).Count
+
+        If unsafeCount > 0 Then
+            Dim targetName As String = If(closingSolidWorks, "SOLIDWORKS", "this file")
+            Dim response As DialogResult = MessageBox.Show(
+                Me,
+                unsafeCount.ToString() & " file(s) still have unsaved or local changes." & Environment.NewLine & Environment.NewLine &
+                "Close " & targetName & " and discard any changes that exist only in SOLIDWORKS? " &
+                "Saved local SVN changes will remain on disk for the next session.",
+                "Discard remaining changes?",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2
+            )
+
+            If response <> DialogResult.Yes Then Return
+        End If
 
         _decision = CloseLockReviewDecision.ContinueClose
         DialogResult = DialogResult.OK
@@ -633,5 +754,6 @@ Public Class CloseLockReviewForm
 
     Private Sub CloseLockReviewForm_FormClosed(sender As Object, e As FormClosedEventArgs)
         RemoveHandler svnModule.CloseReviewCommitCompleted, AddressOf CloseReviewCommitCompleted
+        RemoveHandler svnModule.CloseReviewRevertCompleted, AddressOf CloseReviewRevertCompleted
     End Sub
 End Class

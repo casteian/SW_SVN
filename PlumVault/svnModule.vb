@@ -41,11 +41,13 @@ Public Module svnModule
     Private lockReviewMessageShowing As Boolean = False
     Private controlledApplicationCloseQueued As Boolean = False
     Private controlledApplicationExitInProgress As Boolean = False
-    Private controlledDocumentCloseInProgress As Boolean = False
+    Private controlledApplicationNativeCloseCallInProgress As Boolean = False
+    Private controlledDocumentCloseNativeCallInProgress As Boolean = False
     Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
     Private unsafeForceCloseApprovedUntil As DateTime = DateTime.MinValue
     Private documentLockReviewApprovedUntil As DateTime = DateTime.MinValue
     Private documentLockReviewApprovedPath As String = ""
+    Private documentLockReviewApprovedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private applicationLockReviewApprovedUntil As DateTime = DateTime.MinValue
     Private applicationLockReviewApprovedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private statusCacheByNormalizedPath As New Dictionary(Of String, SVNStatus.filePpty)(StringComparer.OrdinalIgnoreCase)
@@ -54,10 +56,14 @@ Public Module svnModule
     Private asyncGetLocksInProgress As Boolean = False
     Private asyncCommitInProgress As Boolean = False
     Private asyncCleanupInProgress As Boolean = False
+    Private closeReviewRevertInProgress As Boolean = False
 
     'The close-review table remains open while its TortoiseSVN commit runs. This event is
     'raised on the SOLIDWORKS UI thread so that table can refresh the affected row in place.
     Public Event CloseReviewCommitCompleted(ByVal committedPaths() As String,
+                                            ByVal success As Boolean,
+                                            ByVal errorMessage As String)
+    Public Event CloseReviewRevertCompleted(ByVal revertedPath As String,
                                             ByVal success As Boolean,
                                             ByVal errorMessage As String)
     Private cachedConfiguredRepoPathForWorkingCopyRoot As String = ""
@@ -97,6 +103,7 @@ Public Module svnModule
         Public Property Depth As Integer = 0
         Public Property LastBeginUtc As DateTime = DateTime.MinValue
         Public Property WasDirtyAtOuterBegin As Boolean = False
+        Public Property SawGenericModifyNotify As Boolean = False
     End Class
 
     'If RegenPostNotify is ever lost (SOLIDWORKS errors out mid-rebuild, an exception, etc.)
@@ -105,6 +112,8 @@ Public Module svnModule
     'permanent, invisible loss of lock protection for the rest of the session.
     Private Const REBUILD_SUPPRESSION_STALE_MINUTES As Double = 30.0
     Private ReadOnly assemblyRebuildPaths As New Dictionary(Of String, AssemblyRebuildTracker)(StringComparer.OrdinalIgnoreCase)
+    Private Const COMPLETED_REBUILD_MODIFY_GRACE_SECONDS As Double = 10.0
+    Private ReadOnly completedAssemblyRebuildModifyUtcByPath As New Dictionary(Of String, DateTime)(StringComparer.OrdinalIgnoreCase)
 
     'A drawing opened alone (its referenced part/assembly not also opened) can silently show
     'stale views if someone else committed a newer revision of that geometry since this
@@ -154,16 +163,20 @@ Public Module svnModule
 
     'Edit Component is intercepted before SOLIDWORKS attempts to open the selected child for
     'write access. The SVN lock runs asynchronously; once the exact child has been made
-    'writable, the original edit is resumed with IAssemblyDoc.EditPart2. Only stable paths
-    'cross that asynchronous boundary so stale Component2 RCWs are never retained.
+    'writable, the original SOLIDWORKS command is replayed. Replaying the native command is
+    'important because the same UI action can mean Edit Part or Edit Assembly. Only stable
+    'paths cross that asynchronous boundary so stale Component2 RCWs are never retained.
     Private Class PendingInContextAutoEdit
         Public Property AssemblyPath As String = ""
         Public Property ChildPath As String = ""
         Public Property RequestedUtc As DateTime = DateTime.MinValue
+        Public Property RequestedCommand As Integer = 0
     End Class
 
     Private pendingInContextAutoEditRequest As PendingInContextAutoEdit = Nothing
     Private inContextAutoEditReplayInProgress As Boolean = False
+    Private inContextExitTransitionInProgress As Boolean = False
+    Private ReadOnly inContextExitTransitionQueuedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
     'Display-only commands can also raise the assembly's generic ModifyNotify. Remember the
     'purpose-built visibility/appearance event briefly so the generic post-event does not
@@ -184,10 +197,14 @@ Public Module svnModule
 
     Private Const SW_COMMAND_SAVE As Integer = 2
     Private Const SW_COMMAND_SAVE_AS As Integer = 620
-    'Values verified against the installed SolidWorks.Interop.swcommands.dll. Different UI
-    'entry points use these two commands for the same in-context Edit Component operation.
+    'Values verified against the installed SolidWorks.Interop.swcommands.dll. Edit Component
+    'has two UI command IDs; Edit Feature is intercepted separately for deep tree selections.
     Private Const SW_COMMAND_EDIT_COMPONENT As Integer = 119
+    Private Const SW_COMMAND_EDIT_FEATURE As Integer = 623
     Private Const SW_COMMAND_EDIT_PART As Integer = 965
+    Private Const SW_COMMAND_INSERT_FEATURE_FOLDER As Integer = 1829
+    Private Const SW_COMMAND_CREATE_EMPTY_FEATURE_FOLDER As Integer = 1906
+    Private Const SW_COMMAND_EDIT_FEATURE_FOLDER As Integer = 2390
 
     Public sSVNPath As String '= "C:\Program Files\TortoiseSVN\bin\svn.exe"
     Public sTortPath As String '= "C:\Users\benne\Documents\SVN\TortoiseProc.exe"
@@ -364,7 +381,11 @@ Public Module svnModule
     '==========================================================================
 
     Private Function automaticSaveEventsSuppressed() As Boolean
-        Return internalSolidWorksSaveDepth > 0 OrElse automaticSaveCommitPreparing OrElse legacyImportInProgress OrElse cadRelocationInProgress
+        Return internalSolidWorksSaveDepth > 0 OrElse
+               automaticSaveCommitPreparing OrElse
+               legacyImportInProgress OrElse
+               cadRelocationInProgress OrElse
+               closeReviewRevertInProgress
     End Function
 
 
@@ -372,8 +393,18 @@ Public Module svnModule
     ' ASSEMBLY EDIT PROTECTION
     '==========================================================================
 
-    Private Function assemblyEditGuardSuppressed(ByVal assemblyDocument As ModelDoc2) As Boolean
-        If automaticSaveEventsSuppressed() OrElse assemblyGuardUndoInProgress Then Return True
+    Private Function assemblyEditGuardSuppressed(ByVal assemblyDocument As ModelDoc2,
+                                                   Optional ByVal ignoreActiveRebuild As Boolean = False) As Boolean
+        If automaticSaveEventsSuppressed() OrElse
+           assemblyGuardUndoInProgress OrElse
+           controlledApplicationNativeCloseCallInProgress OrElse
+           controlledDocumentCloseNativeCallInProgress OrElse
+           inContextExitTransitionInProgress Then Return True
+
+        'Purpose-built user-edit events (move/add/delete/dimension) remain authoritative even
+        'when SOLIDWORKS happens to wrap that edit in a RegenNotify bracket. Only the generic
+        'ModifyNotify path may borrow rebuild suppression.
+        If ignoreActiveRebuild Then Return False
 
         Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
         If String.IsNullOrWhiteSpace(assemblyKey) Then Return False
@@ -406,12 +437,16 @@ Public Module svnModule
             End If
 
             If tracker.Depth = 0 Then
+                completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+
                 Try
                     tracker.WasDirtyAtOuterBegin = assemblyDocument.GetSaveFlag()
                 Catch
                     'Unknown pre-rebuild state is treated as dirty so close protection remains conservative.
                     tracker.WasDirtyAtOuterBegin = True
                 End Try
+
+                tracker.SawGenericModifyNotify = False
             End If
 
             tracker.Depth += 1
@@ -423,6 +458,7 @@ Public Module svnModule
         Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
         If String.IsNullOrWhiteSpace(assemblyKey) Then Exit Sub
         Dim completedCleanStartRebuild As Boolean = False
+        Dim needsPostRebuildModifyAllowance As Boolean = False
 
         SyncLock assemblyGuardSync
             Dim tracker As AssemblyRebuildTracker = Nothing
@@ -430,11 +466,22 @@ Public Module svnModule
 
             If tracker.Depth <= 1 Then
                 completedCleanStartRebuild = Not tracker.WasDirtyAtOuterBegin
+                needsPostRebuildModifyAllowance = completedCleanStartRebuild AndAlso Not tracker.SawGenericModifyNotify
                 assemblyRebuildPaths.Remove(assemblyKey)
+
+                If needsPostRebuildModifyAllowance Then
+                    completedAssemblyRebuildModifyUtcByPath(assemblyKey) = DateTime.UtcNow
+                Else
+                    completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+                End If
             Else
                 tracker.Depth -= 1
             End If
         End SyncLock
+
+        If needsPostRebuildModifyAllowance Then
+            queueAssemblyRebuildGenericModifyAllowanceExpiry(assemblyKey)
+        End If
 
         If Not completedCleanStartRebuild Then Exit Sub
 
@@ -455,6 +502,87 @@ Public Module svnModule
         End Try
     End Sub
 
+    Private Sub queueAssemblyRebuildGenericModifyAllowanceExpiry(ByVal assemblyKey As String)
+        If String.IsNullOrWhiteSpace(assemblyKey) Then Exit Sub
+
+        Dim firstTurn As New MethodInvoker(
+            Sub()
+                Try
+                    If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
+                        SyncLock assemblyGuardSync
+                            completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+                        End SyncLock
+                        Exit Sub
+                    End If
+
+                    'Allow the native RegenPostNotify call stack and one subsequent SOLIDWORKS
+                    'UI turn to deliver its paired ModifyNotify. A later human edit must never
+                    'inherit a ten-second rebuild exception merely because no ModifyNotify came.
+                    myUserControl.BeginInvoke(
+                        New MethodInvoker(
+                            Sub()
+                                SyncLock assemblyGuardSync
+                                    completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+                                End SyncLock
+                            End Sub
+                        )
+                    )
+                Catch
+                    SyncLock assemblyGuardSync
+                        completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+                    End SyncLock
+                End Try
+            End Sub
+        )
+
+        Try
+            If myUserControl IsNot Nothing AndAlso
+               Not myUserControl.IsDisposed AndAlso
+               myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(firstTurn)
+            Else
+                SyncLock assemblyGuardSync
+                    completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+                End SyncLock
+            End If
+        Catch
+            SyncLock assemblyGuardSync
+                completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+            End SyncLock
+        End Try
+    End Sub
+
+    Private Function consumeAssemblyRebuildGenericModifyAllowance(ByVal assemblyDocument As ModelDoc2) As Boolean
+        Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyKey) Then Return False
+
+        SyncLock assemblyGuardSync
+            Dim activeTracker As AssemblyRebuildTracker = Nothing
+
+            If assemblyRebuildPaths.TryGetValue(assemblyKey, activeTracker) AndAlso activeTracker IsNot Nothing Then
+                activeTracker.SawGenericModifyNotify = True
+                Return True
+            End If
+
+            Dim completedUtc As DateTime = DateTime.MinValue
+            If Not completedAssemblyRebuildModifyUtcByPath.TryGetValue(assemblyKey, completedUtc) Then Return False
+
+            completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+
+            Dim ageSeconds As Double = (DateTime.UtcNow - completedUtc).TotalSeconds
+            Return ageSeconds >= 0 AndAlso ageSeconds <= COMPLETED_REBUILD_MODIFY_GRACE_SECONDS
+        End SyncLock
+    End Function
+
+    Private Sub clearAssemblyRebuildGenericModifyAllowance(ByVal assemblyDocument As ModelDoc2)
+        Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyKey) Then Exit Sub
+
+        SyncLock assemblyGuardSync
+            completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+        End SyncLock
+    End Sub
+
     Private Function getAssemblyEditTargetDocumentSafe(ByVal assemblyDocument As ModelDoc2) As ModelDoc2
         If assemblyDocument Is Nothing Then Return Nothing
 
@@ -462,7 +590,45 @@ Public Module svnModule
             Dim swAssembly As AssemblyDoc = TryCast(assemblyDocument, AssemblyDoc)
             If swAssembly Is Nothing Then Return Nothing
 
-            Return TryCast(swAssembly.GetEditTarget(), ModelDoc2)
+            Dim editTarget As ModelDoc2 = TryCast(swAssembly.GetEditTarget(), ModelDoc2)
+            If editTarget Is Nothing Then Return Nothing
+
+            'At the top level of Edit Assembly, some SOLIDWORKS releases return the
+            'assembly itself from GetEditTarget. That is not an in-context child edit.
+            'Treating it as one makes every close state machine call EditAssembly forever
+            'because the owner and target can never separate (ownerPath|ownerPath).
+            If Object.ReferenceEquals(editTarget, assemblyDocument) Then Return Nothing
+
+            Try
+                If iSwApp IsNot Nothing AndAlso
+                   iSwApp.IsSame(assemblyDocument, editTarget) = swObjectEquality.swObjectSame Then
+                    Return Nothing
+                End If
+            Catch
+            End Try
+
+            Dim ownerPath As String = ""
+            Dim targetPath As String = ""
+
+            Try
+                ownerPath = assemblyDocument.GetPathName()
+            Catch
+                ownerPath = ""
+            End Try
+
+            Try
+                targetPath = editTarget.GetPathName()
+            Catch
+                targetPath = ""
+            End Try
+
+            If Not String.IsNullOrWhiteSpace(ownerPath) AndAlso
+               Not String.IsNullOrWhiteSpace(targetPath) AndAlso
+               pathsAreSame(ownerPath, targetPath) Then
+                Return Nothing
+            End If
+
+            Return editTarget
         Catch
             Return Nothing
         End Try
@@ -854,8 +1020,230 @@ Public Module svnModule
         End Try
     End Sub
 
+    Private Function assemblyHasActiveInContextEdit(ByVal assemblyDocument As ModelDoc2) As Boolean
+        If assemblyDocument Is Nothing Then Return False
+
+        Dim editTarget As ModelDoc2 = getAssemblyEditTargetDocumentSafe(assemblyDocument)
+        If editTarget IsNot Nothing Then
+            Try
+                Dim ownerPath As String = assemblyDocument.GetPathName()
+                Dim targetPath As String = editTarget.GetPathName()
+
+                If Not String.IsNullOrWhiteSpace(targetPath) AndAlso
+                   (String.IsNullOrWhiteSpace(ownerPath) OrElse Not pathsAreSame(ownerPath, targetPath)) Then
+                    Dim selectedChildPath As String = getSelectedExternalPhysicalChildPathSafe(assemblyDocument)
+
+                    'While editing a subassembly, the user can select a deeper child and invoke
+                    'Edit Part again. That is a drill-down request, not the toggle that exits the
+                    'current context; let the normal child-lock pipeline handle it.
+                    If Not String.IsNullOrWhiteSpace(selectedChildPath) AndAlso
+                       Not pathsAreSame(selectedChildPath, targetPath) Then Return False
+
+                    Return True
+                End If
+            Catch
+                Return True
+            End Try
+        End If
+
+        'Command interception must use the live edit target. The tracked event session is
+        'allowed to protect delayed ModifyNotify events, but a lost End notification must
+        'never turn a later, unrelated Edit Part click into an "exit" command.
+        Return False
+    End Function
+
+    Private Function queueReadOnlyParentInContextExit(ByVal assemblyDocument As ModelDoc2) As Boolean
+        If assemblyDocument Is Nothing OrElse myUserControl Is Nothing Then Return False
+        If inContextExitTransitionInProgress Then Return True
+
+        Dim isReadOnly As Boolean = False
+
+        Try
+            isReadOnly = assemblyDocument.IsOpenedReadOnly()
+        Catch
+            isReadOnly = False
+        End Try
+
+        'A writable parent can use the native toggle without any intervention.
+        If Not isReadOnly Then Return False
+
+        Dim assemblyPath As String = getAssemblyPathKeySafe(assemblyDocument)
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Return False
+
+        SyncLock assemblyGuardSync
+            If inContextExitTransitionQueuedPaths.Contains(assemblyPath) Then Return True
+            inContextExitTransitionQueuedPaths.Add(assemblyPath)
+        End SyncLock
+
+        Try
+            myUserControl.BeginInvoke(
+                New MethodInvoker(
+                    Sub()
+                        Try
+                            Dim currentAssembly As ModelDoc2 = getOpenModelByPathSafe(assemblyPath)
+                            If currentAssembly Is Nothing Then currentAssembly = assemblyDocument
+                            If currentAssembly Is Nothing OrElse Not assemblyHasActiveInContextEdit(currentAssembly) Then Exit Sub
+
+                            exitAssemblyInContextEditWithoutSavingParent(currentAssembly)
+                        Catch ex As Exception
+                            Try
+                                iSwApp.SendMsgToUser2(
+                                    "Could not safely leave Edit Part/Edit Assembly mode." & vbCrLf & vbCrLf & ex.Message,
+                                    swMessageBoxIcon_e.swMbWarning,
+                                    swMessageBoxBtn_e.swMbOk
+                                )
+                            Catch
+                            End Try
+                        Finally
+                            SyncLock assemblyGuardSync
+                                inContextExitTransitionQueuedPaths.Remove(assemblyPath)
+                            End SyncLock
+                        End Try
+                    End Sub
+                )
+            )
+            Return True
+        Catch
+            SyncLock assemblyGuardSync
+                inContextExitTransitionQueuedPaths.Remove(assemblyPath)
+            End SyncLock
+            Return False
+        End Try
+    End Function
+
+    Private Sub exitAssemblyInContextEditWithoutSavingParent(ByVal assemblyDocument As ModelDoc2)
+        If assemblyDocument Is Nothing Then Exit Sub
+
+        Dim assemblyDoc As AssemblyDoc = TryCast(assemblyDocument, AssemblyDoc)
+        If assemblyDoc Is Nothing Then Exit Sub
+
+        Dim assemblyPath As String = getAssemblyPathKeySafe(assemblyDocument)
+        Dim parentWasDirty As Boolean = True
+        Dim parentWasReadOnly As Boolean = False
+        Dim originalAttributes As FileAttributes = FileAttributes.Normal
+        Dim haveOriginalAttributes As Boolean = False
+        Dim parentHasLock As Boolean = False
+
+        Try
+            parentWasDirty = assemblyDocument.GetSaveFlag()
+        Catch
+            parentWasDirty = True
+        End Try
+
+        Try
+            parentWasReadOnly = assemblyDocument.IsOpenedReadOnly()
+        Catch
+            parentWasReadOnly = False
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(assemblyPath) AndAlso File.Exists(assemblyPath) Then
+            Try
+                originalAttributes = File.GetAttributes(assemblyPath)
+                haveOriginalAttributes = True
+            Catch
+            End Try
+
+            parentHasLock = userHasLocalSvnLockTokenForPath(assemblyPath, allowCachedToken:=False)
+        End If
+
+        inContextExitTransitionInProgress = True
+        Dim restoreReadOnlyDeferred As Boolean = False
+
+        Try
+            If parentWasReadOnly Then
+                If haveOriginalAttributes Then
+                    File.SetAttributes(assemblyPath, originalAttributes And Not FileAttributes.ReadOnly)
+                End If
+
+                If Not assemblyDocument.SetReadOnlyState(False) Then
+                    Throw New InvalidOperationException("SOLIDWORKS would not temporarily release the parent document's read-only state.")
+                End If
+            End If
+
+            'This changes only the active editing context. PlumVault never saves the parent
+            'during this transition. SOLIDWORKS completes the context change on its next UI
+            'turn, so an unlocked parent must remain temporarily writable until that turn.
+            assemblyDoc.EditAssembly()
+
+            If parentWasReadOnly AndAlso Not parentHasLock Then
+                Dim restoreAction As New MethodInvoker(
+                    Sub()
+                        Try
+                            Dim currentAssembly As ModelDoc2 = getOpenModelByPathSafe(assemblyPath)
+                            If currentAssembly Is Nothing Then currentAssembly = assemblyDocument
+
+                            If currentAssembly IsNot Nothing Then
+                                Try
+                                    currentAssembly.SetReadOnlyState(True)
+                                Catch
+                                End Try
+                            End If
+
+                            If haveOriginalAttributes AndAlso File.Exists(assemblyPath) Then
+                                Try
+                                    File.SetAttributes(assemblyPath, originalAttributes Or FileAttributes.ReadOnly)
+                                Catch
+                                End Try
+                            End If
+                        Finally
+                            inContextExitTransitionInProgress = False
+                        End Try
+                    End Sub
+                )
+
+                If myUserControl IsNot Nothing AndAlso
+                   Not myUserControl.IsDisposed AndAlso
+                   myUserControl.IsHandleCreated Then
+                    myUserControl.BeginInvoke(restoreAction)
+                    restoreReadOnlyDeferred = True
+                End If
+            End If
+        Catch
+            'If the native transition itself fails, restore the original access state before
+            'letting the caller report the failure.
+            If parentWasReadOnly AndAlso Not parentHasLock Then
+                Try
+                    assemblyDocument.SetReadOnlyState(True)
+                Catch
+                End Try
+
+                If haveOriginalAttributes AndAlso File.Exists(assemblyPath) Then
+                    Try
+                        File.SetAttributes(assemblyPath, originalAttributes Or FileAttributes.ReadOnly)
+                    Catch
+                    End Try
+                End If
+            End If
+
+            Throw
+        Finally
+            If Not restoreReadOnlyDeferred Then inContextExitTransitionInProgress = False
+        End Try
+
+        If Not parentWasDirty Then
+            markAssemblyGuardFalseDirtyCandidate(assemblyDocument)
+        End If
+
+        writeOperationLog("Exited in-context edit without saving read-only parent: " & assemblyPath)
+    End Sub
+
     Public Function handleSolidWorksCommandOpenPreNotifyPublic(ByVal command As Integer,
                                                                 ByVal userCommand As Integer) As Integer
+        If command = SW_COMMAND_INSERT_FEATURE_FOLDER OrElse
+           command = SW_COMMAND_CREATE_EMPTY_FEATURE_FOLDER OrElse
+           command = SW_COMMAND_EDIT_FEATURE_FOLDER Then
+            Dim activeAssembly As ModelDoc2 = Nothing
+
+            Try
+                activeAssembly = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+                If activeAssembly IsNot Nothing AndAlso
+                   activeAssembly.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                    Return blockAssemblyOwnedEditPrePublic(activeAssembly, "changing FeatureManager folders")
+                End If
+            Catch
+            End Try
+        End If
+
         Dim editResult As Integer = handleInContextEditCommandPreNotify(command)
         If editResult <> 0 Then Return editResult
 
@@ -863,21 +1251,59 @@ Public Module svnModule
     End Function
 
     Private Function handleInContextEditCommandPreNotify(ByVal command As Integer) As Integer
-        If command <> SW_COMMAND_EDIT_COMPONENT AndAlso command <> SW_COMMAND_EDIT_PART Then Return 0
+        If command <> SW_COMMAND_EDIT_COMPONENT AndAlso
+           command <> SW_COMMAND_EDIT_PART AndAlso
+           command <> SW_COMMAND_EDIT_FEATURE Then Return 0
         If inContextAutoEditReplayInProgress Then Return 0
         If iSwApp Is Nothing Then Return 0
 
-        Dim assemblyModel As ModelDoc2 = Nothing
+        Dim activeModel As ModelDoc2 = Nothing
 
         Try
-            assemblyModel = TryCast(iSwApp.ActiveDoc, ModelDoc2)
-            If assemblyModel Is Nothing OrElse
-               assemblyModel.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Return 0
+            activeModel = TryCast(iSwApp.ActiveDoc, ModelDoc2)
         Catch
             Return 0
         End Try
 
-        Dim childPath As String = getSelectedExternalPhysicalChildPathSafe(assemblyModel)
+        If activeModel Is Nothing Then Return 0
+
+        Dim activeType As Integer
+
+        Try
+            activeType = activeModel.GetType()
+        Catch
+            Return 0
+        End Try
+
+        Dim isAssemblyContext As Boolean = (activeType = swDocumentTypes_e.swDocASSEMBLY)
+
+        'The same Edit Component command is a toggle. When a read-only parent is already
+        'hosting an in-context edit, letting the native exit command run produces SOLIDWORKS'
+        '"parent is read-only" dialog. Cancel it and perform the bounded no-save transition.
+        If isAssemblyContext AndAlso
+           command <> SW_COMMAND_EDIT_FEATURE AndAlso
+           assemblyHasActiveInContextEdit(activeModel) AndAlso
+           queueReadOnlyParentInContextExit(activeModel) Then
+            Return -1
+        End If
+
+        If Not isAssemblyContext AndAlso
+           Not (command = SW_COMMAND_EDIT_FEATURE AndAlso activeType = swDocumentTypes_e.swDocPART) Then Return 0
+
+        Dim childPath As String = ""
+
+        If isAssemblyContext Then
+            'GetSelectedObjectsComponent4 resolves the owning Component2 even when the user
+            'right-clicked a feature several levels down in the assembly tree.
+            childPath = getSelectedExternalPhysicalChildPathSafe(activeModel)
+        Else
+            Try
+                childPath = activeModel.GetPathName()
+            Catch
+                childPath = ""
+            End Try
+        End If
+
         If String.IsNullOrWhiteSpace(childPath) Then Return 0
         If Not isPathInsideLocalRepo(childPath) Then Return 0
         If isNewUnversionedOrAddedFile(childPath) Then Return 0
@@ -890,10 +1316,12 @@ Public Module svnModule
             Return -1
         End If
 
-        Dim assemblyPath As String = getAssemblyPathKeySafe(assemblyModel)
+        Dim assemblyPath As String = getAssemblyPathKeySafe(activeModel)
         If String.IsNullOrWhiteSpace(assemblyPath) Then Return 0
 
-        rememberInContextEditDirtyBaseline(assemblyModel, assemblyPath)
+        If isAssemblyContext AndAlso command <> SW_COMMAND_EDIT_FEATURE Then
+            rememberInContextEditDirtyBaseline(activeModel, assemblyPath)
+        End If
 
         'Do not trust the UI status cache here: the user may have unlocked through Explorer.
         'Edit access requires the working copy's live local K token.
@@ -923,7 +1351,7 @@ Public Module svnModule
             Return 0
         End If
 
-        If Not queueInContextAutoEditLockRequest(assemblyPath, childPath) Then
+        If Not queueInContextAutoEditLockRequest(assemblyPath, childPath, command) Then
             showInContextAutoEditFailure(
                 childPath,
                 "Another lock or SOLIDWORKS document operation is still finishing."
@@ -937,15 +1365,26 @@ Public Module svnModule
     End Function
 
     Private Function queueInContextAutoEditLockRequest(ByVal assemblyPath As String,
-                                                        ByVal childPath As String) As Boolean
+                                                        ByVal childPath As String,
+                                                        Optional ByVal requestedCommand As Integer = SW_COMMAND_EDIT_PART) As Boolean
         If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then Return False
         If String.IsNullOrWhiteSpace(assemblyPath) OrElse String.IsNullOrWhiteSpace(childPath) Then Return False
 
         If pendingInContextAutoEditRequest IsNot Nothing Then
-            If (DateTime.UtcNow - pendingInContextAutoEditRequest.RequestedUtc).TotalSeconds <= 60.0 AndAlso
-               pathsAreSame(pendingInContextAutoEditRequest.AssemblyPath, assemblyPath) AndAlso
-               pathsAreSame(pendingInContextAutoEditRequest.ChildPath, childPath) Then
-                Return True
+            Dim pendingAgeSeconds As Double =
+                (DateTime.UtcNow - pendingInContextAutoEditRequest.RequestedUtc).TotalSeconds
+
+            If pendingAgeSeconds >= 0 AndAlso pendingAgeSeconds <= 60.0 Then
+                If pathsAreSame(pendingInContextAutoEditRequest.AssemblyPath, assemblyPath) AndAlso
+                   pathsAreSame(pendingInContextAutoEditRequest.ChildPath, childPath) AndAlso
+                   pendingInContextAutoEditRequest.RequestedCommand = requestedCommand Then
+                    Return True
+                End If
+
+                'Preserve the first request. Replacing it while svn.exe is still obtaining its
+                'lock strands that successful lock with no command replay and makes rapid edits
+                'look random to the user.
+                Return False
             End If
 
             pendingInContextAutoEditRequest = Nothing
@@ -954,7 +1393,8 @@ Public Module svnModule
         pendingInContextAutoEditRequest = New PendingInContextAutoEdit With {
             .AssemblyPath = assemblyPath,
             .ChildPath = childPath,
-            .RequestedUtc = DateTime.UtcNow
+            .RequestedUtc = DateTime.UtcNow,
+            .RequestedCommand = requestedCommand
         }
 
         Try
@@ -1000,7 +1440,8 @@ Public Module svnModule
     End Function
 
     Private Function buildInContextAutoEditFailureMessage(ByVal childPath As String,
-                                                           ByVal detail As String) As String
+                                                           ByVal detail As String,
+                                                           Optional ByVal writeAccessWasObtained As Boolean = False) As String
         Dim childName As String = childPath
 
         Try
@@ -1008,25 +1449,41 @@ Public Module svnModule
         Catch
         End Try
 
-        Dim message As String =
-            "Could not get write access for Edit Part:" & vbCrLf & vbCrLf &
-            childName
+        Dim operationName As String =
+            If(String.Equals(Path.GetExtension(childPath), ".SLDASM", StringComparison.OrdinalIgnoreCase),
+               "Edit Assembly",
+               "Edit Part")
+
+        Dim message As String
+        If writeAccessWasObtained Then
+            message = "Could not start " & operationName & ":" & vbCrLf & vbCrLf & childName
+        Else
+            message = "Could not get write access for " & operationName & ":" & vbCrLf & vbCrLf & childName
+        End If
 
         If Not String.IsNullOrWhiteSpace(detail) Then
             message &= vbCrLf & vbCrLf & detail.Trim()
         End If
 
-        message &= vbCrLf & vbCrLf &
-            "Click Sync to refresh the SVN lock and revision status. If the file is out of date, " &
-            "use Get Latest, then select the component and try Edit Part again."
+        If writeAccessWasObtained Then
+            message &= vbCrLf & vbCrLf &
+                "The SVN lock is still held by you. Reselect the item and try " & operationName &
+                " again. If SOLIDWORKS still shows it as read-only, click Sync and reopen that document."
+        Else
+            message &= vbCrLf & vbCrLf &
+                "Click Sync to refresh the SVN lock and revision status. If the file is out of date, " &
+                "use Get Latest, then select the component and try " & operationName & " again."
+        End If
 
         Return message
     End Function
 
-    Private Sub showInContextAutoEditFailure(ByVal childPath As String, ByVal detail As String)
+    Private Sub showInContextAutoEditFailure(ByVal childPath As String,
+                                              ByVal detail As String,
+                                              Optional ByVal writeAccessWasObtained As Boolean = False)
         Try
             iSwApp.SendMsgToUser2(
-                buildInContextAutoEditFailureMessage(childPath, detail),
+                buildInContextAutoEditFailureMessage(childPath, detail, writeAccessWasObtained),
                 swMessageBoxIcon_e.swMbStop,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -1044,7 +1501,7 @@ Public Module svnModule
             Exit Sub
         End If
 
-        'Always leave the timer/native-mutation callback before invoking EditPart2.
+        'Always leave the timer/native-mutation callback before replaying the native command.
         Try
             myUserControl.BeginInvoke(New MethodInvoker(AddressOf resumePendingInContextAutoEdit))
         Catch
@@ -1056,11 +1513,17 @@ Public Module svnModule
         Dim request As PendingInContextAutoEdit = pendingInContextAutoEditRequest
         If request Is Nothing Then Exit Sub
 
+        Dim childIsAssembly As Boolean =
+            String.Equals(Path.GetExtension(request.ChildPath), ".SLDASM", StringComparison.OrdinalIgnoreCase)
+        Dim operationName As String = If(request.RequestedCommand = SW_COMMAND_EDIT_FEATURE,
+                                         "Edit Feature",
+                                         If(childIsAssembly, "Edit Assembly", "Edit Part"))
+
         If (DateTime.UtcNow - request.RequestedUtc).TotalSeconds > 60.0 Then
             pendingInContextAutoEditRequest = Nothing
             iSwApp.SendMsgToUser2(
-                "The SVN lock was obtained, but too much time passed to safely resume Edit Part." & vbCrLf & vbCrLf &
-                "Select the component and click Edit Part again.",
+                "The SVN lock was obtained, but too much time passed to safely resume " & operationName & "." & vbCrLf & vbCrLf &
+                "Select the item and click " & operationName & " again.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -1080,21 +1543,33 @@ Public Module svnModule
             pendingInContextAutoEditRequest = Nothing
             iSwApp.SendMsgToUser2(
                 "The SVN lock was obtained. Because you changed document windows while it was running, " &
-                "PlumVault did not force SolidWorks into Edit Part mode." & vbCrLf & vbCrLf &
-                "Return to the assembly, select the component, and click Edit Part again.",
+                "PlumVault did not force SolidWorks into " & operationName & " mode." & vbCrLf & vbCrLf &
+                "Return to the original document, select the item, and click " & operationName & " again.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
             Exit Sub
         End If
 
-        Dim selectedChildPath As String = getSelectedExternalPhysicalChildPathSafe(assemblyModel)
+        Dim selectedChildPath As String = ""
+
+        Try
+            If assemblyModel.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                selectedChildPath = getSelectedExternalPhysicalChildPathSafe(assemblyModel)
+            ElseIf request.RequestedCommand = SW_COMMAND_EDIT_FEATURE AndAlso
+                   assemblyModel.GetType() = swDocumentTypes_e.swDocPART Then
+                selectedChildPath = assemblyModel.GetPathName()
+            End If
+        Catch
+            selectedChildPath = ""
+        End Try
+
         If Not pathsAreSame(selectedChildPath, request.ChildPath) Then
             pendingInContextAutoEditRequest = Nothing
             iSwApp.SendMsgToUser2(
-                "The SVN lock was obtained. Because the component selection changed while it was running, " &
-                "PlumVault did not force SolidWorks into Edit Part mode." & vbCrLf & vbCrLf &
-                "Select the component and click Edit Part again.",
+                "The SVN lock was obtained. Because the selection changed while it was running, " &
+                "PlumVault did not force SolidWorks into " & operationName & " mode." & vbCrLf & vbCrLf &
+                "Select the item and click " & operationName & " again.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -1126,22 +1601,29 @@ Public Module svnModule
         inContextAutoEditReplayInProgress = True
 
         Try
-            Dim assemblyDocument As AssemblyDoc = TryCast(assemblyModel, AssemblyDoc)
-            If assemblyDocument Is Nothing Then Throw New InvalidOperationException("The active document is no longer an assembly.")
+            Dim replayCommand As Integer = request.RequestedCommand
 
-            Dim information As Integer = 0
-            Dim editStatus As Integer = assemblyDocument.EditPart2(True, False, information)
+            'Edit Part (965) cannot enter a selected subassembly and returns status -1. The
+            'general Edit Component command delegates correctly to Edit Assembly for SLDASM.
+            If childIsAssembly AndAlso replayCommand = SW_COMMAND_EDIT_PART Then
+                replayCommand = SW_COMMAND_EDIT_COMPONENT
+            End If
 
-            If editStatus <> CInt(swEditPartCommandStatus_e.swEditPartSuccessful) Then
+            If Not iSwApp.RunCommand(replayCommand, "") Then
                 showInContextAutoEditFailure(
                     request.ChildPath,
-                    "SolidWorks declined Edit Part after the lock was obtained (status " & editStatus.ToString() & ")."
+                    "SOLIDWORKS declined the edit command after the lock and writable state were verified.",
+                    writeAccessWasObtained:=True
                 )
             Else
-                writeOperationLog("Edit Component resumed after lock/write verification: " & request.ChildPath)
+                writeOperationLog(operationName & " resumed after lock/write verification: " & request.ChildPath)
             End If
         Catch ex As Exception
-            showInContextAutoEditFailure(request.ChildPath, "SolidWorks could not resume Edit Part: " & ex.Message)
+            showInContextAutoEditFailure(
+                request.ChildPath,
+                "SOLIDWORKS could not resume " & operationName & ": " & ex.Message,
+                writeAccessWasObtained:=True
+            )
         Finally
             inContextAutoEditReplayInProgress = False
         End Try
@@ -1202,6 +1684,9 @@ Public Module svnModule
             inContextEditSessionByAssemblyPath.Remove(assemblyKey)
             pendingInContextDirtyBaselineByAssemblyPath.Remove(assemblyKey)
             assemblyDisplayOnlyChangeUtcByPath.Remove(assemblyKey)
+            assemblyRebuildPaths.Remove(assemblyKey)
+            completedAssemblyRebuildModifyUtcByPath.Remove(assemblyKey)
+            inContextExitTransitionQueuedPaths.Remove(assemblyKey)
         End SyncLock
     End Sub
 
@@ -1247,7 +1732,12 @@ Public Module svnModule
             If session.EndedUtc = DateTime.MinValue Then
                 Dim ageSeconds As Double = (DateTime.UtcNow - session.BeganUtc).TotalSeconds
 
-                If allowRecentlyEndedEdit AndAlso ageSeconds >= 0 AndAlso ageSeconds <= 10.0 Then
+                'An active BeginInContextEditNotify session is process state, not a short-lived
+                'timing hint. A user can legitimately remain in Edit Part/Edit Assembly for
+                'hours; while that session is active, generic ModifyNotify events on any owner
+                'assembly belong to the separately file-backed child. Explicit structural
+                'events never request this fallback and therefore remain guarded normally.
+                If allowRecentlyEndedEdit AndAlso ageSeconds >= 0 AndAlso ageSeconds <= 4.0 * 60.0 * 60.0 Then
                     Return session.ChildPath
                 End If
 
@@ -1487,82 +1977,16 @@ Public Module svnModule
         If String.IsNullOrWhiteSpace(filePath) Then Return False
 
         Dim normalizedPath As String = normalizeFullPathSafe(filePath)
+        If Not documentCloseReviewIsApproved(normalizedPath) Then Return False
 
         SyncLock assemblyGuardSync
             If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedPath) Then Return True
             assemblyGuardControlledCloseQueuedPaths.Add(normalizedPath)
         End SyncLock
 
-        Dim closeAction As New System.Windows.Forms.MethodInvoker(
+        Dim closeAction As New MethodInvoker(
             Sub()
-                Try
-                    If Not documentCloseReviewIsApproved(normalizedPath) Then Exit Sub
-
-                    Dim currentDoc As ModelDoc2 = getOpenModelByPathSafe(normalizedPath)
-                    If currentDoc Is Nothing Then Exit Sub
-
-                    Dim documentName As String = ""
-
-                    Try
-                        documentName = currentDoc.GetTitle()
-                    Catch
-                        documentName = ""
-                    End Try
-
-                    If String.IsNullOrWhiteSpace(documentName) Then
-                        documentName = Path.GetFileName(normalizedPath)
-                    End If
-
-                    controlledDocumentCloseInProgress = True
-
-                    'CloseDoc explicitly closes a dirty document without saving it. This is
-                    'used only after the user chose Continue in PlumVault's review table.
-                    iSwApp.CloseDoc(documentName)
-
-                    'A part/assembly can remain loaded invisibly after its document window
-                    'closes because another open assembly or drawing still references it.
-                    'GetOpenDocumentByName/GetDocuments therefore cannot prove close failure.
-                    'Verify the user-visible context one UI turn later, after SOLIDWORKS has
-                    'finished removing the native view, and warn only if a visible window or
-                    'an active in-context edit of this exact file remains.
-                    Dim verifyCloseAction As New System.Windows.Forms.MethodInvoker(
-                        Sub()
-                            If cadPathStillHasVisibleDocumentContext(normalizedPath) Then
-                                iSwApp.SendMsgToUser2(
-                                    "SOLIDWORKS could not close " & Path.GetFileName(normalizedPath) & "." & vbCrLf & vbCrLf &
-                                    "Its document window or in-context edit is still active. Review it and try again.",
-                                    swMessageBoxIcon_e.swMbWarning,
-                                    swMessageBoxBtn_e.swMbOk
-                                )
-                            End If
-                        End Sub
-                    )
-
-                    Try
-                        If Not myUserControl.IsDisposed AndAlso myUserControl.IsHandleCreated Then
-                            myUserControl.BeginInvoke(verifyCloseAction)
-                        Else
-                            verifyCloseAction.Invoke()
-                        End If
-                    Catch
-                    End Try
-                Catch ex As Exception
-                    Try
-                        iSwApp.SendMsgToUser2(
-                            "SOLIDWORKS could not complete the reviewed document close." & vbCrLf & vbCrLf & ex.Message,
-                            swMessageBoxIcon_e.swMbWarning,
-                            swMessageBoxBtn_e.swMbOk
-                        )
-                    Catch
-                    End Try
-                Finally
-                    controlledDocumentCloseInProgress = False
-
-                    SyncLock assemblyGuardSync
-                        assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
-                        assemblyGuardFalseDirtyCandidatePaths.Remove(normalizedPath)
-                    End SyncLock
-                End Try
+                continueUserApprovedDocumentCloseWithoutSave(normalizedPath, 0, "", 0)
             End Sub
         )
 
@@ -1574,12 +1998,178 @@ Public Module svnModule
         Catch
         End Try
 
-        SyncLock assemblyGuardSync
-            assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
-        End SyncLock
+        finishUserApprovedDocumentClose(normalizedPath)
 
         Return False
     End Function
+
+    Private Sub continueUserApprovedDocumentCloseWithoutSave(ByVal normalizedPath As String,
+                                                               ByVal attempt As Integer,
+                                                               ByVal previousContextSignature As String,
+                                                               ByVal repeatedContextCount As Integer)
+        Try
+            Dim currentDoc As ModelDoc2 = getOpenModelByPathSafe(normalizedPath)
+            If currentDoc Is Nothing Then
+                finishUserApprovedDocumentClose(normalizedPath)
+                Exit Sub
+            End If
+
+            Dim ownerToExit As ModelDoc2 = Nothing
+            Dim contextSignature As String = ""
+
+            If tryGetInContextOwnerBlockingClose(normalizedPath, ownerToExit, contextSignature) Then
+                Dim sameContext As Boolean = String.Equals(
+                    contextSignature,
+                    previousContextSignature,
+                    StringComparison.OrdinalIgnoreCase
+                )
+                Dim nextRepeatedCount As Integer = If(sameContext, repeatedContextCount + 1, 0)
+
+                If attempt >= 64 OrElse nextRepeatedCount >= 24 Then
+                    Throw New InvalidOperationException(
+                        "SOLIDWORKS did not finish leaving Edit Part/Edit Assembly mode. " &
+                        "PlumVault left the document open so no work is lost."
+                    )
+                End If
+
+                If Not sameContext OrElse nextRepeatedCount Mod 4 = 0 Then
+                    activateAssemblyForContextExit(ownerToExit, contextSignature)
+                    exitAssemblyInContextEditWithoutSavingParent(ownerToExit)
+                    writeOperationLog("Queued in-context unwind before reviewed close: " & contextSignature)
+                End If
+
+                If myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
+                    Throw New InvalidOperationException("The PlumVault task pane closed before SOLIDWORKS completed the document close.")
+                End If
+
+                myUserControl.BeginInvoke(New MethodInvoker(Sub() continueUserApprovedDocumentCloseWithoutSave(normalizedPath, attempt + 1, contextSignature, nextRepeatedCount)))
+                Exit Sub
+            End If
+
+            Dim documentName As String = ""
+
+            Try
+                documentName = currentDoc.GetTitle()
+            Catch
+                documentName = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(documentName) Then documentName = Path.GetFileName(normalizedPath)
+
+            'CloseDoc is reached only after every owner/target edit relationship involving
+            'this exact file has disappeared. Referenced documents may remain loaded invisibly.
+            controlledDocumentCloseNativeCallInProgress = True
+            Try
+                iSwApp.CloseDoc(documentName)
+            Finally
+                controlledDocumentCloseNativeCallInProgress = False
+            End Try
+
+            Dim verifyCloseAction As New MethodInvoker(
+                Sub()
+                    Try
+                        If cadPathStillHasVisibleDocumentContext(normalizedPath) Then
+                            iSwApp.SendMsgToUser2(
+                                "SOLIDWORKS could not close " & Path.GetFileName(normalizedPath) & "." & vbCrLf & vbCrLf &
+                                "Its document window or in-context edit is still active. Review it and try again.",
+                                swMessageBoxIcon_e.swMbWarning,
+                                swMessageBoxBtn_e.swMbOk
+                            )
+                        End If
+                    Finally
+                        finishUserApprovedDocumentClose(normalizedPath)
+                    End Try
+                End Sub
+            )
+
+            If Not myUserControl.IsDisposed AndAlso myUserControl.IsHandleCreated Then
+                myUserControl.BeginInvoke(verifyCloseAction)
+            Else
+                verifyCloseAction.Invoke()
+            End If
+        Catch ex As Exception
+            writeOperationLog("Reviewed document close stopped: " & normalizedPath & " | " & ex.Message)
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "SOLIDWORKS could not complete the reviewed document close." & vbCrLf & vbCrLf & ex.Message,
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            finishUserApprovedDocumentClose(normalizedPath)
+        End Try
+    End Sub
+
+    Private Function tryGetInContextOwnerBlockingClose(ByVal normalizedPath As String,
+                                                         ByRef ownerToExit As ModelDoc2,
+                                                         ByRef contextSignature As String,
+                                                         Optional ByVal matchAnyActiveContext As Boolean = False) As Boolean
+        ownerToExit = Nothing
+        contextSignature = ""
+        If iSwApp Is Nothing Then Return False
+        If Not matchAnyActiveContext AndAlso String.IsNullOrWhiteSpace(normalizedPath) Then Return False
+
+        Dim documents As Object() = Nothing
+
+        Try
+            documents = TryCast(iSwApp.GetDocuments(), Object())
+        Catch
+            documents = Nothing
+        End Try
+
+        If documents Is Nothing Then Return False
+
+        For Each documentObject As Object In documents
+            Dim candidate As ModelDoc2 = TryCast(documentObject, ModelDoc2)
+            If candidate Is Nothing Then Continue For
+
+            Try
+                If candidate.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Continue For
+            Catch
+                Continue For
+            End Try
+
+            Dim editTarget As ModelDoc2 = getAssemblyEditTargetDocumentSafe(candidate)
+            If editTarget Is Nothing Then Continue For
+
+            Dim ownerPath As String = getAssemblyPathKeySafe(candidate)
+            Dim targetPath As String = ""
+
+            Try
+                targetPath = normalizeFullPathSafe(editTarget.GetPathName())
+            Catch
+                targetPath = ""
+            End Try
+
+            If matchAnyActiveContext OrElse
+               (Not String.IsNullOrWhiteSpace(ownerPath) AndAlso pathsAreSame(ownerPath, normalizedPath)) OrElse
+               (Not String.IsNullOrWhiteSpace(targetPath) AndAlso pathsAreSame(targetPath, normalizedPath)) Then
+                ownerToExit = candidate
+                contextSignature = ownerPath & "|" & targetPath
+                Return True
+            End If
+        Next
+
+        Return False
+    End Function
+
+    Private Sub finishUserApprovedDocumentClose(ByVal normalizedPath As String)
+        controlledDocumentCloseNativeCallInProgress = False
+
+        If pathsAreSame(documentLockReviewApprovedPath, normalizedPath) Then
+            documentLockReviewApprovedUntil = DateTime.MinValue
+            documentLockReviewApprovedPath = ""
+            documentLockReviewApprovedPaths.Clear()
+        End If
+
+        SyncLock assemblyGuardSync
+            assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+            assemblyGuardFalseDirtyCandidatePaths.Remove(normalizedPath)
+        End SyncLock
+    End Sub
 
     Private Function cadPathStillHasVisibleDocumentContext(ByVal filePath As String) As Boolean
         If iSwApp Is Nothing OrElse String.IsNullOrWhiteSpace(filePath) Then Return False
@@ -1696,7 +2286,13 @@ Public Module svnModule
                 End If
             End If
 
-            If Not String.IsNullOrWhiteSpace(targetPath) Then Return True
+            'GetEditTarget proves SOLIDWORKS is in an in-context edit on this external child -
+            'it does not by itself prove the child is locked by the current user. Without this
+            'check, being in Edit Component mode on ANY unlocked child (including one another
+            'user holds) would silently exempt the parent assembly from its own lock
+            'requirement, bypassing the guard entirely rather than just avoiding a false block.
+            If Not String.IsNullOrWhiteSpace(targetPath) AndAlso
+               externalChildPathHasRequiredLockFast(targetPath) Then Return True
         End If
 
         'SOLIDWORKS can clear GetEditTarget by the time ModifyNotify actually arrives -
@@ -1767,9 +2363,11 @@ Public Module svnModule
     End Function
 
     Private Function assemblyOwnedEditMustBeBlocked(ByVal assemblyDocument As ModelDoc2,
-                                                      Optional ByVal allowLockedChildDimensionFallback As Boolean = False) As Boolean
+                                                      Optional ByVal allowLockedChildDimensionFallback As Boolean = False,
+                                                      Optional ByVal ignoreActiveRebuild As Boolean = False,
+                                                      Optional ByVal allowActiveChildEditContext As Boolean = False) As Boolean
         If assemblyDocument Is Nothing Then Return False
-        If assemblyEditGuardSuppressed(assemblyDocument) Then Return False
+        If assemblyEditGuardSuppressed(assemblyDocument, ignoreActiveRebuild) Then Return False
 
         Try
             If assemblyDocument.GetType() <> swDocumentTypes_e.swDocASSEMBLY Then Return False
@@ -1779,14 +2377,16 @@ Public Module svnModule
 
         'Do not let the parent assembly's lack of a lock interfere while a separately
         'file-backed child is being edited in context.
-        If assemblyIsEditingExternalPhysicalChild(assemblyDocument, allowLockedChildDimensionFallback) Then Return False
+        If allowActiveChildEditContext AndAlso
+           assemblyIsEditingExternalPhysicalChild(assemblyDocument, allowLockedChildDimensionFallback) Then Return False
 
         Return Not assemblyHasRequiredLockFast(assemblyDocument)
     End Function
 
     Private Sub showAssemblyLockRequiredMessage(ByVal assemblyDocument As ModelDoc2,
-                                                ByVal actionDescription As String,
-                                                Optional ByVal editWasUndone As Boolean = False)
+                                                 ByVal actionDescription As String,
+                                                 Optional ByVal editWasUndone As Boolean = False,
+                                                 Optional ByVal editWasBlockedBeforeChange As Boolean = False)
         Dim assemblyPath As String = ""
         Dim assemblyName As String = "the assembly"
 
@@ -1806,9 +2406,14 @@ Public Module svnModule
         lastAssemblyGuardMessagePath = assemblyPath
         lastAssemblyGuardMessageUtc = DateTime.UtcNow
 
-        Dim firstLine As String = If(editWasUndone,
-                                     "Assembly edit was undone.",
-                                     "Assembly edit could not be automatically undone.")
+        Dim firstLine As String
+        If editWasBlockedBeforeChange Then
+            firstLine = "Assembly edit was blocked before anything changed."
+        ElseIf editWasUndone Then
+            firstLine = "Assembly edit was undone."
+        Else
+            firstLine = "Assembly edit could not be automatically undone."
+        End If
 
         Dim actionText As String = ""
         If Not String.IsNullOrWhiteSpace(actionDescription) Then
@@ -1816,7 +2421,7 @@ Public Module svnModule
         End If
 
         Dim manualCleanupText As String = ""
-        If Not editWasUndone Then
+        If Not editWasUndone AndAlso Not editWasBlockedBeforeChange Then
             manualCleanupText = vbCrLf & vbCrLf &
                 "PlumVault could not confirm this change was removed. Please check the feature tree, undo it yourself " &
                 "(Ctrl+Z) if it is still there, then Get Locks before trying again."
@@ -1826,9 +2431,9 @@ Public Module svnModule
             iSwApp.SendMsgToUser2(
                 firstLine & vbCrLf & vbCrLf &
                 assemblyName & " is not locked by you." & vbCrLf &
-                "Get Locks on the assembly before changing mates, component positions, inserted components, assembly configurations, display state, or virtual components." &
+                "Get Locks on the assembly before changing mates, component positions, inserted components, assembly configurations, FeatureManager organization, or virtual components." &
                 actionText & manualCleanupText & vbCrLf & vbCrLf &
-                "You may still edit a separately file-backed child part in context when that child has its own lock.",
+                "You may still hide/show components, change transparency for inspection, or edit a separately file-backed child in context when that child has its own lock.",
                 swMessageBoxIcon_e.swMbWarning,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -1840,14 +2445,18 @@ Public Module svnModule
                                                      ByVal actionDescription As String) As Integer
         Dim childEditContext As Boolean = assemblyIsEditingExternalPhysicalChild(assemblyDocument)
 
-        If Not assemblyOwnedEditMustBeBlocked(assemblyDocument) Then
+        If Not assemblyOwnedEditMustBeBlocked(assemblyDocument, ignoreActiveRebuild:=True, allowActiveChildEditContext:=True) Then
             'A genuine assembly-owned edit made while the assembly is locked supersedes any
             'earlier guard-generated false-dirty candidate. Child edits do not touch it.
             If Not childEditContext Then clearAssemblyGuardFalseDirtyCandidate(assemblyDocument)
             Return 0
         End If
 
-        showAssemblyLockRequiredMessage(assemblyDocument, actionDescription, editWasUndone:=False)
+        showAssemblyLockRequiredMessage(
+            assemblyDocument,
+            actionDescription,
+            editWasBlockedBeforeChange:=True
+        )
         Return 1
     End Function
 
@@ -2159,7 +2768,8 @@ Public Module svnModule
             handleAssemblyOwnedEditPostPublic(
                 assemblyDocument,
                 "changing an assembly, mate, or child-part dimension",
-                allowLockedChildDimensionFallback:=True
+                allowLockedChildDimensionFallback:=True,
+                allowActiveChildEditContext:=True
             )
         Finally
             clearAssemblySelectionContext(assemblyDocument)
@@ -2172,20 +2782,39 @@ Public Module svnModule
                                                   Optional ByVal addedEntityType As Integer = 0,
                                                   Optional ByVal addedItemName As String = "",
                                                   Optional ByVal allowRecentlyEndedInContextEdit As Boolean = False,
-                                                  Optional ByVal allowDisplayOnlyFallback As Boolean = False)
+                                                  Optional ByVal allowDisplayOnlyFallback As Boolean = False,
+                                                  Optional ByVal allowRebuildModifyFallback As Boolean = False,
+                                                  Optional ByVal allowActiveChildEditContext As Boolean = False)
+        If allowRebuildModifyFallback Then
+            If consumeAssemblyRebuildGenericModifyAllowance(assemblyDocument) Then Exit Sub
+        Else
+            'A purpose-built structural event is a real user action, not the delayed generic
+            'notification from the preceding rebuild. It invalidates any unused allowance.
+            clearAssemblyRebuildGenericModifyAllowance(assemblyDocument)
+        End If
+
         If allowDisplayOnlyFallback AndAlso hasRecentAssemblyDisplayOnlyChange(assemblyDocument) Then Exit Sub
 
-        Dim childEditContext As Boolean = assemblyIsEditingExternalPhysicalChild(
-            assemblyDocument,
-            allowLockedChildDimensionFallback,
-            allowRecentlyEndedInContextEdit
-        )
+        Dim childEditContext As Boolean = False
+
+        If allowActiveChildEditContext Then
+            childEditContext = assemblyIsEditingExternalPhysicalChild(
+                assemblyDocument,
+                allowLockedChildDimensionFallback,
+                allowRecentlyEndedInContextEdit
+            )
+        End If
 
         'Use the child-context result once. A recently ended session is intentionally
         'consumed so a later, unrelated assembly edit cannot borrow the same exception.
         If childEditContext Then Exit Sub
 
-        If Not assemblyOwnedEditMustBeBlocked(assemblyDocument, allowLockedChildDimensionFallback) Then
+        If Not assemblyOwnedEditMustBeBlocked(
+            assemblyDocument,
+            allowLockedChildDimensionFallback,
+            ignoreActiveRebuild:=Not allowRebuildModifyFallback,
+            allowActiveChildEditContext:=allowActiveChildEditContext
+        ) Then
             If Not childEditContext Then clearAssemblyGuardFalseDirtyCandidate(assemblyDocument)
             Exit Sub
         End If
@@ -2233,7 +2862,12 @@ Public Module svnModule
 
                     If currentAssembly Is Nothing Then Exit Sub
                     If allowDisplayOnlyFallback AndAlso hasRecentAssemblyDisplayOnlyChange(currentAssembly) Then Exit Sub
-                    If Not assemblyOwnedEditMustBeBlocked(currentAssembly, allowLockedChildDimensionFallback) Then Exit Sub
+                    If Not assemblyOwnedEditMustBeBlocked(
+                        currentAssembly,
+                        allowLockedChildDimensionFallback,
+                        ignoreActiveRebuild:=Not allowRebuildModifyFallback,
+                        allowActiveChildEditContext:=allowActiveChildEditContext
+                    ) Then Exit Sub
 
                     Dim editWasUndone As Boolean = True
 
@@ -4305,7 +4939,9 @@ Public Module svnModule
         Return True
     End Function
 
-    Private Function automaticSaveCommitPathsHaveRequiredLocks(ByVal commitPaths() As String) As Boolean
+    Private Function automaticSaveCommitPathsHaveRequiredLocks(ByVal commitPaths() As String,
+                                                                 Optional ByVal operationLabel As String = "Automatic commit",
+                                                                 Optional ByVal retryInstruction As String = "Get Locks, save again, and the plugin will commit automatically.") As Boolean
         If commitPaths Is Nothing Then Return False
 
         Dim missingLocks As New List(Of String)()
@@ -4325,10 +4961,10 @@ Public Module svnModule
         If missingLocks.Count = 0 Then Return True
 
         iSwApp.SendMsgToUser2(
-            "Automatic commit blocked." & vbCrLf & vbCrLf &
+            operationLabel & " blocked." & vbCrLf & vbCrLf &
             "These versioned CAD files are not locked by you:" & vbCrLf &
             stringArrToSingleStringWithNewLines(missingLocks.ToArray(), bTrimFileNames:=True, iLimit:=10) & vbCrLf &
-            "Get Locks, save again, and the plugin will commit automatically.",
+            retryInstruction,
             swMessageBoxIcon_e.swMbStop,
             swMessageBoxBtn_e.swMbOk
         )
@@ -5036,6 +5672,12 @@ Public Module svnModule
         Return pathsAreSame(filePath, documentLockReviewApprovedPath)
     End Function
 
+    Private Function documentCloseReviewCoveredPath(ByVal filePath As String) As Boolean
+        If DateTime.Now >= documentLockReviewApprovedUntil Then Return False
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+        Return documentLockReviewApprovedPaths.Contains(normalizeFullPathSafe(filePath))
+    End Function
+
     Private Function applicationCloseReviewApprovedPath(ByVal filePath As String) As Boolean
         If DateTime.Now >= applicationLockReviewApprovedUntil Then Return False
         If String.IsNullOrWhiteSpace(filePath) Then Return False
@@ -5046,10 +5688,15 @@ Public Module svnModule
         If iSwApp Is Nothing Then Return False
         If myUserControl Is Nothing Then Return False
 
-        'ExitApp can generate one final native close message. The controlled path has already
-        'completed every lock/dirty check and closed the documents without saving, so let that
-        'message pass instead of recursively reopening the review table.
-        If controlledApplicationExitInProgress Then Return False
+        'Only the WM_CLOSE generated by our own final ExitApp call may bypass the guard. While
+        'the reviewed close is asynchronously unwinding nested edit contexts, a second user
+        'click on the big X must remain blocked rather than racing the first close operation.
+        If controlledApplicationNativeCloseCallInProgress Then Return False
+        If controlledApplicationCloseQueued OrElse controlledApplicationExitInProgress Then Return True
+
+        SyncLock assemblyGuardSync
+            If assemblyGuardControlledCloseQueuedPaths.Count > 0 Then Return True
+        End SyncLock
 
         If closeMustWaitForActiveOperation() Then Return True
 
@@ -5157,7 +5804,12 @@ Public Module svnModule
 
             For Each closeEntry As KeyValuePair(Of Integer, String) In closeNames.OrderBy(Function(entry) entry.Key)
                 Try
-                    iSwApp.CloseDoc(closeEntry.Value)
+                    controlledApplicationNativeCloseCallInProgress = True
+                    Try
+                        iSwApp.CloseDoc(closeEntry.Value)
+                    Finally
+                        controlledApplicationNativeCloseCallInProgress = False
+                    End Try
                 Catch
                 End Try
             Next
@@ -5190,52 +5842,7 @@ Public Module svnModule
 
         Dim closeAction As New System.Windows.Forms.MethodInvoker(
             Sub()
-                Dim exitRequested As Boolean = False
-
-                Try
-                    controlledApplicationExitInProgress = True
-
-                    'The PlumVault checks/table have already established what must be committed,
-                    'retained, or discarded. Close every verified document explicitly without
-                    'saving so SOLIDWORKS cannot append a duplicate native save decision.
-                    Dim documentsClosed As Boolean = closeAllVerifiedDocumentsWithoutSaving()
-
-                    If Not documentsClosed AndAlso hasAnyOpenSolidWorksDocument() Then
-                        controlledApplicationExitInProgress = False
-                        iSwApp.SendMsgToUser2(
-                            "SOLIDWORKS could not close every verified document automatically." & vbCrLf & vbCrLf &
-                            "The application was left open. Check the remaining document and close again.",
-                            swMessageBoxIcon_e.swMbWarning,
-                            swMessageBoxBtn_e.swMbOk
-                        )
-                        Exit Sub
-                    End If
-
-                    'With all documents already closed there is no native save question left to
-                    'ask. ExitApp completes the original application-close request.
-                    iSwApp.ExitApp()
-                    exitRequested = True
-
-                Catch ex As Exception
-                    controlledApplicationExitInProgress = False
-
-                    Try
-                        iSwApp.SendMsgToUser2(
-                            "SOLIDWORKS could not complete the verified close." & vbCrLf & vbCrLf &
-                            ex.Message & vbCrLf & vbCrLf &
-                            "The application was left open so no work is silently lost.",
-                            swMessageBoxIcon_e.swMbWarning,
-                            swMessageBoxBtn_e.swMbOk
-                        )
-                    Catch
-                    End Try
-                Finally
-                    controlledApplicationCloseQueued = False
-
-                    'Keep the bypass active while ExitApp drains its final native close messages.
-                    'On failure, restore normal protection because SOLIDWORKS remains open.
-                    If Not exitRequested Then controlledApplicationExitInProgress = False
-                End Try
+                continueVerifiedSafeApplicationClose(0, "", 0)
             End Sub
         )
 
@@ -5247,6 +5854,104 @@ Public Module svnModule
             Return False
         End Try
     End Function
+
+    Private Sub continueVerifiedSafeApplicationClose(ByVal attempt As Integer,
+                                                       ByVal previousContextSignature As String,
+                                                       ByVal repeatedContextCount As Integer)
+        Try
+            controlledApplicationExitInProgress = True
+
+            'EditAssembly is asynchronous inside SOLIDWORKS. Unwind exactly one owner/target
+            'relationship per UI turn so a Top -> Mid -> Bottom edit chain is handled at any
+            'depth without restoring a read-only parent before SOLIDWORKS leaves that level.
+            Dim ownerToExit As ModelDoc2 = Nothing
+            Dim contextSignature As String = ""
+
+            If tryGetInContextOwnerBlockingClose(
+                "",
+                ownerToExit,
+                contextSignature,
+                matchAnyActiveContext:=True
+            ) Then
+                Dim sameContext As Boolean = String.Equals(
+                    contextSignature,
+                    previousContextSignature,
+                    StringComparison.OrdinalIgnoreCase
+                )
+                Dim nextRepeatedCount As Integer = If(sameContext, repeatedContextCount + 1, 0)
+
+                If attempt >= 64 OrElse nextRepeatedCount >= 24 Then
+                    Throw New InvalidOperationException(
+                        "SOLIDWORKS did not finish leaving Edit Part/Edit Assembly mode. " &
+                        "PlumVault left the application open so no work is lost."
+                    )
+                End If
+
+                If Not sameContext OrElse nextRepeatedCount Mod 4 = 0 Then
+                    activateAssemblyForContextExit(ownerToExit, contextSignature)
+                    exitAssemblyInContextEditWithoutSavingParent(ownerToExit)
+                    writeOperationLog("Queued in-context unwind before verified application close: " & contextSignature)
+                End If
+
+                If myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
+                    Throw New InvalidOperationException("The PlumVault task pane closed before SOLIDWORKS completed the application close.")
+                End If
+
+                myUserControl.BeginInvoke(
+                    New MethodInvoker(
+                        Sub()
+                            continueVerifiedSafeApplicationClose(
+                                attempt + 1,
+                                contextSignature,
+                                nextRepeatedCount
+                            )
+                        End Sub
+                    )
+                )
+                Exit Sub
+            End If
+
+            'The PlumVault checks/table have already established what must be committed,
+            'retained, or discarded. Close every verified document explicitly without saving
+            'so SOLIDWORKS cannot append a duplicate native save decision.
+            Dim documentsClosed As Boolean = closeAllVerifiedDocumentsWithoutSaving()
+
+            If Not documentsClosed AndAlso hasAnyOpenSolidWorksDocument() Then
+                Throw New InvalidOperationException(
+                    "SOLIDWORKS could not close every verified document automatically. " &
+                    "Check the remaining document and close again."
+                )
+            End If
+
+            'With all documents already closed there is no native save question left to ask.
+            'Only this exact ExitApp call may pass the application WM_CLOSE hook.
+            controlledApplicationNativeCloseCallInProgress = True
+            Try
+                iSwApp.ExitApp()
+            Finally
+                controlledApplicationNativeCloseCallInProgress = False
+            End Try
+
+            controlledApplicationCloseQueued = False
+            'Keep controlledApplicationExitInProgress set while SOLIDWORKS drains shutdown.
+
+        Catch ex As Exception
+            controlledApplicationNativeCloseCallInProgress = False
+            controlledApplicationCloseQueued = False
+            controlledApplicationExitInProgress = False
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "SOLIDWORKS could not complete the verified close." & vbCrLf & vbCrLf &
+                    ex.Message & vbCrLf & vbCrLf &
+                    "The application was left open so no work is silently lost.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+        End Try
+    End Sub
 
     Private Function closeMustWaitForActiveOperation() As Boolean
         Dim operationDescription As String = ""
@@ -5459,8 +6164,22 @@ Public Module svnModule
                 openPaths.Add(docPath)
             End If
 
-        Catch
-            Return False
+        Catch ex As Exception
+            'A mini-X close that cannot be verified must not fall through to SOLIDWORKS'
+            'native close; that can discard a file the guard never classified and reintroduce
+            'the duplicate Save/Don't Save dialog. Leave the document open and give one clear
+            'recovery action instead.
+            Try
+                iSwApp.SendMsgToUser2(
+                    "The file close was cancelled because PlumVault could not verify the document state." & vbCrLf & vbCrLf &
+                    "Click Sync and try closing again." & vbCrLf & vbCrLf & ex.Message,
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Return True
         End Try
 
         If openPaths.Count = 0 Then Return False
@@ -5481,8 +6200,9 @@ Public Module svnModule
     End Function
 
     Public Function blockCloseIfActiveDocUnsafe() As Boolean
-        If controlledApplicationExitInProgress Then Return False
-        If controlledDocumentCloseInProgress Then Return False
+        If controlledApplicationNativeCloseCallInProgress Then Return False
+        If controlledApplicationCloseQueued OrElse controlledApplicationExitInProgress Then Return True
+        If controlledDocumentCloseNativeCallInProgress Then Return False
         If cadRelocationInProgress Then Return False
         If iSwApp Is Nothing Then Return False
         If myUserControl Is Nothing Then Return False
@@ -5505,9 +6225,22 @@ Public Module svnModule
             activePath = ""
         End Try
 
+        'A controlled close already in flight for THIS document must stay blocked (a second
+        'click on its own small X must not race the first). An unrelated document's controlled
+        'close in flight must NOT block this one - each document's close is independent, unlike
+        'the whole-application guard in blockCloseIfOpenDocsUnsafe, which intentionally treats
+        'any in-flight controlled close as reason to hold the entire app-close.
+        If Not String.IsNullOrWhiteSpace(activePath) Then
+            Dim normalizedActivePath As String = normalizeFullPathSafe(activePath)
+
+            SyncLock assemblyGuardSync
+                If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedActivePath) Then Return True
+            End SyncLock
+        End If
+
         'Use the same actionable review table as full application close, but scope it to the
-        'document whose small X was clicked. Clean retained locks remain a full-close concern;
-        'only a real commit/revert decision opens the table here.
+        'document whose small X was clicked and its recursive CAD dependency closure. This
+        'catches both changed files and clean retained locks without showing unrelated projects.
         If Not documentCloseReviewIsApproved(activePath) Then
             If blockCloseForOwnedLocks(
                 isClosingSolidWorks:=False,
@@ -5515,11 +6248,29 @@ Public Module svnModule
             ) Then Return True
         End If
 
-        'Continue closing in the table is an explicit no-further-save decision. Swallow the
-        'native window close and use CloseDoc so SOLIDWORKS cannot append its own ambiguous
-        'Save/Don't Save prompt.
+        'Continue closing in the table is an explicit no-further-save decision for every row
+        'that the table actually displayed. A dirty active document without its own lock is
+        'not an owned-lock row; if the table appeared only because one of its dependencies was
+        'locked, run the ordinary unsafe-file guard before inheriting the table approval.
         If documentCloseReviewIsApproved(activePath) Then
+            If Not documentCloseReviewCoveredPath(activePath) AndAlso
+               blockCloseIfSingleDocUnsafe(activeDoc) Then Return True
+
+            'Swallow the native window close and use CloseDoc so SOLIDWORKS cannot append its
+            'own ambiguous Save/Don't Save prompt.
             If queueUserApprovedDocumentCloseWithoutSave(activePath) Then Return True
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "The reviewed close could not be started." & vbCrLf & vbCrLf &
+                    "The file was left open. Try closing it again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Return True
         End If
 
         Dim guardGeneratedFalseDirty As Boolean = False
@@ -5538,6 +6289,18 @@ Public Module svnModule
             'message and queue a verified close-without-save instead, preventing the false
             'Save Modified Documents dialog while preserving all genuine dirty-file checks.
             If queueGuardGeneratedFalseDirtyDocumentClose(activePath) Then Return True
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "The file is SVN-clean, but SOLIDWORKS could not start the verified close." & vbCrLf & vbCrLf &
+                    "The file was left open. Try closing it again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Return True
         End If
 
         Return False
@@ -5833,25 +6596,31 @@ Public Module svnModule
             If isClosingSolidWorks Then
                 reviewItems = getOwnedLockReviewItemsForCloseCached()
             Else
+                Dim documentScopePaths() As String = getCadDependencyClosureForDocumentClose(closingDocumentPath)
+
                 reviewItems = getOwnedLockReviewItems(
-                    candidatePaths:=New String() {closingDocumentPath},
+                    candidatePaths:=documentScopePaths,
                     scanWholeWorkingCopy:=False
                 )
-
-                'Closing one document should not nag about clean retained locks or unrelated
-                'open files. The full working-copy lock review remains exclusive to the main
-                'SOLIDWORKS X; the document X uses the same table only when this file needs a
-                'commit/revert decision.
-                reviewItems = reviewItems.
-                    Where(Function(item) item IsNot Nothing AndAlso Not item.IsSafeToUnlock).
-                    ToList()
             End If
         Catch
             reviewItems = Nothing
         End Try
 
         If reviewItems Is Nothing Then
-            If Not isClosingSolidWorks Then Return False
+            If Not isClosingSolidWorks Then
+                Try
+                    iSwApp.SendMsgToUser2(
+                        "PlumVault could not verify the SVN locks for this file and its references." & vbCrLf & vbCrLf &
+                        "The close was cancelled. Click Sync, then try closing the file again.",
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                Catch
+                End Try
+
+                Return True
+            End If
 
             Dim response As Integer = iSwApp.SendMsgToUser2(
                 "PlumVault could not verify whether SVN locks are still held in the working copy." & vbCrLf & vbCrLf &
@@ -5889,6 +6658,12 @@ Public Module svnModule
                     Else
                         documentLockReviewApprovedPath = closingDocumentPath
                         documentLockReviewApprovedUntil = DateTime.Now.AddSeconds(10)
+                        documentLockReviewApprovedPaths = New HashSet(Of String)(
+                            reviewItems.
+                                Where(Function(item) item IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(item.FilePath)).
+                                Select(Function(item) normalizeFullPathSafe(item.FilePath)),
+                            StringComparer.OrdinalIgnoreCase
+                        )
                     End If
 
                     Return False
@@ -5903,6 +6678,70 @@ Public Module svnModule
         Finally
             lockReviewMessageShowing = False
         End Try
+    End Function
+
+    Private Function getCadDependencyClosureForDocumentClose(ByVal documentPath As String) As String()
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        If String.IsNullOrWhiteSpace(documentPath) Then Return Nothing
+
+        Dim normalizedDocumentPath As String = normalizeFullPathSafe(documentPath)
+
+        If isCadFilePath(normalizedDocumentPath) AndAlso
+           isPathInsideLocalRepo(normalizedDocumentPath) AndAlso
+           seen.Add(normalizedDocumentPath) Then
+            output.Add(normalizedDocumentPath)
+        End If
+
+        'One local SOLIDWORKS dependency query returns the complete recursive closure for
+        'assemblies and drawings, including referenced files that are not currently open.
+        'This keeps the mini-X review scoped to the document being closed while still finding
+        'clean retained locks at any depth. It never scans unrelated working-copy folders and
+        'does not contact the SVN server.
+        Try
+            Dim dependenciesObject As Object = iSwApp.GetDocumentDependencies2(
+                normalizedDocumentPath,
+                True,  'Traverseflag: include every nested assembly/drawing dependency
+                True,  'Searchflag: resolve full paths where possible
+                False  'AddReadOnlyInfo: preserve [name, resolved path] pairs
+            )
+
+            Dim dependencies As Array = TryCast(dependenciesObject, Array)
+
+            If dependencies IsNot Nothing AndAlso dependencies.Length >= 2 Then
+                Dim lowerBound As Integer = dependencies.GetLowerBound(0)
+                Dim upperBound As Integer = dependencies.GetUpperBound(0)
+
+                For entryIndex As Integer = lowerBound + 1 To upperBound Step 2
+                    Dim dependencyPath As String = Convert.ToString(dependencies.GetValue(entryIndex))
+                    If String.IsNullOrWhiteSpace(dependencyPath) Then Continue For
+
+                    If Not Path.IsPathRooted(dependencyPath) Then
+                        Try
+                            dependencyPath = Path.Combine(Path.GetDirectoryName(normalizedDocumentPath), dependencyPath)
+                        Catch
+                        End Try
+                    End If
+
+                    dependencyPath = normalizeFullPathSafe(dependencyPath)
+
+                    If Not isCadFilePath(dependencyPath) Then Continue For
+                    If Not isPathInsideLocalRepo(dependencyPath) Then Continue For
+                    If seen.Add(dependencyPath) Then output.Add(dependencyPath)
+                Next
+            End If
+        Catch ex As Exception
+            'The root document remains in scope even if SOLIDWORKS cannot enumerate one of
+            'its dependencies. The normal full-application close scan remains the final net.
+            writeOperationLog(
+                "Mini-X dependency lock review used root-only fallback for " &
+                Path.GetFileName(normalizedDocumentPath) & ": " & ex.Message
+            )
+        End Try
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
     End Function
 
     Private Function getOpenSessionCadPathsForLockReview() As String()
@@ -6163,39 +7002,486 @@ Public Module svnModule
                                                      ByRef errorMessage As String) As Boolean
         errorMessage = ""
 
+        If iSwApp Is Nothing OrElse myUserControl Is Nothing Then
+            errorMessage = "PlumVault is not connected to SOLIDWORKS."
+            Return False
+        End If
+
         If String.IsNullOrWhiteSpace(filePath) OrElse Not File.Exists(filePath) OrElse
            Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then
             errorMessage = "The selected path is not a managed local CAD file."
             Return False
         End If
 
-        myGetLatestOrRevertPaths(
-            New String() {filePath},
-            getLatestType.revert,
-            bVerbose:=False
-        )
-
-        Dim refreshed As List(Of CloseLockReviewItem) = getOwnedLockReviewItems(
-            candidatePaths:=New String() {filePath},
-            scanWholeWorkingCopy:=False
-        )
-
-        Dim refreshedItem As CloseLockReviewItem = refreshed.FirstOrDefault(
-            Function(item) pathsAreSame(item.FilePath, filePath)
-        )
-
-        If refreshedItem Is Nothing Then
-            errorMessage = "The file is no longer locked by this working copy."
+        If closeReviewRevertInProgress Then
+            errorMessage = "Another discard is still finishing."
             Return False
         End If
 
-        If Not refreshedItem.IsSafeToUnlock Then
-            errorMessage = "Revert was cancelled or local changes remain."
+        Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+            "Discard every change to " & Path.GetFileName(filePath) & "?" & vbCrLf & vbCrLf &
+            "This removes both unsaved SOLIDWORKS edits and saved local SVN changes. " &
+            "The SVN lock will be retained so you can continue working or release it from the table.",
+            swMessageBoxIcon_e.swMbWarning,
+            swMessageBoxBtn_e.swMbOkCancel
+        )
+
+        If response <> swMessageBoxResult_e.swMbHitOk Then
+            errorMessage = "Discard cancelled; no changes were removed."
             Return False
         End If
+
+        Dim normalizedPath As String = normalizeFullPathSafe(filePath)
+        Dim operationDescription As String = "Discard changes from close review"
+
+        If Not tryBeginSolidWorksNativeMutation(operationDescription) Then
+            errorMessage = "Another SOLIDWORKS file operation is still finishing. Try again in a moment."
+            Return False
+        End If
+
+        closeReviewRevertInProgress = True
+
+        Try
+            If myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
+                Throw New InvalidOperationException("The PlumVault task pane is not available.")
+            End If
+
+            myUserControl.BeginInvoke(
+                New System.Windows.Forms.MethodInvoker(
+                    Sub()
+                        continueCloseReviewRevert(normalizedPath, 0, "", 0)
+                    End Sub
+                )
+            )
+        Catch ex As Exception
+            closeReviewRevertInProgress = False
+            endSolidWorksNativeMutation(operationDescription)
+            errorMessage = "Discard could not be started. " & ex.Message
+            Return False
+        End Try
 
         Return True
     End Function
+
+    Private Sub continueCloseReviewRevert(ByVal normalizedPath As String,
+                                          ByVal attempt As Integer,
+                                          ByVal previousContextSignature As String,
+                                          ByVal repeatedContextCount As Integer)
+        Try
+            'A selected row can be a child currently edited through any number of parent
+            'assemblies. Leave one real owner/child relationship per UI turn before touching
+            'the file. GetEditTarget self-results are filtered centrally and never enter here.
+            Dim ownerToExit As ModelDoc2 = Nothing
+            Dim contextSignature As String = ""
+
+            If tryGetInContextOwnerBlockingClose(normalizedPath, ownerToExit, contextSignature) Then
+                Dim sameContext As Boolean = String.Equals(
+                    contextSignature,
+                    previousContextSignature,
+                    StringComparison.OrdinalIgnoreCase
+                )
+                Dim nextRepeatedCount As Integer = If(sameContext, repeatedContextCount + 1, 0)
+
+                If attempt >= 64 OrElse nextRepeatedCount >= 24 Then
+                    Throw New InvalidOperationException(
+                        "SOLIDWORKS did not finish leaving Edit Part/Edit Assembly mode. " &
+                        "Return to SOLIDWORKS, leave the active edit, and try Discard again."
+                    )
+                End If
+
+                'Give SOLIDWORKS several message turns to complete EditAssembly before
+                'reissuing it. Replaying on every turn can itself keep a deep edit transition
+                'busy and is a common cause of the old repeated close error.
+                If Not sameContext OrElse nextRepeatedCount Mod 4 = 0 Then
+                    activateAssemblyForContextExit(ownerToExit, contextSignature)
+                    exitAssemblyInContextEditWithoutSavingParent(ownerToExit)
+                    writeOperationLog("Queued in-context unwind before close-review discard: " & contextSignature)
+                End If
+
+                If myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
+                    Throw New InvalidOperationException("The PlumVault task pane closed before SOLIDWORKS completed the discard.")
+                End If
+
+                myUserControl.BeginInvoke(
+                    New System.Windows.Forms.MethodInvoker(
+                        Sub()
+                            continueCloseReviewRevert(
+                                normalizedPath,
+                                attempt + 1,
+                                contextSignature,
+                                nextRepeatedCount
+                            )
+                        End Sub
+                    )
+                )
+                Exit Sub
+            End If
+
+            Dim operationError As String = ""
+            Dim success As Boolean = performCloseReviewRevertNow(normalizedPath, operationError)
+            completeCloseReviewRevert(normalizedPath, success, operationError)
+
+        Catch ex As Exception
+            writeOperationLog("Close-review discard stopped: " & normalizedPath & " | " & ex.Message)
+            completeCloseReviewRevert(normalizedPath, False, ex.Message)
+        End Try
+    End Sub
+
+    Private Sub activateAssemblyForContextExit(ByRef ownerToExit As ModelDoc2,
+                                               ByVal contextSignature As String)
+        If ownerToExit Is Nothing OrElse iSwApp Is Nothing Then Exit Sub
+
+        Dim ownerPath As String = getAssemblyPathKeySafe(ownerToExit)
+        Dim ownerTitle As String = ""
+
+        Try
+            ownerTitle = ownerToExit.GetTitle()
+        Catch
+            ownerTitle = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(ownerTitle) Then
+            Dim activationErrors As Integer = 0
+            iSwApp.ActivateDoc3(
+                ownerTitle,
+                True,
+                swRebuildOnActivation_e.swDontRebuildActiveDoc,
+                activationErrors
+            )
+
+            If activationErrors <> 0 Then
+                writeOperationLog(
+                    "Activation returned status " & activationErrors.ToString() &
+                    " while unwinding context: " & contextSignature
+                )
+            End If
+        End If
+
+        If Not String.IsNullOrWhiteSpace(ownerPath) Then
+            Dim reboundOwner As ModelDoc2 = getOpenModelByPathSafe(ownerPath)
+            If reboundOwner IsNot Nothing Then ownerToExit = reboundOwner
+        End If
+    End Sub
+
+    Private Function tryGetLocalSvnChangeState(ByVal filePath As String,
+                                               ByRef hasLocalChanges As Boolean,
+                                               ByRef errorMessage As String) As Boolean
+        hasLocalChanges = False
+        errorMessage = ""
+
+        Try
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "status --non-interactive --depth empty """ & filePath & """"
+            )
+
+            Dim svnError As String = If(statusResult.outputError, "").Trim()
+            If svnError <> "" Then
+                errorMessage = "SVN status failed: " & svnError
+                Return False
+            End If
+
+            Dim lines() As String = If(statusResult.output, "").Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+
+                Dim workingCopyState As Char = If(line.Length >= 1, line(0), " "c)
+                Dim propertyState As Char = If(line.Length >= 2, line(1), " "c)
+                Dim treeConflictState As Char = If(line.Length >= 7, line(6), " "c)
+
+                If workingCopyState <> " "c OrElse
+                   propertyState <> " "c OrElse
+                   treeConflictState <> " "c Then
+                    hasLocalChanges = True
+                    Exit For
+                End If
+            Next
+
+            Return True
+        Catch ex As Exception
+            errorMessage = "SVN status failed: " & ex.Message
+            Return False
+        End Try
+    End Function
+
+    Private Function performCloseReviewRevertNow(ByVal filePath As String,
+                                                  ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        Dim hasLocalChanges As Boolean = False
+        If Not tryGetLocalSvnChangeState(filePath, hasLocalChanges, errorMessage) Then Return False
+
+        Dim hadLock As Boolean = userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False)
+        Dim openDocument As ModelDoc2 = getOpenModelByPathSafe(filePath)
+        Dim documentType As Integer = swDocumentTypes_e.swDocNONE
+        Dim documentWasDirty As Boolean = False
+        Dim documentWasVisible As Boolean = False
+        Dim activePathBefore As String = ""
+        Dim drawingWasClosedForDiskRevert As Boolean = False
+        Dim solidWorksLocksWereReleased As Boolean = False
+
+        Try
+            Dim activeDocument As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDocument IsNot Nothing Then activePathBefore = normalizeFullPathSafe(activeDocument.GetPathName())
+        Catch
+            activePathBefore = ""
+        End Try
+
+        If openDocument IsNot Nothing Then
+            Try
+                documentType = openDocument.GetType()
+            Catch
+                documentType = swDocumentTypes_e.swDocNONE
+            End Try
+
+            Try
+                documentWasDirty = openDocument.GetSaveFlag()
+            Catch
+                documentWasDirty = False
+            End Try
+
+            Try
+                documentWasVisible = openDocument.Visible
+            Catch
+                documentWasVisible = False
+            End Try
+        End If
+
+        Try
+            'Drawings use SOLIDWORKS' drawing-specific close/reopen API when only memory must be
+            'discarded. When SVN must overwrite the drawing on disk, close it without saving,
+            'revert the working-copy file, then reopen it; ForceReleaseLocks is unsupported for
+            'drawings by the SOLIDWORKS API.
+            If openDocument IsNot Nothing AndAlso documentType = swDocumentTypes_e.swDocDRAWING Then
+            If hasLocalChanges Then
+                Dim drawingTitle As String = ""
+                Try
+                    drawingTitle = openDocument.GetTitle()
+                Catch
+                    drawingTitle = Path.GetFileName(filePath)
+                End Try
+
+                controlledDocumentCloseNativeCallInProgress = True
+                Try
+                    iSwApp.CloseDoc(drawingTitle)
+                Finally
+                    controlledDocumentCloseNativeCallInProgress = False
+                End Try
+
+                If getOpenModelByPathSafe(filePath) IsNot Nothing Then
+                    errorMessage = "SOLIDWORKS did not close the drawing, so no SVN changes were discarded."
+                    Return False
+                End If
+
+                drawingWasClosedForDiskRevert = True
+                openDocument = Nothing
+            ElseIf documentWasDirty Then
+                Dim closeOptions As Integer = CInt(swCloseReopenOption_e.swCloseReopenOption_DiscardChanges)
+                If Not hadLock Then closeOptions = closeOptions Or CInt(swCloseReopenOption_e.swCloseReopenOption_ReadOnly)
+
+                Dim reopenedDrawing As ModelDoc2 = Nothing
+                Dim closeReopenResult As Integer
+
+                controlledDocumentCloseNativeCallInProgress = True
+                Try
+                    closeReopenResult = iSwApp.CloseAndReopen(openDocument, closeOptions, reopenedDrawing)
+                Finally
+                    controlledDocumentCloseNativeCallInProgress = False
+                End Try
+
+                If closeReopenResult <> CInt(swCloseReopenError_e.swCloseReopenNoError) OrElse
+                   reopenedDrawing Is Nothing Then
+                    errorMessage = "SOLIDWORKS could not discard the drawing's unsaved changes (status " & closeReopenResult.ToString() & ")."
+                    Return False
+                End If
+
+                openDocument = reopenedDrawing
+            End If
+
+            ElseIf openDocument IsNot Nothing AndAlso (documentWasDirty OrElse hasLocalChanges) Then
+            'ReloadOrReplace requires a document window. An assembly-only referenced child
+            'may be loaded invisibly, so expose it just for the verified reload and restore
+            'its original visibility afterwards.
+            If Not documentWasVisible Then
+                Try
+                    openDocument.Visible = True
+                Catch
+                End Try
+            End If
+
+            If hasLocalChanges Then
+                Try
+                    Dim released As Integer = openDocument.ForceReleaseLocks()
+                    solidWorksLocksWereReleased = True
+                    writeOperationLog("ForceReleaseLocks before close-review discard returned " & released.ToString() & ": " & filePath)
+                Catch ex As Exception
+                    writeOperationLog("ForceReleaseLocks before close-review discard raised: " & filePath & " | " & ex.Message)
+                End Try
+            End If
+            End If
+
+            Dim revertError As String = ""
+
+            If hasLocalChanges Then
+            Try
+                Dim revertResult As rawProcessReturn = runSvnProcess(
+                    sSVNPath,
+                    "revert --non-interactive """ & filePath & """"
+                )
+                revertError = If(revertResult.outputError, "").Trim()
+            Catch ex As Exception
+                revertError = ex.Message
+            End Try
+            End If
+
+        'Reattach/reload even when SVN revert failed. The user explicitly chose Discard, and
+        'leaving a ForceReleaseLocks document detached is less safe than reloading the file
+        'that remains on disk and reporting the exact SVN error in the table.
+            If drawingWasClosedForDiskRevert Then
+            Dim openOptions As Integer = CInt(swOpenDocOptions_e.swOpenDocOptions_Silent) Or
+                                         CInt(swOpenDocOptions_e.swOpenDocOptions_LoadModel)
+            If Not hadLock Then openOptions = openOptions Or CInt(swOpenDocOptions_e.swOpenDocOptions_ReadOnly)
+
+            Dim openErrors As Integer = 0
+            Dim openWarnings As Integer = 0
+            openDocument = iSwApp.OpenDoc6(
+                filePath,
+                swDocumentTypes_e.swDocDRAWING,
+                openOptions,
+                "",
+                openErrors,
+                openWarnings
+            )
+
+            If openDocument Is Nothing Then
+                errorMessage = "The drawing changes were discarded, but SOLIDWORKS could not reopen it (error " & openErrors.ToString() & ")."
+                If revertError <> "" Then errorMessage &= " SVN also reported: " & revertError
+                Return False
+            End If
+
+            ElseIf openDocument IsNot Nothing AndAlso
+                   documentType <> swDocumentTypes_e.swDocDRAWING AndAlso
+                   (documentWasDirty OrElse hasLocalChanges) Then
+            Dim reloadResult As Integer
+
+            Try
+                reloadResult = openDocument.ReloadOrReplace(
+                    ReadOnly:=Not hadLock,
+                    ReplaceFileName:=Nothing,
+                    DiscardChanges:=True
+                )
+            Catch ex As Exception
+                errorMessage = "SOLIDWORKS could not reload the discarded file. " & ex.Message
+                If revertError <> "" Then errorMessage &= " SVN also reported: " & revertError
+                If solidWorksLocksWereReleased Then
+                    errorMessage &= " The SOLIDWORKS file lock was released; return to the document and use File > Reload before continuing."
+                End If
+                Return False
+            End Try
+
+            If reloadResult <> CInt(swComponentReloadError_e.swReloadOkay) AndAlso
+               reloadResult <> CInt(swComponentReloadError_e.swDocumentNotChanged) AndAlso
+               reloadResult <> CInt(swComponentReloadError_e.swReadOnlyChanged) Then
+                errorMessage = "SOLIDWORKS could not reload the discarded file (status " & reloadResult.ToString() & ")."
+                If revertError <> "" Then errorMessage &= " SVN also reported: " & revertError
+                If solidWorksLocksWereReleased Then
+                    errorMessage &= " Return to the document and use File > Reload before continuing."
+                End If
+                Return False
+            End If
+
+            solidWorksLocksWereReleased = False
+            End If
+
+            If revertError <> "" Then
+                errorMessage = "SVN could not discard the saved local changes: " & revertError
+                Return False
+            End If
+
+            Dim stillHasLocalChanges As Boolean = False
+            If Not tryGetLocalSvnChangeState(filePath, stillHasLocalChanges, errorMessage) Then Return False
+            If stillHasLocalChanges Then
+                errorMessage = "SVN still reports local changes after Discard. Return to SOLIDWORKS and review the file."
+                Return False
+            End If
+
+            Dim verifiedDocument As ModelDoc2 = getOpenModelByPathSafe(filePath)
+            If verifiedDocument IsNot Nothing Then
+                Try
+                    'tryGetLocalSvnChangeState just above already proved the on-disk file is
+                    'clean (no local SVN changes remain). GetSaveFlag() can still read True here
+                    'purely because of the reload SOLIDWORKS just performed - a documented
+                    'SOLIDWORKS limitation elsewhere in this add-in (no public API clears
+                    'GetSaveFlag once set, e.g. after a rebuild). Since the file's actual content
+                    'is already verified clean, that flag cannot represent a real unsaved change
+                    'and must not block reporting the discard as successful.
+                    If verifiedDocument.GetSaveFlag() Then
+                        writeOperationLog(
+                            "Close-review discard: SOLIDWORKS still shows a dirty flag after a " &
+                            "verified-clean reload, treating as spurious: " & filePath
+                        )
+                    End If
+                Catch ex As Exception
+                    errorMessage = "PlumVault could not verify the reloaded SOLIDWORKS document: " & ex.Message
+                    Return False
+                End Try
+            End If
+
+            Try
+                updateStatusCacheForKnownPaths(New String() {filePath}, forceAddDelChg1:=" ")
+                invalidateOwnedLocksWholeCopySnapshotPublic()
+            Catch
+            End Try
+
+            Return True
+        Finally
+            'Every early return above still restores the transient UI state used to make a
+            'referenced child reloadable. Without this finally block, one failed SVN/reload
+            'step could leave a formerly hidden child window visible or steal focus from the
+            'assembly/drawing the user was working in.
+            If openDocument IsNot Nothing AndAlso Not documentWasVisible AndAlso
+               documentType <> swDocumentTypes_e.swDocDRAWING Then
+                Try
+                    openDocument.Visible = False
+                Catch
+                End Try
+            End If
+
+            If Not String.IsNullOrWhiteSpace(activePathBefore) AndAlso
+               Not pathsAreSame(activePathBefore, filePath) Then
+                Try
+                    Dim previousActive As ModelDoc2 = getOpenModelByPathSafe(activePathBefore)
+                    If previousActive IsNot Nothing Then
+                        Dim activationErrors As Integer = 0
+                        iSwApp.ActivateDoc3(
+                            previousActive.GetTitle(),
+                            True,
+                            swRebuildOnActivation_e.swDontRebuildActiveDoc,
+                            activationErrors
+                        )
+                    End If
+                Catch
+                End Try
+            End If
+        End Try
+    End Function
+
+    Private Sub completeCloseReviewRevert(ByVal filePath As String,
+                                          ByVal success As Boolean,
+                                          ByVal errorMessage As String)
+        closeReviewRevertInProgress = False
+        endSolidWorksNativeMutation("Discard changes from close review")
+
+        Try
+            RaiseEvent CloseReviewRevertCompleted(filePath, success, If(errorMessage, ""))
+        Catch ex As Exception
+            writeOperationLog("Close-review discard completion handler failed: " & ex.Message)
+        End Try
+    End Sub
 
     Public Function unlockPathFromCloseReviewPublic(ByVal filePath As String,
                                                      ByRef errorMessage As String) As Boolean
@@ -12298,6 +13584,11 @@ Public Module svnModule
             Exit Sub
         End If
 
+        'The tree intentionally uses a cache for display, but that cache is not authority for
+        'whether Commit may proceed. Reconcile positive live local K tokens before any commit
+        'preparation so a stale tree row cannot force the user through Get Locks a second time.
+        refreshCachedLockTokensFromWorkingCopy(sModDocPathArr)
+
         'Assembly safety with almost no normal slowdown:
         'Only when the selected commit target is an open assembly, locally check for external CAD refs.
         'If external CAD is found, prompt vendor vs normal CAD, copy into the proper SVN folder, relink, and commit it too.
@@ -12328,6 +13619,12 @@ Public Module svnModule
         If Not validateNoDuplicateCadFileNamesForPaths(sModDocPathArr) Then Exit Sub
         If Not commitPathsAllowedOnlyIfUpToDate(sModDocPathArr) Then Exit Sub
         If Not commitAssemblyChildrenAllowedOnlyIfCachedUpToDate(sModDocPathArr) Then Exit Sub
+        If Not automaticSaveCommitPathsHaveRequiredLocks(
+            sModDocPathArr,
+            operationLabel:="Commit",
+            retryInstruction:="Click Sync to refresh status if these locks were changed outside PlumVault; otherwise use Get Locks and try Commit again."
+        ) Then Exit Sub
+        If Not ensureLiveLockedCommitPathsWritable(sModDocPathArr) Then Exit Sub
 
         makeFirstCommitCandidatePathsWritable(sModDocPathArr)
 
@@ -12354,6 +13651,67 @@ Public Module svnModule
 
         startCommitProcessBackground(sModDocPathArr, sCommitMessage, bAutoFirstCommitDataset)
     End Sub
+
+    Private Sub refreshCachedLockTokensFromWorkingCopy(ByVal filePaths() As String)
+        If filePaths Is Nothing Then Exit Sub
+
+        Dim liveLockedPaths As New List(Of String)()
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            If Directory.Exists(filePath) OrElse Not File.Exists(filePath) Then Continue For
+            If Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then Continue For
+            If isFirstCommitCandidatePath(filePath) Then Continue For
+
+            If userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False) Then
+                liveLockedPaths.Add(filePath)
+            End If
+        Next
+
+        If liveLockedPaths.Count > 0 Then
+            updateStatusCacheForKnownPaths(liveLockedPaths.ToArray(), forceLock6:="K")
+        End If
+    End Sub
+
+    Private Function ensureLiveLockedCommitPathsWritable(ByVal filePaths() As String) As Boolean
+        If filePaths Is Nothing Then Return False
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+            If Directory.Exists(filePath) OrElse Not File.Exists(filePath) Then Continue For
+            If Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then Continue For
+            If isFirstCommitCandidatePath(filePath) Then Continue For
+            If Not userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False) Then Continue For
+
+            Try
+                File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
+
+                Dim openDocument As ModelDoc2 = getOpenModelByPathSafe(filePath)
+                If openDocument Is Nothing Then Continue For
+
+                If openDocument.IsOpenedReadOnly() AndAlso Not openDocument.SetReadOnlyState(False) Then
+                    Throw New InvalidOperationException("SOLIDWORKS kept the document read-only.")
+                End If
+
+                If openDocument.IsOpenedReadOnly() Then
+                    Throw New InvalidOperationException("SOLIDWORKS still reports the document as read-only.")
+                End If
+            Catch ex As Exception
+                iSwApp.SendMsgToUser2(
+                    "Commit blocked." & vbCrLf & vbCrLf &
+                    "The SVN lock exists, but SOLIDWORKS could not make this file writable:" & vbCrLf &
+                    Path.GetFileName(filePath) & vbCrLf & vbCrLf &
+                    ex.Message & vbCrLf & vbCrLf &
+                    "Click Sync to refresh status, then try Commit again.",
+                    swMessageBoxIcon_e.swMbStop,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return False
+            End Try
+        Next
+
+        Return True
+    End Function
 
     Private Function validateNoDuplicateCadFileNamesForPaths(ByVal filePaths() As String) As Boolean
         If filePaths Is Nothing Then Return True
