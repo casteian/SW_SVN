@@ -195,6 +195,53 @@ Public Module svnModule
     'one UI turn later with ISldWorks.QuitDoc. Only stable file paths cross the deferred boundary.
     Private ReadOnly assemblyGuardControlledCloseQueuedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
+    'Tracks how long ANY entry has been continuously outstanding in
+    'assemblyGuardControlledCloseQueuedPaths, so the whole-application close guard
+    '(blockCloseIfOpenDocsUnsafe) can self-heal instead of silently blocking the big-X close
+    'forever if some exit path is ever found to leave a stale entry behind. MinValue means empty.
+    Private assemblyGuardControlledCloseQueuedPathsSinceUtc As DateTime = DateTime.MinValue
+    Private Const CONTROLLED_CLOSE_QUEUE_STALE_MINUTES As Double = 2.0
+    Private lastControlledCloseQueueBlockedMessageUtc As DateTime = DateTime.MinValue
+
+    'Callers must already hold assemblyGuardSync.
+    Private Sub addControlledCloseQueuedPathLocked(ByVal normalizedPath As String)
+        If assemblyGuardControlledCloseQueuedPaths.Count = 0 Then
+            assemblyGuardControlledCloseQueuedPathsSinceUtc = DateTime.UtcNow
+        End If
+        assemblyGuardControlledCloseQueuedPaths.Add(normalizedPath)
+    End Sub
+
+    'Callers must already hold assemblyGuardSync.
+    Private Sub removeControlledCloseQueuedPathLocked(ByVal normalizedPath As String)
+        assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+        If assemblyGuardControlledCloseQueuedPaths.Count = 0 Then
+            assemblyGuardControlledCloseQueuedPathsSinceUtc = DateTime.MinValue
+        End If
+    End Sub
+
+    'True only while at least one entry is outstanding AND it hasn't been stuck longer than the
+    'stale threshold. A stale set self-heals (cleared, logged) rather than permanently blocking
+    'the application close guard with no way for the user to recover short of restarting SOLIDWORKS.
+    Private Function hasFreshControlledCloseQueuedPaths() As Boolean
+        SyncLock assemblyGuardSync
+            If assemblyGuardControlledCloseQueuedPaths.Count = 0 Then Return False
+
+            If assemblyGuardControlledCloseQueuedPathsSinceUtc <> DateTime.MinValue AndAlso
+               (DateTime.UtcNow - assemblyGuardControlledCloseQueuedPathsSinceUtc).TotalMinutes > CONTROLLED_CLOSE_QUEUE_STALE_MINUTES Then
+
+                writeOperationLog(
+                    "controlledCloseQueuedPaths stale after " & CONTROLLED_CLOSE_QUEUE_STALE_MINUTES.ToString() &
+                    " minute(s), clearing: " & String.Join(" | ", assemblyGuardControlledCloseQueuedPaths.ToArray())
+                )
+                assemblyGuardControlledCloseQueuedPaths.Clear()
+                assemblyGuardControlledCloseQueuedPathsSinceUtc = DateTime.MinValue
+                Return False
+            End If
+
+            Return True
+        End SyncLock
+    End Function
+
     Private Const SW_COMMAND_SAVE As Integer = 2
     Private Const SW_COMMAND_SAVE_AS As Integer = 620
     'Values verified against the installed SolidWorks.Interop.swcommands.dll. Edit Component
@@ -1909,7 +1956,7 @@ Public Module svnModule
 
         SyncLock assemblyGuardSync
             If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedPath) Then Return True
-            assemblyGuardControlledCloseQueuedPaths.Add(normalizedPath)
+            addControlledCloseQueuedPathLocked(normalizedPath)
         End SyncLock
 
         Dim closeAction As New System.Windows.Forms.MethodInvoker(
@@ -1951,7 +1998,7 @@ Public Module svnModule
                     'If SOLIDWORKS refuses the controlled close, leave the document open.
                 Finally
                     SyncLock assemblyGuardSync
-                        assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+                        removeControlledCloseQueuedPathLocked(normalizedPath)
                     End SyncLock
                 End Try
             End Sub
@@ -1966,7 +2013,7 @@ Public Module svnModule
         End Try
 
         SyncLock assemblyGuardSync
-            assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+            removeControlledCloseQueuedPathLocked(normalizedPath)
         End SyncLock
 
         Return False
@@ -1981,7 +2028,7 @@ Public Module svnModule
 
         SyncLock assemblyGuardSync
             If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedPath) Then Return True
-            assemblyGuardControlledCloseQueuedPaths.Add(normalizedPath)
+            addControlledCloseQueuedPathLocked(normalizedPath)
         End SyncLock
 
         Dim closeAction As New MethodInvoker(
@@ -2166,7 +2213,7 @@ Public Module svnModule
         End If
 
         SyncLock assemblyGuardSync
-            assemblyGuardControlledCloseQueuedPaths.Remove(normalizedPath)
+            removeControlledCloseQueuedPathLocked(normalizedPath)
             assemblyGuardFalseDirtyCandidatePaths.Remove(normalizedPath)
         End SyncLock
     End Sub
@@ -4403,6 +4450,29 @@ Public Module svnModule
             Return result
         End If
 
+        'GRC27/CFD27 names are unique identifiers across the whole project, not just within a
+        'folder - saving a second file with the same name in a different folder would silently
+        'create two unrelated documents sharing one name.
+        If Not isVendorPartPath(destinationPath) Then
+            Dim duplicateNamePath As String = getExistingRepoCadPathForFileName(
+                Path.GetFileName(destinationPath),
+                excludeVendorParts:=True
+            )
+
+            If Not String.IsNullOrWhiteSpace(duplicateNamePath) AndAlso
+               Not pathsAreSame(duplicateNamePath, destinationPath) Then
+
+                row.StateText = "Name already used"
+                row.CheckText = "Blocked"
+                row.Explanation = "A file with this exact name already exists elsewhere in the working copy:" &
+                    vbCrLf & duplicateNamePath & vbCrLf &
+                    "GRC27/CFD27 names must be unique across the whole project."
+                result.Rows.Add(row)
+                result.Summary = "Choose a different name, then Check again."
+                Return result
+            End If
+        End If
+
         If Not automaticSaveTargetHasRequiredLock(destinationPath) Then
             row.StateText = "Lock needed"
             row.CheckText = "Blocked"
@@ -5694,9 +5764,26 @@ Public Module svnModule
         If controlledApplicationNativeCloseCallInProgress Then Return False
         If controlledApplicationCloseQueued OrElse controlledApplicationExitInProgress Then Return True
 
-        SyncLock assemblyGuardSync
-            If assemblyGuardControlledCloseQueuedPaths.Count > 0 Then Return True
-        End SyncLock
+        If hasFreshControlledCloseQueuedPaths() Then
+            'Unlike the two silent checks above (a review table or the final ExitApp sequence is
+            'already visibly in progress), nothing else is necessarily on screen here - a document
+            'close is quietly unwinding in the background. Tell the user why the X did nothing
+            'instead of leaving it looking broken, but only once per few seconds so repeatedly
+            'clicking X during the normal brief window does not spam dialogs.
+            If (DateTime.UtcNow - lastControlledCloseQueueBlockedMessageUtc).TotalSeconds >= 5.0 Then
+                lastControlledCloseQueueBlockedMessageUtc = DateTime.UtcNow
+                Try
+                    iSwApp.SendMsgToUser2(
+                        "SOLIDWORKS will stay open until PlumVault finishes closing a document it is still verifying." & vbCrLf & vbCrLf &
+                        "Wait a moment and click the close button again. If this keeps happening, click Sync, then try again.",
+                        swMessageBoxIcon_e.swMbInformation,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                Catch
+                End Try
+            End If
+            Return True
+        End If
 
         If closeMustWaitForActiveOperation() Then Return True
 
@@ -6230,7 +6317,7 @@ Public Module svnModule
         'close in flight must NOT block this one - each document's close is independent, unlike
         'the whole-application guard in blockCloseIfOpenDocsUnsafe, which intentionally treats
         'any in-flight controlled close as reason to hold the entire app-close.
-        If Not String.IsNullOrWhiteSpace(activePath) Then
+        If Not String.IsNullOrWhiteSpace(activePath) AndAlso hasFreshControlledCloseQueuedPaths() Then
             Dim normalizedActivePath As String = normalizeFullPathSafe(activePath)
 
             SyncLock assemblyGuardSync
