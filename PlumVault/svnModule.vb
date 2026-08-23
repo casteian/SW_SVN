@@ -59,6 +59,7 @@ Public Module svnModule
     Private asyncGetLocksInProgress As Boolean = False
     Private ReadOnly asyncGetLocksStateSync As New Object()
     Private asyncGetLocksRequestedPaths() As String = Nothing
+    Private pendingCloseReviewLockPath As String = ""
     Private asyncCommitInProgress As Boolean = False
     Private asyncCleanupInProgress As Boolean = False
     Private closeReviewRevertInProgress As Boolean = False
@@ -68,6 +69,9 @@ Public Module svnModule
     Public Event CloseReviewCommitCompleted(ByVal committedPaths() As String,
                                             ByVal success As Boolean,
                                             ByVal errorMessage As String)
+    Public Event CloseReviewLockCompleted(ByVal lockedPath As String,
+                                          ByVal success As Boolean,
+                                          ByVal errorMessage As String)
     Public Event CloseReviewRevertCompleted(ByVal revertedPath As String,
                                             ByVal success As Boolean,
                                             ByVal errorMessage As String)
@@ -92,6 +96,11 @@ Public Module svnModule
     Private newDocumentTeamSaveWorkflowInProgress As Boolean = False
     Private managedActiveDocumentSaveQueued As Boolean = False
     Private pendingAutomaticSaveCommitPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private ReadOnly automaticSaveStateSync As New Object()
+    Private postFirstCommitLockPendingPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private postFirstCommitLockRetryPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+    Private postFirstCommitLockRetryTimer As System.Windows.Forms.Timer = Nothing
+    Private postFirstCommitLockRetryStartedUtc As DateTime = DateTime.MinValue
     Private automaticSaveCommitPreparing As Boolean = False
     Private legacyImportInProgress As Boolean = False
     Private cadRelocationInProgress As Boolean = False
@@ -181,6 +190,7 @@ Public Module svnModule
     'exiting "Edit Part" in-context editing).
     Private Class InContextEditSession
         Public Property ChildPath As String = ""
+        Public Property LockPath As String = ""
         Public Property BeganUtc As DateTime = DateTime.MinValue
         Public Property EndedUtc As DateTime = DateTime.MinValue 'MinValue while still actively editing.
         Public Property AssemblyWasDirtyBeforeEdit As Boolean = True
@@ -877,18 +887,36 @@ Public Module svnModule
     Private Function externalChildPathHasRequiredLockFast(ByVal childPath As String) As Boolean
         If String.IsNullOrWhiteSpace(childPath) Then Return False
         If Not isPathInsideLocalRepo(childPath) Then Return False
-        If isNewUnversionedOrAddedFile(childPath) Then Return True
 
         Try
             Dim cached As SVNStatus.filePpty = Nothing
 
             If tryFindCachedStatusProperty(childPath, cached) Then
-                If cached.lock6 = "K" Then Return True
+                Return cached.lock6 = "K" OrElse
+                       cached.addDelChg1 = "?" OrElse
+                       cached.addDelChg1 = "A"
             End If
         Catch
         End Try
 
-        Return userHasLocalSvnLockTokenForPath(childPath)
+        Dim hasLocalChanges As Boolean = False
+        Dim hasLocalLockToken As Boolean = False
+        Dim workingCopyState As Char = " "c
+        Dim statusError As String = ""
+
+        If tryGetLocalSvnChangeState(
+            childPath,
+            hasLocalChanges,
+            statusError,
+            hasLocalLockToken,
+            workingCopyState) Then
+
+            Return hasLocalLockToken OrElse
+                   workingCopyState = "?"c OrElse
+                   workingCopyState = "A"c
+        End If
+
+        Return False
     End Function
 
     Public Sub noteAssemblySelectionContextPublic(ByVal assemblyDocument As ModelDoc2)
@@ -1009,11 +1037,15 @@ Public Module svnModule
 
             If String.IsNullOrWhiteSpace(childPath) Then Exit Sub
 
+            Dim lockPath As String = getInContextEffectiveLockPath(editedDocument, childPath)
+            If String.IsNullOrWhiteSpace(lockPath) Then lockPath = childPath
+
             Dim assemblyWasDirtyBeforeEdit As Boolean =
                 consumeInContextEditDirtyBaseline(assemblyDocument, assemblyKey)
 
             Dim editSession As New InContextEditSession With {
                 .ChildPath = childPath,
+                .LockPath = lockPath,
                 .BeganUtc = DateTime.UtcNow,
                 .EndedUtc = DateTime.MinValue,
                 .AssemblyWasDirtyBeforeEdit = assemblyWasDirtyBeforeEdit
@@ -1028,7 +1060,7 @@ Public Module svnModule
             'can itself emit ModifyNotify; that notification must be classified as child-edit
             'bookkeeping rather than a top-assembly edit. The parent is never saved and is
             'restored after EndInContextEditNotify.
-            If userHasSvnLockOnDoc(editedDocument) Then
+            If inContextEditTargetHasRequiredLock(editedDocument, lockPath) Then
                 prepareInContextParentForCleanExit(assemblyDocument, assemblyKey, editSession)
             End If
 
@@ -1044,7 +1076,13 @@ Public Module svnModule
             'get flipped writable. Reconcile it immediately.
             reconcileWriteAccessForActiveDocumentPublic()
 
-            enforceInContextEditRequiresLock(assemblyDocument, editedDocument, assemblyKey, childPath)
+            enforceInContextEditRequiresLock(
+                assemblyDocument,
+                editedDocument,
+                assemblyKey,
+                childPath,
+                lockPath
+            )
         Catch
         End Try
     End Sub
@@ -1128,9 +1166,10 @@ Public Module svnModule
     Private Sub enforceInContextEditRequiresLock(ByVal assemblyDocument As ModelDoc2,
                                                   ByVal editedDocument As ModelDoc2,
                                                   ByVal assemblyKey As String,
-                                                  ByVal childPath As String)
+                                                  ByVal childPath As String,
+                                                  ByVal lockPath As String)
         If assemblyEditGuardSuppressed(assemblyDocument) Then Exit Sub
-        If userHasSvnLockOnDoc(editedDocument) Then Exit Sub
+        If inContextEditTargetHasRequiredLock(editedDocument, lockPath) Then Exit Sub
 
         'An already-loaded child can enter Edit Part without either CommandOpenPreNotify or
         'FileOpenPreNotify firing. Never leave that child editable while a pending network lock
@@ -1138,7 +1177,7 @@ Public Module svnModule
         'replays the edit automatically; this post-facto fallback exits promptly unless the K
         'token becomes authoritative before the deferred check runs.
         Dim lockWasPendingAtNotify As Boolean =
-            asyncGetLocksInProgress AndAlso asyncGetLocksIncludesPath(childPath)
+            asyncGetLocksInProgress AndAlso asyncGetLocksIncludesPath(lockPath)
 
         'If this edit raced an explicit Get Locks click, let that one authoritative request
         'finish. Keep the edit only when the local K token is then present; if the lock fails
@@ -1146,10 +1185,11 @@ Public Module svnModule
         If lockWasPendingAtNotify AndAlso
            waitForCurrentGetLocksBeforeEnforcingInContextEdit(
                assemblyDocument,
-               editedDocument,
-               assemblyKey,
-               childPath
-           ) Then Exit Sub
+                editedDocument,
+                assemblyKey,
+                childPath,
+                lockPath
+            ) Then Exit Sub
 
         Dim kickOutAction As New System.Windows.Forms.MethodInvoker(
             Sub()
@@ -1168,7 +1208,7 @@ Public Module svnModule
 
                     Dim currentChild As ModelDoc2 = getOpenModelByPathSafe(childPath)
                     If currentChild Is Nothing Then currentChild = editedDocument
-                    If userHasSvnLockOnDoc(currentChild) Then Exit Sub
+                    If inContextEditTargetHasRequiredLock(currentChild, lockPath) Then Exit Sub
 
                     Dim currentAssembly As ModelDoc2 = getOpenModelByPathSafe(assemblyKey)
                     If currentAssembly Is Nothing Then currentAssembly = assemblyDocument
@@ -1199,7 +1239,7 @@ Public Module svnModule
                             swMessageBoxBtn_e.swMbOk
                         )
                     Else
-                        showManualLockRequired(childPath, "start Edit Part or Edit Assembly")
+                        showManualLockRequired(lockPath, "start Edit Part or Edit Assembly")
                     End If
                     writeOperationLog(
                         "Post-notify in-context edit blocked; manual Get Locks required: " & childName
@@ -1630,14 +1670,21 @@ Public Module svnModule
         'This is deliberately a live selection lookup. CommandOpenPreNotify is the last point
         'before SOLIDWORKS replaces MirrorComponent1 with one of its generated components and
         'starts broadcasting state changes on every ancestor assembly.
-        Dim ownerAssembly As ModelDoc2 = getLiveSelectedAssemblyFeatureOwner(activeAssembly)
-        If ownerAssembly Is Nothing Then
-            ownerAssembly = getRecentNestedFeatureOwnerDocument(activeAssembly)
+        Dim ownerDocument As ModelDoc2 = getLiveSelectedSuppressionOwnerDocument(activeAssembly)
+        If ownerDocument Is Nothing Then
+            ownerDocument = getRecentNestedFeatureOwnerDocument(activeAssembly)
         End If
-        If ownerAssembly Is Nothing Then
-            ownerAssembly = getSelectedAssemblyEditOwnerPublic(activeAssembly)
+        If ownerDocument Is Nothing Then
+            ownerDocument = getSelectedAssemblyEditOwnerPublic(activeAssembly)
         End If
-        If ownerAssembly Is Nothing Then ownerAssembly = activeAssembly
+        If ownerDocument Is Nothing Then ownerDocument = activeAssembly
+
+        Dim ownerIsPart As Boolean = False
+        Try
+            ownerIsPart = ownerDocument.GetType() = swDocumentTypes_e.swDocPART
+        Catch
+            ownerIsPart = False
+        End Try
 
         Dim actionDescription As String = If(
             command = SW_COMMAND_UNSUPPRESS OrElse
@@ -1647,11 +1694,21 @@ Public Module svnModule
             command = SW_COMMAND_UNSUPPRESS_DEPENDENT_ALL_CONFIGS OrElse
             command = SW_COMMAND_UNSUPPRESS_DEPENDENT_SELECTED_CONFIGS OrElse
             command = SW_COMMAND_UNSUPPRESS_FEATURE,
-            "unsuppressing an assembly feature or component",
-            "suppressing an assembly feature or component"
+            If(ownerIsPart, "unsuppressing the selected part feature", "unsuppressing an assembly feature or component"),
+            If(ownerIsPart, "suppressing the selected part feature", "suppressing an assembly feature or component")
         )
 
-        Dim blockResult As Integer = blockAssemblyOwnedEditPrePublic(ownerAssembly, actionDescription)
+        Dim blockResult As Integer = 0
+
+        If ownerIsPart Then
+            If Not assemblyHasRequiredLockFast(ownerDocument) Then
+                showManualLockRequired(getAssemblyPathKeySafe(ownerDocument), actionDescription)
+                blockResult = 1
+            End If
+        Else
+            blockResult = blockAssemblyOwnedEditPrePublic(ownerDocument, actionDescription)
+        End If
+
         If blockResult <> 0 Then
             SyncLock assemblyGuardSync
                 pendingAssemblySuppressionState = Nothing
@@ -1660,7 +1717,7 @@ Public Module svnModule
         End If
 
         Dim activePath As String = getAssemblyPathKeySafe(activeAssembly)
-        Dim ownerPath As String = getAssemblyPathKeySafe(ownerAssembly)
+        Dim ownerPath As String = getAssemblyPathKeySafe(ownerDocument)
 
         If String.IsNullOrWhiteSpace(activePath) OrElse String.IsNullOrWhiteSpace(ownerPath) Then Return 0
 
@@ -1678,14 +1735,14 @@ Public Module svnModule
         End SyncLock
 
         Dim writableFailure As String = ""
-        If Not ensureOpenCadDocumentWritableNow(ownerPath, ownerAssembly, writableFailure) Then
+        If Not ensureOpenCadDocumentWritableNow(ownerPath, ownerDocument, writableFailure) Then
             SyncLock assemblyGuardSync
                 pendingAssemblySuppressionState = Nothing
             End SyncLock
 
             Try
                 iSwApp.SendMsgToUser2(
-                    "Suppress/Unsuppress was paused because PlumVault could not give the locked assembly write access." & vbCrLf & vbCrLf &
+                    "Suppress/Unsuppress was paused because PlumVault could not give the locked file write access." & vbCrLf & vbCrLf &
                     Path.GetFileName(ownerPath) & vbCrLf & vbCrLf &
                     writableFailure & vbCrLf & vbCrLf &
                     "Click Sync and try again. The feature was not changed.",
@@ -1952,7 +2009,7 @@ Public Module svnModule
             If String.IsNullOrWhiteSpace(childPath) Then
                 'GetSelectedObjectsComponent4 resolves the owning Component2 even when the user
                 'right-clicked a feature several levels down in the assembly tree.
-                childPath = getSelectedExternalPhysicalChildPathSafe(activeModel)
+                childPath = getSelectedInContextLockPathSafe(activeModel)
             End If
 
             If String.IsNullOrWhiteSpace(childPath) AndAlso command = SW_COMMAND_SKETCH Then
@@ -2323,6 +2380,46 @@ Public Module svnModule
         Catch
             Return eventAssembly
         End Try
+    End Function
+
+    Private Function getLiveSelectedSuppressionOwnerDocument(ByVal eventAssembly As ModelDoc2) As ModelDoc2
+        If eventAssembly Is Nothing Then Return Nothing
+
+        Try
+            Dim selectionManager As SelectionMgr = eventAssembly.SelectionManager
+            If selectionManager IsNot Nothing AndAlso selectionManager.GetSelectedObjectCount2(-1) > 0 Then
+                Dim selectedObject As Object = selectionManager.GetSelectedObject6(1, -1)
+                Dim selectedType As Integer = selectionManager.GetSelectedObjectType3(1, -1)
+
+                'Suppressing a feature beneath an expanded physical part changes the part
+                'file, not the assembly containing that occurrence. Reuse the same proven
+                'feature-owner resolver as Edit Feature/Edit Sketch. A direct Component2
+                'selection deliberately skips this branch because its suppression state is
+                'persisted by the immediate parent assembly.
+                If selectedType <> swSelectType_e.swSelCOMPONENTS AndAlso
+                   TypeOf selectedObject Is Feature Then
+                    Dim featureOwner As ModelDoc2 = getFeatureEditTargetDocumentSafe(
+                        eventAssembly,
+                        selectedObject
+                    )
+
+                    If featureOwner IsNot Nothing Then Return featureOwner
+
+                    'A deep in-context feature can be exposed through a contextual proxy that
+                    'does not compare equal to the native part feature. Only in this proven
+                    'feature-selection branch, accept SOLIDWORKS' explicit Edit Part target.
+                    Dim activeEditTarget As ModelDoc2 = getAssemblyEditTargetDocumentSafe(eventAssembly)
+                    If activeEditTarget IsNot Nothing AndAlso
+                       activeEditTarget.GetType() = swDocumentTypes_e.swDocPART Then Return activeEditTarget
+                End If
+            End If
+        Catch ex As Exception
+            writeOperationLog("Could not resolve selected suppression feature owner: " & ex.Message)
+        End Try
+
+        'Preserve the established assembly-feature/component behavior whenever a physical
+        'part feature cannot be proven from the live selection.
+        Return getLiveSelectedAssemblyFeatureOwner(eventAssembly)
     End Function
 
     Private Function getLiveSelectedAssemblyFeatureOwner(ByVal eventAssembly As ModelDoc2) As ModelDoc2
@@ -2762,7 +2859,7 @@ Public Module svnModule
 
         Try
             If assemblyModel.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
-                selectedChildPath = getSelectedExternalPhysicalChildPathSafe(assemblyModel)
+                selectedChildPath = getSelectedInContextLockPathSafe(assemblyModel)
             ElseIf (isFeatureEdit OrElse isSketchEdit) AndAlso
                    assemblyModel.GetType() = swDocumentTypes_e.swDocPART Then
                 selectedChildPath = assemblyModel.GetPathName()
@@ -2944,53 +3041,146 @@ Public Module svnModule
         End SyncLock
     End Function
 
+    Private Function assemblyContainsPhysicalChildPathSafe(ByVal assemblyDocument As ModelDoc2,
+                                                            ByVal childPath As String) As Boolean
+        If assemblyDocument Is Nothing OrElse String.IsNullOrWhiteSpace(childPath) Then Return False
+
+        Dim assemblyDoc As AssemblyDoc = TryCast(assemblyDocument, AssemblyDoc)
+        If assemblyDoc Is Nothing Then Return False
+
+        Dim componentsObject As Object = Nothing
+        Try
+            'False includes every loaded assembly depth, which lets a middle-assembly event be
+            'matched to the same locked part being edited through a higher assembly window.
+            componentsObject = assemblyDoc.GetComponents(False)
+        Catch
+            componentsObject = Nothing
+        End Try
+
+        Dim components As Array = TryCast(componentsObject, Array)
+        If components Is Nothing Then Return False
+
+        For Each componentObject As Object In components
+            Dim component As Component2 = TryCast(componentObject, Component2)
+            If component Is Nothing OrElse isComponentVirtualSafe(component) Then Continue For
+
+            Dim componentPath As String = ""
+            Try
+                componentPath = component.GetPathName()
+            Catch
+                componentPath = ""
+            End Try
+
+            If Not String.IsNullOrWhiteSpace(componentPath) AndAlso pathsAreSame(componentPath, childPath) Then
+                Return True
+            End If
+        Next
+
+        Return False
+    End Function
+
     Private Function getInContextEditChildPath(ByVal assemblyDocument As ModelDoc2,
                                                 ByVal allowRecentlyEndedEdit As Boolean) As String
         Dim assemblyKey As String = getAssemblyPathKeySafe(assemblyDocument)
         If String.IsNullOrWhiteSpace(assemblyKey) Then Return ""
 
+        'Before BeginInContextEditNotify has propagated to every referenced assembly handler,
+        'the active top-level assembly can already expose the authoritative edit target. Use
+        'that live state to classify an immediate child-driven ModifyNotify on a middle owner.
+        If allowRecentlyEndedEdit AndAlso iSwApp IsNot Nothing Then
+            Try
+                Dim activeAssembly As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+
+                If activeAssembly IsNot Nothing AndAlso
+                   activeAssembly.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+
+                    Dim activeTarget As ModelDoc2 = getAssemblyEditTargetDocumentSafe(activeAssembly)
+                    If activeTarget IsNot Nothing Then
+                        Dim activeTargetPath As String = ""
+                        Try
+                            activeTargetPath = activeTarget.GetPathName()
+                        Catch
+                            activeTargetPath = ""
+                        End Try
+
+                        Dim activeLockPath As String = getInContextEffectiveLockPath(activeTarget, activeTargetPath)
+                        If Not String.IsNullOrWhiteSpace(activeLockPath) AndAlso
+                           assemblyContainsPhysicalChildPathSafe(assemblyDocument, activeLockPath) Then
+                            Return activeLockPath
+                        End If
+                    End If
+                End If
+            Catch
+            End Try
+        End If
+
+        Dim crossAssemblyLockPaths As New List(Of String)()
+
         SyncLock assemblyGuardSync
             Dim session As InContextEditSession = Nothing
-            If Not inContextEditSessionByAssemblyPath.TryGetValue(assemblyKey, session) OrElse session Is Nothing Then Return ""
+            If Not inContextEditSessionByAssemblyPath.TryGetValue(assemblyKey, session) OrElse session Is Nothing Then
+                If allowRecentlyEndedEdit Then
+                    For Each candidate As InContextEditSession In inContextEditSessionByAssemblyPath.Values
+                        If candidate Is Nothing OrElse candidate.EndedUtc <> DateTime.MinValue Then Continue For
+                        If (DateTime.UtcNow - candidate.BeganUtc).TotalHours > 4.0 Then Continue For
 
-            'GetEditTarget already handles a normal active edit before this helper is called.
-            'Use the tracked active session only for the same generic ModifyNotify fallback
-            'as an ended session, and only immediately after Begin. Explicit component/add
-            'events must never borrow this broader fallback.
-            If session.EndedUtc = DateTime.MinValue Then
-                Dim ageSeconds As Double = (DateTime.UtcNow - session.BeganUtc).TotalSeconds
-
-                'An active BeginInContextEditNotify session is process state, not a short-lived
-                'timing hint. A user can legitimately remain in Edit Part/Edit Assembly for
-                'hours; while that session is active, generic ModifyNotify events on any owner
-                'assembly belong to the separately file-backed child. Explicit structural
-                'events never request this fallback and therefore remain guarded normally.
-                If allowRecentlyEndedEdit AndAlso ageSeconds >= 0 AndAlso ageSeconds <= 4.0 * 60.0 * 60.0 Then
-                    Return session.ChildPath
+                        Dim candidateLockPath As String = candidate.LockPath
+                        If String.IsNullOrWhiteSpace(candidateLockPath) Then candidateLockPath = candidate.ChildPath
+                        If Not String.IsNullOrWhiteSpace(candidateLockPath) Then crossAssemblyLockPaths.Add(candidateLockPath)
+                    Next
                 End If
+            Else
 
-                'Keep a legitimate long-running edit registered so its eventual End event
-                'can create the narrow two-second grace. Only purge a clearly orphaned entry.
-                If ageSeconds > 4.0 * 60.0 * 60.0 Then
-                    inContextEditSessionByAssemblyPath.Remove(assemblyKey)
+                'GetEditTarget already handles a normal active edit before this helper is called.
+                'Use the tracked active session only for the same generic ModifyNotify fallback
+                'as an ended session, and only immediately after Begin. Explicit component/add
+                'events must never borrow this broader fallback.
+                If session.EndedUtc = DateTime.MinValue Then
+                    Dim ageSeconds As Double = (DateTime.UtcNow - session.BeganUtc).TotalSeconds
+
+                    'An active BeginInContextEditNotify session is process state, not a short-lived
+                    'timing hint. A user can legitimately remain in Edit Part/Edit Assembly for
+                    'hours; while that session is active, generic ModifyNotify events on any owner
+                    'assembly belong to the separately file-backed child. Explicit structural
+                    'events never request this fallback and therefore remain guarded normally.
+                    If allowRecentlyEndedEdit AndAlso ageSeconds >= 0 AndAlso ageSeconds <= 4.0 * 60.0 * 60.0 Then
+                        Return If(String.IsNullOrWhiteSpace(session.LockPath), session.ChildPath, session.LockPath)
+                    End If
+
+                    'Keep a legitimate long-running edit registered so its eventual End event
+                    'can create the narrow two-second grace. Only purge a clearly orphaned entry.
+                    If ageSeconds > 4.0 * 60.0 * 60.0 Then
+                        inContextEditSessionByAssemblyPath.Remove(assemblyKey)
+                    End If
+                Else
+                    'Only ModifyNotify is allowed to claim this one-shot grace. Explicit assembly
+                    'events such as component move/add must never inherit a child edit that ended.
+                    If allowRecentlyEndedEdit AndAlso
+                       (DateTime.UtcNow - session.EndedUtc).TotalSeconds <= 2.0 Then
+                        Dim childPath As String = If(
+                            String.IsNullOrWhiteSpace(session.LockPath),
+                            session.ChildPath,
+                            session.LockPath
+                        )
+                        inContextEditSessionByAssemblyPath.Remove(assemblyKey)
+                        Return childPath
+                    End If
+
+                    If (DateTime.UtcNow - session.EndedUtc).TotalSeconds > 2.0 Then
+                        inContextEditSessionByAssemblyPath.Remove(assemblyKey)
+                    End If
                 End If
-                Return ""
             End If
-
-            'Only ModifyNotify is allowed to claim this one-shot grace. Explicit assembly
-            'events such as component move/add must never inherit a child edit that ended.
-            If allowRecentlyEndedEdit AndAlso
-               (DateTime.UtcNow - session.EndedUtc).TotalSeconds <= 2.0 Then
-                Dim childPath As String = session.ChildPath
-                inContextEditSessionByAssemblyPath.Remove(assemblyKey)
-                Return childPath
-            End If
-
-            If (DateTime.UtcNow - session.EndedUtc).TotalSeconds > 2.0 Then
-                inContextEditSessionByAssemblyPath.Remove(assemblyKey)
-            End If
-            Return ""
         End SyncLock
+
+        'SOLIDWORKS can report the child-driven rebuild on an intermediate assembly instead
+        'of the assembly that emitted BeginInContextEditNotify. This fallback applies only to
+        'generic ModifyNotify and only when that assembly really contains the locked child.
+        For Each lockPath As String In crossAssemblyLockPaths.Distinct(StringComparer.OrdinalIgnoreCase)
+            If assemblyContainsPhysicalChildPathSafe(assemblyDocument, lockPath) Then Return lockPath
+        Next
+
+        Return ""
     End Function
 
     Private Sub markAssemblyGuardFalseDirtyCandidate(ByVal assemblyDocument As ModelDoc2)
@@ -3507,7 +3697,8 @@ Public Module svnModule
     Private Function waitForCurrentGetLocksBeforeEnforcingInContextEdit(ByVal assemblyDocument As ModelDoc2,
                                                                         ByVal editedDocument As ModelDoc2,
                                                                         ByVal assemblyKey As String,
-                                                                        ByVal childPath As String) As Boolean
+                                                                        ByVal childPath As String,
+                                                                        ByVal lockPath As String) As Boolean
         If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse
            Not myUserControl.IsHandleCreated Then Return False
 
@@ -3518,7 +3709,7 @@ Public Module svnModule
         AddHandler waitTimer.Tick,
             Sub(sender As Object, e As EventArgs)
                 Try
-                    If asyncGetLocksInProgress AndAlso asyncGetLocksIncludesPath(childPath) AndAlso
+                    If asyncGetLocksInProgress AndAlso asyncGetLocksIncludesPath(lockPath) AndAlso
                        (DateTime.UtcNow - startedUtc).TotalSeconds < 120.0 Then Exit Sub
 
                     waitTimer.Stop()
@@ -3534,13 +3725,19 @@ Public Module svnModule
                     Dim currentChild As ModelDoc2 = getOpenModelByPathSafe(childPath)
                     If currentChild Is Nothing Then currentChild = editedDocument
 
-                    If userHasSvnLockOnDoc(currentChild) Then
+                    If inContextEditTargetHasRequiredLock(currentChild, lockPath) Then
                         Dim writableFailure As String = ""
-                        If Not ensureOpenCadDocumentWritableNow(childPath, currentChild, writableFailure) Then
+                        Dim writableDocument As ModelDoc2 = currentChild
+                        If Not pathsAreSame(childPath, lockPath) Then
+                            writableDocument = getOpenModelByPathSafe(lockPath)
+                            If writableDocument Is Nothing Then writableDocument = assemblyDocument
+                        End If
+
+                        If Not ensureOpenCadDocumentWritableNow(lockPath, writableDocument, writableFailure) Then
                             Dim failedAssembly As ModelDoc2 = getOpenModelByPathSafe(assemblyKey)
                             If failedAssembly Is Nothing Then failedAssembly = assemblyDocument
                             If failedAssembly IsNot Nothing Then exitAssemblyInContextEditWithoutSavingParent(failedAssembly)
-                            showInContextAutoEditFailure(childPath, writableFailure, writeAccessWasObtained:=True)
+                            showInContextAutoEditFailure(lockPath, writableFailure, writeAccessWasObtained:=True)
                             Exit Sub
                         End If
 
@@ -3573,7 +3770,7 @@ Public Module svnModule
                 End Try
             End Sub
 
-        writeOperationLog("In-context edit waiting for current Get Locks result: " & childPath)
+        writeOperationLog("In-context edit waiting for current Get Locks result: " & lockPath)
         waitTimer.Start()
         Return True
     End Function
@@ -3753,21 +3950,41 @@ Public Module svnModule
         'managed save is still handled by the existing naming/add/commit workflow.
         If String.IsNullOrWhiteSpace(assemblyPath) Then Return True
         If Not isPathInsideLocalRepo(assemblyPath) Then Return True
-        If isNewUnversionedOrAddedFile(assemblyPath) Then Return True
 
-        'Fast cache path: normal modelling actions do not launch an SVN process.
+        'Normal modelling actions must not launch svn.exe when the task-pane cache already
+        'knows the answer. New Part/AddItem/Modify notifications can arrive several times
+        'inside one native SOLIDWORKS transaction; the previous live-first order could freeze
+        'the UI while those callbacks synchronously repeated local status scans.
         Try
             Dim cached As SVNStatus = findStatusForFile(assemblyPath)
             If cached IsNot Nothing AndAlso cached.fp IsNot Nothing AndAlso cached.fp.Length > 0 Then
-                If cached.fp(0).lock6 = "K" Then Return True
-                'Only a positive cached token is authoritative. Before undoing work, verify a
-                'blank/stale negative against the live local working-copy lock below.
+                Return cached.fp(0).lock6 = "K" OrElse
+                       cached.fp(0).addDelChg1 = "?" OrElse
+                       cached.fp(0).addDelChg1 = "A"
             End If
         Catch
         End Try
 
-        'Fallback is local working-copy status only; no server call is made.
-        Return userHasSvnLockOnDoc(assemblyDocument)
+        'Unknown cache state gets one local working-copy query. It never contacts the server
+        'and obtains both first-commit and K-token state in the same svn.exe invocation.
+        Dim hasLocalChanges As Boolean = False
+        Dim hasLocalLockToken As Boolean = False
+        Dim workingCopyState As Char = " "c
+        Dim statusError As String = ""
+
+        If tryGetLocalSvnChangeState(
+            assemblyPath,
+            hasLocalChanges,
+            statusError,
+            hasLocalLockToken,
+            workingCopyState) Then
+
+            Return hasLocalLockToken OrElse
+                   workingCopyState = "?"c OrElse
+                   workingCopyState = "A"c
+        End If
+
+        Return False
     End Function
 
     Private Function assemblyOwnedEditMustBeBlocked(ByVal assemblyDocument As ModelDoc2,
@@ -4401,6 +4618,12 @@ Public Module svnModule
             If Not childEditContext Then clearAssemblyGuardFalseDirtyCandidate(assemblyDocument)
             Exit Sub
         End If
+
+        'This notification represents a real assembly-owned operation that SOLIDWORKS has
+        'already applied and PlumVault intentionally does not undo. It must invalidate any
+        'older child-rebuild/ancestor false-dirty candidate so close review cannot discard the
+        'user's move, mate, suppression, or feature change as harmless bookkeeping.
+        clearAssemblyGuardFalseDirtyCandidate(assemblyDocument)
 
         Dim assemblyPath As String = ""
         Dim queueKey As String = ""
@@ -6390,15 +6613,27 @@ Public Module svnModule
         'A path that does not exist yet is a valid first-save/first-commit target.
         If Not File.Exists(filePath) Then Return True
 
-        Dim statusChar As Char = getFirstSvnStatusChar(filePath)
+        'A new CAD file is briefly versioned-but-unlocked after its first commit while the
+        'automatic Get Locks request runs. Permit its local continuation save, but the queued
+        'commit remains deferred until that exact lock request succeeds or fails.
+        If isPostFirstCommitLockPending(filePath) Then Return True
 
-        If statusChar = "?"c OrElse statusChar = "A"c Then Return True
+        Dim hasLocalChanges As Boolean = False
+        Dim hasLocalLockToken As Boolean = False
+        Dim statusChar As Char = " "c
+        Dim statusError As String = ""
 
-        If statusChar = ChrW(0) Then
+        If Not tryGetLocalSvnChangeState(
+            filePath,
+            hasLocalChanges,
+            statusError,
+            hasLocalLockToken,
+            statusChar) Then
             iSwApp.SendMsgToUser2(
                 "Save blocked." & vbCrLf & vbCrLf &
                 "The plugin could not verify SVN status for:" & vbCrLf &
                 filePath & vbCrLf & vbCrLf &
+                statusError & vbCrLf & vbCrLf &
                 "Run Cleanup/Sync and try again.",
                 swMessageBoxIcon_e.swMbStop,
                 swMessageBoxBtn_e.swMbOk
@@ -6406,7 +6641,14 @@ Public Module svnModule
             Return False
         End If
 
-        If userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False) Then Return True
+        If statusChar = "?"c OrElse statusChar = "A"c OrElse hasLocalLockToken Then Return True
+
+        'If the task pane still showed a green row, correct its cached token immediately. Do
+        'not refresh/rebuild the SOLIDWORKS tree from inside the native save callback.
+        Try
+            updateStatusCacheForKnownPaths(New String() {filePath}, forceLock6:=" ")
+        Catch
+        End Try
 
         iSwApp.SendMsgToUser2(
             "Save blocked." & vbCrLf & vbCrLf &
@@ -6542,10 +6784,269 @@ Public Module svnModule
         processPendingAutomaticSaveCommits()
     End Sub
 
+    Private Sub claimPendingAutomaticSaveCommitPathsForManualCommit(ByVal filePaths() As String)
+        If filePaths Is Nothing Then Exit Sub
+
+        For Each filePath As String In filePaths
+            If String.IsNullOrWhiteSpace(filePath) Then Continue For
+
+            Dim normalizedPath As String = normalizeSvnPath(filePath)
+            If String.IsNullOrWhiteSpace(normalizedPath) Then normalizedPath = filePath
+
+            If pendingAutomaticSaveCommitPaths.Remove(normalizedPath) Then
+                writeOperationLog(
+                    "Manual Commit claimed pending automatic-save commit: " & normalizedPath
+                )
+            End If
+        Next
+    End Sub
+
+    Private Sub dropCleanAutomaticSaveCommitDuplicates(ByVal committedPaths() As String)
+        If committedPaths Is Nothing OrElse pendingAutomaticSaveCommitPaths.Count = 0 Then Exit Sub
+
+        For Each committedPath As String In committedPaths
+            If String.IsNullOrWhiteSpace(committedPath) Then Continue For
+
+            Dim normalizedPath As String = normalizeSvnPath(committedPath)
+            If String.IsNullOrWhiteSpace(normalizedPath) Then normalizedPath = committedPath
+            If Not pendingAutomaticSaveCommitPaths.Contains(normalizedPath) Then Continue For
+
+            Dim hasLocalChanges As Boolean = False
+            Dim hasLocalLockToken As Boolean = False
+            Dim statusError As String = ""
+
+            'A delayed FileSavePostNotify can arrive after Manual Commit claimed the original
+            'queue entry. Drop it only when SVN proves the just-committed path is clean; a real
+            'save made after the commit began remains modified and keeps its follow-up commit.
+            If tryGetLocalSvnChangeState(
+                normalizedPath,
+                hasLocalChanges,
+                statusError,
+                hasLocalLockToken) AndAlso Not hasLocalChanges Then
+
+                pendingAutomaticSaveCommitPaths.Remove(normalizedPath)
+                writeOperationLog(
+                    "Dropped clean automatic-save duplicate after Manual Commit: " & normalizedPath
+                )
+            End If
+        Next
+    End Sub
+
+    Private Function isPostFirstCommitLockPending(ByVal filePath As String) As Boolean
+        Dim normalizedPath As String = normalizeFullPathSafe(filePath)
+        If String.IsNullOrWhiteSpace(normalizedPath) Then Return False
+
+        SyncLock automaticSaveStateSync
+            Return postFirstCommitLockPendingPaths.Contains(normalizedPath)
+        End SyncLock
+    End Function
+
+    Private Sub markPostFirstCommitLockPending(ByVal filePaths() As String,
+                                                ByVal isPending As Boolean)
+        If filePaths Is Nothing Then Exit Sub
+
+        SyncLock automaticSaveStateSync
+            For Each filePath As String In filePaths
+                Dim normalizedPath As String = normalizeFullPathSafe(filePath)
+                If String.IsNullOrWhiteSpace(normalizedPath) Then Continue For
+
+                If isPending Then
+                    postFirstCommitLockPendingPaths.Add(normalizedPath)
+                Else
+                    postFirstCommitLockPendingPaths.Remove(normalizedPath)
+                End If
+            Next
+        End SyncLock
+    End Sub
+
+    Private Sub finishPostFirstCommitLockTransition(ByVal attemptedPaths() As String)
+        If attemptedPaths Is Nothing Then
+            SyncLock automaticSaveStateSync
+                postFirstCommitLockPendingPaths.Clear()
+                postFirstCommitLockRetryPaths.Clear()
+            End SyncLock
+
+            stopPostFirstCommitLockRetryTimer()
+        Else
+            Dim transitionedPaths() As String = attemptedPaths.Where(
+                Function(path) isPostFirstCommitLockPending(path)
+            ).ToArray()
+
+            markPostFirstCommitLockPending(transitionedPaths, False)
+
+            'SaveAs and component externalization can emit a second FileSavePostNotify while
+            'the first commit/lock transition is still running. If that duplicate is now clean,
+            'remove it instead of starting an empty commit or showing "not locked" after the
+            'first commit already succeeded. A genuine edit remains queued and is still checked.
+            For Each path As String In transitionedPaths
+                Dim normalizedPath As String = normalizeFullPathSafe(path)
+                If Not pendingAutomaticSaveCommitPaths.Contains(normalizedPath) Then Continue For
+
+                Dim hasLocalChanges As Boolean = False
+                Dim hasLocalLockToken As Boolean = False
+                Dim statusError As String = ""
+
+                If tryGetLocalSvnChangeState(
+                    normalizedPath,
+                    hasLocalChanges,
+                    statusError,
+                    hasLocalLockToken) AndAlso Not hasLocalChanges Then
+
+                    pendingAutomaticSaveCommitPaths.Remove(normalizedPath)
+                    writeOperationLog(
+                        "Dropped clean duplicate save notification after first commit: " & normalizedPath
+                    )
+                End If
+            Next
+        End If
+
+        processPendingAutomaticSaveCommits()
+    End Sub
+
+    Private Sub stopPostFirstCommitLockRetryTimer()
+        If postFirstCommitLockRetryTimer Is Nothing Then Exit Sub
+
+        Try
+            postFirstCommitLockRetryTimer.Stop()
+            postFirstCommitLockRetryTimer.Dispose()
+        Catch
+        End Try
+
+        postFirstCommitLockRetryTimer = Nothing
+        postFirstCommitLockRetryStartedUtc = DateTime.MinValue
+    End Sub
+
+    Private Sub queuePostFirstCommitLockTransition(ByVal filePaths() As String)
+        If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
+
+        markPostFirstCommitLockPending(filePaths, True)
+
+        SyncLock automaticSaveStateSync
+            For Each filePath As String In filePaths
+                Dim normalizedPath As String = normalizeFullPathSafe(filePath)
+                If Not String.IsNullOrWhiteSpace(normalizedPath) Then
+                    postFirstCommitLockRetryPaths.Add(normalizedPath)
+                End If
+            Next
+        End SyncLock
+
+        If postFirstCommitLockRetryStartedUtc = DateTime.MinValue Then
+            postFirstCommitLockRetryStartedUtc = DateTime.UtcNow
+        End If
+
+        tryStartPostFirstCommitLockTransition()
+    End Sub
+
+    Private Sub ensurePostFirstCommitLockRetryTimer()
+        If postFirstCommitLockRetryTimer IsNot Nothing Then
+            postFirstCommitLockRetryTimer.Start()
+            Exit Sub
+        End If
+
+        postFirstCommitLockRetryTimer = New System.Windows.Forms.Timer() With {.Interval = 200}
+        AddHandler postFirstCommitLockRetryTimer.Tick,
+            Sub(sender As Object, e As EventArgs)
+                tryStartPostFirstCommitLockTransition()
+            End Sub
+        postFirstCommitLockRetryTimer.Start()
+    End Sub
+
+    Private Sub tryStartPostFirstCommitLockTransition()
+        Dim pathsToLock() As String
+
+        SyncLock automaticSaveStateSync
+            pathsToLock = postFirstCommitLockRetryPaths.Where(
+                Function(path) Not String.IsNullOrWhiteSpace(path) AndAlso File.Exists(path)
+            ).ToArray()
+        End SyncLock
+
+        If pathsToLock.Length = 0 Then
+            stopPostFirstCommitLockRetryTimer()
+            Exit Sub
+        End If
+
+        If postFirstCommitLockRetryStartedUtc <> DateTime.MinValue AndAlso
+           (DateTime.UtcNow - postFirstCommitLockRetryStartedUtc).TotalSeconds >= 120.0 Then
+
+            SyncLock automaticSaveStateSync
+                For Each path As String In pathsToLock
+                    postFirstCommitLockRetryPaths.Remove(path)
+                Next
+            End SyncLock
+            stopPostFirstCommitLockRetryTimer()
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "The new CAD file was committed, but PlumVault could not start its follow-up Get Locks operation." &
+                    vbCrLf & vbCrLf &
+                    "Select the new file and click Get Locks before editing it.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            finishPostFirstCommitLockTransition(pathsToLock)
+            Exit Sub
+        End If
+
+        If asyncGetLocksInProgress Then
+            'If these exact paths are already in the running request, its normal completion
+            'will clear the pending transition. Otherwise wait without showing a false warning.
+            If pathsToLock.All(Function(path) asyncGetLocksIncludesPath(path)) Then
+                SyncLock automaticSaveStateSync
+                    For Each path As String In pathsToLock
+                        postFirstCommitLockRetryPaths.Remove(path)
+                    Next
+                End SyncLock
+                stopPostFirstCommitLockRetryTimer()
+            Else
+                ensurePostFirstCommitLockRetryTimer()
+            End If
+            Exit Sub
+        End If
+
+        If Not canRunDeferredSolidWorksUiMutationPublic() Then
+            ensurePostFirstCommitLockRetryTimer()
+            Exit Sub
+        End If
+
+        getLocksOfPathsAsync(
+            pathsToLock,
+            bBreakLocks:=False,
+            bUseTortoise:=False,
+            sMessage:="Auto-lock after automatic save commit"
+        )
+
+        Dim lockRequestStarted As Boolean =
+            asyncGetLocksInProgress AndAlso pathsToLock.All(Function(path) asyncGetLocksIncludesPath(path))
+
+        If lockRequestStarted Then
+            SyncLock automaticSaveStateSync
+                For Each path As String In pathsToLock
+                    postFirstCommitLockRetryPaths.Remove(path)
+                Next
+            End SyncLock
+            stopPostFirstCommitLockRetryTimer()
+            writeOperationLog(
+                "Post-first-commit Get Locks started: " & String.Join(" | ", pathsToLock)
+            )
+        Else
+            ensurePostFirstCommitLockRetryTimer()
+        End If
+    End Sub
+
     Private Sub processPendingAutomaticSaveCommits()
         If asyncCommitInProgress Then Exit Sub
         If automaticSaveCommitPreparing Then Exit Sub
         If pendingAutomaticSaveCommitPaths.Count = 0 Then Exit Sub
+
+        'Do not misclassify a just-committed CAD file as an established unlocked file while
+        'its automatic first K-token request is still in flight. Once Get Locks completes,
+        'finishPostFirstCommitLockTransition re-enters this queue with the authoritative result.
+        If pendingAutomaticSaveCommitPaths.Any(
+            Function(path) isPostFirstCommitLockPending(path)
+        ) Then Exit Sub
 
         Dim pathsToCommit() As String = pendingAutomaticSaveCommitPaths.ToArray()
         pendingAutomaticSaveCommitPaths.Clear()
@@ -6874,15 +7375,7 @@ Public Module svnModule
 
         'Pure first commits and mixed assembly commits both need locks on every newly-added CAD file.
         If firstCommitCadPaths IsNot Nothing AndAlso firstCommitCadPaths.Length > 0 Then
-            Try
-                getLocksOfPathsAsync(
-                    firstCommitCadPaths,
-                    bBreakLocks:=False,
-                    bUseTortoise:=False,
-                    sMessage:="Auto-lock after automatic save commit"
-                )
-            Catch
-            End Try
+            queuePostFirstCommitLockTransition(firstCommitCadPaths)
         End If
 
         processPendingAutomaticSaveCommits()
@@ -8054,20 +8547,13 @@ Public Module svnModule
 
         Catch ex As Exception
             'The verified-close path may close documents without saving, so an incomplete open-
-            'document scan must fail closed. Otherwise a transient COM error could be mistaken
-            'for "safe" and discard a document that was never evaluated.
-            Try
-                iSwApp.SendMsgToUser2(
-                    "SOLIDWORKS close was stopped because PlumVault could not verify every open document." & vbCrLf & vbCrLf &
-                    "Try closing again. If it repeats, save or close the affected document manually first." & vbCrLf & vbCrLf &
-                    ex.Message,
-                    swMessageBoxIcon_e.swMbWarning,
-                    swMessageBoxBtn_e.swMbOk
-                )
-            Catch
-            End Try
-
-            Return True
+            'document scan must not silently fall through. Give the user an explicit escape
+            'route, though, so a persistent COM/SVN verification error can never make the main
+            'SOLIDWORKS window permanently unclosable.
+            writeOperationLog("Could not verify every open document during application close: " & ex.Message)
+            Return Not userApprovedApplicationCloseAfterVerificationFailure(
+                "PlumVault could not verify every open SOLIDWORKS document."
+            )
         End Try
 
         If openPaths.Count = 0 Then Return False
@@ -8678,6 +9164,8 @@ Public Module svnModule
                     .IsSafeToUnlock = item.IsSafeToUnlock,
                     .StateText = item.StateText,
                     .IsStillLocked = item.IsStillLocked,
+                    .RequiresLockBeforeCommit = item.RequiresLockBeforeCommit,
+                    .CanGetLock = item.CanGetLock,
                     .ResultText = item.ResultText,
                     .CanCommit = item.CanCommit,
                     .CanRevert = item.CanRevert
@@ -8686,6 +9174,47 @@ Public Module svnModule
         Next
 
         Return output
+    End Function
+
+    Private Function userApprovedApplicationCloseAfterVerificationFailure(ByVal failureSummary As String) As Boolean
+        If iSwApp Is Nothing Then Return False
+
+        Dim response As Integer = swMessageBoxResult_e.swMbHitCancel
+
+        Try
+            'A modal warning pumps Windows messages. Keep duplicate WM_CLOSE messages blocked
+            'until this one decision has completed.
+            lockReviewMessageShowing = True
+
+            response = iSwApp.SendMsgToUser2(
+                If(String.IsNullOrWhiteSpace(failureSummary),
+                   "PlumVault could not finish the close-safety check.",
+                   failureSummary) & vbCrLf & vbCrLf &
+                "Choose an action:" & vbCrLf &
+                "Yes = Keep SOLIDWORKS open, click Sync, and try closing again" & vbCrLf &
+                "No = Close SOLIDWORKS now without any further saves" & vbCrLf & vbCrLf &
+                "If you close anyway, unsaved in-memory changes will be discarded. " &
+                "Saved local SVN changes remain on disk, and existing SVN locks are retained.",
+                swMessageBoxIcon_e.swMbWarning,
+                swMessageBoxBtn_e.swMbYesNo
+            )
+        Catch ex As Exception
+            writeOperationLog("Could not show the application close-verification choice: " & ex.Message)
+            Return False
+        Finally
+            lockReviewMessageShowing = False
+        End Try
+
+        If response <> swMessageBoxResult_e.swMbHitNo Then Return False
+
+        'Reuse the established controlled no-save shutdown. These short-lived approvals also
+        'cover duplicate close messages pumped while the deferred close is being queued.
+        unsafeForceCloseApprovedUntil = DateTime.Now.AddSeconds(10)
+        unsafeForceCloseApprovedPath = ""
+        applicationLockReviewApprovedUntil = DateTime.Now.AddSeconds(10)
+        applicationLockReviewApprovedPaths.Clear()
+        writeOperationLog("User explicitly chose to close SOLIDWORKS after close verification failed; no further saves will be attempted.")
+        Return True
     End Function
 
     Private Function blockCloseForOwnedLocks(ByVal isClosingSolidWorks As Boolean,
@@ -8702,18 +9231,49 @@ Public Module svnModule
         If lockReviewMessageShowing Then Return True
 
         Dim reviewItems As List(Of CloseLockReviewItem) = Nothing
+        Dim unlockedEditScopePaths() As String = Nothing
 
         Try
             If isClosingSolidWorks Then
                 reviewItems = getOwnedLockReviewItemsForCloseCached()
+                unlockedEditScopePaths = getOpenSessionCadPathsForLockReview()
             Else
                 Dim documentScopePaths() As String = getCadDependencyClosureForDocumentClose(closingDocumentPath)
+                unlockedEditScopePaths = getOpenCadPathsWithinScope(documentScopePaths)
 
                 reviewItems = getOwnedLockReviewItems(
                     candidatePaths:=documentScopePaths,
                     scanWholeWorkingCopy:=False,
                     returnNothingOnFailure:=True
                 )
+            End If
+
+            If reviewItems IsNot Nothing Then
+                Dim unlockedEditItems As List(Of CloseLockReviewItem) =
+                    getUnlockedEditReviewItems(unlockedEditScopePaths)
+
+                If unlockedEditItems Is Nothing Then
+                    reviewItems = Nothing
+                ElseIf unlockedEditItems.Count > 0 Then
+                    Dim existingPaths As New HashSet(Of String)(
+                        reviewItems.
+                            Where(Function(item) item IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(item.FilePath)).
+                            Select(Function(item) normalizeFullPathSafe(item.FilePath)),
+                        StringComparer.OrdinalIgnoreCase
+                    )
+
+                    For Each unlockedItem As CloseLockReviewItem In unlockedEditItems
+                        If unlockedItem Is Nothing Then Continue For
+                        If existingPaths.Add(normalizeFullPathSafe(unlockedItem.FilePath)) Then
+                            reviewItems.Add(unlockedItem)
+                        End If
+                    Next
+
+                    reviewItems = reviewItems.
+                        OrderBy(Function(item) Path.GetFileName(item.FilePath), StringComparer.OrdinalIgnoreCase).
+                        ThenBy(Function(item) item.FilePath, StringComparer.OrdinalIgnoreCase).
+                        ToList()
+                End If
             End If
         Catch
             reviewItems = Nothing
@@ -8734,14 +9294,9 @@ Public Module svnModule
                 Return True
             End If
 
-            iSwApp.SendMsgToUser2(
-                "PlumVault could not verify whether SVN locks are still held in the working copy." & vbCrLf & vbCrLf &
-                "The close was cancelled. Click Sync and try again after checking the working copy and SVN installation.",
-                swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbOk
+            Return Not userApprovedApplicationCloseAfterVerificationFailure(
+                "PlumVault could not verify whether SVN locks are still held in the working copy."
             )
-
-            Return True
         End If
 
         If reviewItems.Count = 0 Then Return False
@@ -8912,6 +9467,193 @@ Public Module svnModule
         Return output.ToArray()
     End Function
 
+    Private Function getOpenCadPathsWithinScope(ByVal scopePaths() As String) As String()
+        If scopePaths Is Nothing OrElse scopePaths.Length = 0 Then Return Nothing
+
+        Dim openPaths() As String = getOpenSessionCadPathsForLockReview()
+        If openPaths Is Nothing OrElse openPaths.Length = 0 Then Return Nothing
+
+        Dim normalizedScope As New HashSet(Of String)(
+            scopePaths.
+                Where(Function(pathValue) Not String.IsNullOrWhiteSpace(pathValue)).
+                Select(Function(pathValue) normalizeFullPathSafe(pathValue)),
+            StringComparer.OrdinalIgnoreCase
+        )
+
+        Dim output() As String = openPaths.
+            Where(Function(pathValue) normalizedScope.Contains(normalizeFullPathSafe(pathValue))).
+            Distinct(StringComparer.OrdinalIgnoreCase).
+            ToArray()
+
+        If output.Length = 0 Then Return Nothing
+        Return output
+    End Function
+
+    Private Class CloseReviewLocalPathState
+        Public Property HasLocalLockToken As Boolean = False
+        Public Property WorkingCopyState As Char = " "c
+        Public Property PropertyState As Char = " "c
+        Public Property TreeConflictState As Char = " "c
+
+        Public ReadOnly Property HasLocalChanges As Boolean
+            Get
+                Return WorkingCopyState <> " "c OrElse
+                       PropertyState <> " "c OrElse
+                       TreeConflictState <> " "c
+            End Get
+        End Property
+    End Class
+
+    'The owned-lock review intentionally starts from K-token rows. This companion scan is
+    'limited to the CAD paths currently being closed and catches the opposite case: a real
+    'versioned document has unsaved/in-working-copy edits but no local lock token. It never
+    'walks unrelated repository folders and never contacts the SVN server.
+    Private Function getUnlockedEditReviewItems(ByVal candidatePaths() As String) As List(Of CloseLockReviewItem)
+        Dim output As New List(Of CloseLockReviewItem)()
+        Dim filteredPaths() As String = distinctExistingCadFilePaths(candidatePaths)
+
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return output
+        If String.IsNullOrWhiteSpace(sSVNPath) OrElse Not File.Exists(sSVNPath) Then Return Nothing
+
+        Dim workingCopyRoot As String = getResolvedSvnWorkingCopyRootPath()
+        If String.IsNullOrWhiteSpace(workingCopyRoot) Then Return Nothing
+
+        Try
+            workingCopyRoot = Path.GetFullPath(workingCopyRoot).TrimEnd("\"c)
+        Catch
+            workingCopyRoot = workingCopyRoot.TrimEnd("\"c)
+        End Try
+
+        Dim statesByPath As New Dictionary(Of String, CloseReviewLocalPathState)(StringComparer.OrdinalIgnoreCase)
+        Const chunkSize As Integer = 16
+
+        For startIndex As Integer = 0 To filteredPaths.Length - 1 Step chunkSize
+            Dim chunk() As String = filteredPaths.Skip(startIndex).Take(chunkSize).ToArray()
+            Dim statusResult As rawProcessReturn = runSvnProcess(
+                sSVNPath,
+                "status -v --non-interactive " & formatFilePathArrForSvnProc(chunk)
+            )
+            Dim errorText As String = If(statusResult.outputError, "").Trim()
+
+            If errorText <> "" Then
+                writeOperationLog("Unlocked-edit close review status failed: " & errorText)
+                Return Nothing
+            End If
+
+            Dim lines() As String = If(statusResult.output, "").Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+            For Each statusLine As String In lines
+                If String.IsNullOrWhiteSpace(statusLine) Then Continue For
+
+                Dim pathStart As Integer = statusLine.IndexOf(
+                    workingCopyRoot,
+                    StringComparison.OrdinalIgnoreCase
+                )
+                If pathStart < 0 Then Continue For
+
+                Dim filePath As String = normalizeFullPathSafe(statusLine.Substring(pathStart).Trim())
+                If String.IsNullOrWhiteSpace(filePath) OrElse Not isCadFilePath(filePath) Then Continue For
+
+                statesByPath(filePath) = New CloseReviewLocalPathState With {
+                    .HasLocalLockToken = statusLine.Length >= 6 AndAlso statusLine(5) = "K"c,
+                    .WorkingCopyState = If(statusLine.Length >= 1, statusLine(0), " "c),
+                    .PropertyState = If(statusLine.Length >= 2, statusLine(1), " "c),
+                    .TreeConflictState = If(statusLine.Length >= 7, statusLine(6), " "c)
+                }
+            Next
+        Next
+
+        For Each candidatePath As String In filteredPaths
+            Dim normalizedPath As String = normalizeFullPathSafe(candidatePath)
+            Dim localState As CloseReviewLocalPathState = Nothing
+
+            If Not statesByPath.TryGetValue(normalizedPath, localState) Then
+                'A clean path can be absent with some SVN client/version combinations. Verify
+                'only that exceptional path locally instead of turning the whole close into a
+                'false failure or broadening the scan.
+                Dim hasLocalChanges As Boolean = False
+                Dim hasLocalLockToken As Boolean = False
+                Dim workingCopyState As Char = " "c
+                Dim stateError As String = ""
+
+                If Not tryGetLocalSvnChangeState(
+                    normalizedPath,
+                    hasLocalChanges,
+                    stateError,
+                    hasLocalLockToken,
+                    workingCopyState
+                ) Then
+                    writeOperationLog("Unlocked-edit close review fallback failed: " & stateError)
+                    Return Nothing
+                End If
+
+                localState = New CloseReviewLocalPathState With {
+                    .HasLocalLockToken = hasLocalLockToken,
+                    .WorkingCopyState = workingCopyState
+                }
+            End If
+
+            If localState.HasLocalLockToken Then Continue For
+
+            'New/uncommitted CAD files do not have a repository lock to obtain yet. Their
+            'existing first-commit workflow remains responsible for adding and committing them.
+            If localState.WorkingCopyState = "?"c OrElse localState.WorkingCopyState = "A"c Then Continue For
+
+            Dim hasUnsavedSolidWorksChanges As Boolean = False
+            Dim openDocument As ModelDoc2 = getOpenModelByPathSafe(normalizedPath)
+
+            If openDocument IsNot Nothing Then
+                Try
+                    hasUnsavedSolidWorksChanges = openDocument.GetSaveFlag()
+
+                    If hasUnsavedSolidWorksChanges AndAlso Not localState.HasLocalChanges Then
+                        Dim isEventProvenAssemblyFalseDirty As Boolean = False
+
+                        Try
+                            isEventProvenAssemblyFalseDirty =
+                                openDocument.GetType() = swDocumentTypes_e.swDocASSEMBLY AndAlso
+                                isAssemblyGuardFalseDirtyCandidate(normalizedPath)
+                        Catch
+                            isEventProvenAssemblyFalseDirty = False
+                        End Try
+
+                        If isEventProvenAssemblyFalseDirty Then
+                            hasUnsavedSolidWorksChanges = False
+                        End If
+                    End If
+                Catch
+                    hasUnsavedSolidWorksChanges = False
+                End Try
+            End If
+
+            If Not hasUnsavedSolidWorksChanges AndAlso Not localState.HasLocalChanges Then Continue For
+
+            output.Add(
+                New CloseLockReviewItem With {
+                    .FilePath = normalizedPath,
+                    .IsSafeToUnlock = False,
+                    .IsStillLocked = False,
+                    .RequiresLockBeforeCommit = True,
+                    .CanGetLock = True,
+                    .CanCommit = False,
+                    .CanRevert = False,
+                    .StateText = If(hasUnsavedSolidWorksChanges,
+                                    "Unsaved edits; SVN lock required",
+                                    "Local changes without SVN lock"),
+                    .ResultText = "Edits were made without your lock. Select Get Lock, then Commit."
+                }
+            )
+        Next
+
+        Return output.
+            OrderBy(Function(item) Path.GetFileName(item.FilePath), StringComparer.OrdinalIgnoreCase).
+            ThenBy(Function(item) item.FilePath, StringComparer.OrdinalIgnoreCase).
+            ToList()
+    End Function
+
     Private Function getOwnedLockReviewItems(ByVal candidatePaths() As String,
                                              ByVal scanWholeWorkingCopy As Boolean,
                                              Optional ByVal returnNothingOnFailure As Boolean = False) As List(Of CloseLockReviewItem)
@@ -9072,6 +9814,55 @@ Public Module svnModule
         Return "Local SVN changes require attention"
     End Function
 
+    Public Function lockPathFromCloseReviewPublic(ByVal filePath As String,
+                                                   ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+
+        If Not isOnlineModeEnabled() Then
+            errorMessage = "PlumVault is offline. Reconnect before getting the lock."
+            Return False
+        End If
+
+        If String.IsNullOrWhiteSpace(filePath) OrElse Not File.Exists(filePath) OrElse
+           Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then
+            errorMessage = "The selected path is not a managed local CAD file."
+            Return False
+        End If
+
+        If asyncGetLocksInProgress Then
+            errorMessage = "Another Get Locks request is already running. Finish it first."
+            Return False
+        End If
+
+        If Not canRunDeferredSolidWorksUiMutationPublic() Then
+            errorMessage = "PlumVault is finishing another SOLIDWORKS document operation. Wait a moment and try again."
+            Return False
+        End If
+
+        pendingCloseReviewLockPath = normalizeFullPathSafe(filePath)
+
+        Try
+            getLocksOfPathsAsync(
+                New String() {filePath},
+                bBreakLocks:=False,
+                bUseTortoise:=False,
+                sMessage:="Lock obtained from close review"
+            )
+        Catch ex As Exception
+            pendingCloseReviewLockPath = ""
+            errorMessage = "Get Lock could not be started: " & ex.Message
+            Return False
+        End Try
+
+        If Not asyncGetLocksInProgress Then
+            pendingCloseReviewLockPath = ""
+            errorMessage = "Get Lock could not be started. Wait for any current operation and try again."
+            Return False
+        End If
+
+        Return True
+    End Function
+
     Public Function commitPathFromCloseReviewPublic(ByVal filePath As String,
                                                      ByRef errorMessage As String) As Boolean
         errorMessage = ""
@@ -9100,7 +9891,10 @@ Public Module svnModule
             Return False
         End If
 
-        tortCommitPathsAsync(New String() {filePath})
+        tortCommitPathsAsync(
+            New String() {filePath},
+            suppressParentAssemblyNotice:=True
+        )
         Return asyncCommitInProgress
     End Function
 
@@ -9299,9 +10093,11 @@ Public Module svnModule
     Private Function tryGetLocalSvnChangeState(ByVal filePath As String,
                                                ByRef hasLocalChanges As Boolean,
                                                ByRef errorMessage As String,
-                                               Optional ByRef hasLocalLockToken As Boolean = False) As Boolean
+                                               Optional ByRef hasLocalLockToken As Boolean = False,
+                                               Optional ByRef workingCopyState As Char = " "c) As Boolean
         hasLocalChanges = False
         hasLocalLockToken = False
+        workingCopyState = " "c
         errorMessage = ""
 
         Try
@@ -9326,7 +10122,7 @@ Public Module svnModule
 
                 If line.Length >= 6 AndAlso line(5) = "K"c Then hasLocalLockToken = True
 
-                Dim workingCopyState As Char = If(line.Length >= 1, line(0), " "c)
+                workingCopyState = If(line.Length >= 1, line(0), " "c)
                 Dim propertyState As Char = If(line.Length >= 2, line(1), " "c)
                 Dim treeConflictState As Char = If(line.Length >= 7, line(6), " "c)
 
@@ -12847,6 +13643,96 @@ Public Module svnModule
         Return ""
     End Function
 
+    Private Function getSelectedInContextLockPathSafe(ByVal assemblyDocument As ModelDoc2) As String
+        If assemblyDocument Is Nothing Then Return ""
+
+        'Normal physical children own their own lock.
+        Dim physicalChildPath As String = getSelectedExternalPhysicalChildPathSafe(assemblyDocument)
+        If Not String.IsNullOrWhiteSpace(physicalChildPath) Then Return physicalChildPath
+
+        'A virtual component has no independently versioned file. Its temporary AppData path
+        'must never be sent through SVN lock validation; edits are stored in the nearest
+        'physical owner assembly, which is also what the PlumVault tree maps the row to.
+        Dim selectionManager As SelectionMgr = Nothing
+
+        Try
+            selectionManager = TryCast(assemblyDocument.SelectionManager, SelectionMgr)
+        Catch
+            selectionManager = Nothing
+        End Try
+
+        If selectionManager Is Nothing Then Return ""
+
+        Dim selectedCount As Integer = 0
+        Try
+            selectedCount = CInt(selectionManager.GetSelectedObjectCount2(-1))
+        Catch
+            selectedCount = 0
+        End Try
+
+        For index As Integer = 1 To selectedCount
+            Dim selectedComponent As Component2 = Nothing
+
+            Try
+                selectedComponent = TryCast(selectionManager.GetSelectedObjectsComponent4(index, -1), Component2)
+            Catch
+                selectedComponent = Nothing
+            End Try
+
+            If selectedComponent Is Nothing OrElse Not isComponentVirtualSafe(selectedComponent) Then Continue For
+
+            Dim ownerPath As String = getPhysicalOwnerAssemblyPathForVirtualComponent(
+                selectedComponent,
+                assemblyDocument
+            )
+
+            If String.IsNullOrWhiteSpace(ownerPath) Then Continue For
+            If Not isPathInsideLocalRepo(ownerPath) Then Continue For
+
+            Return normalizeFullPathSafe(ownerPath)
+        Next
+
+        Return ""
+    End Function
+
+    Private Function getInContextEffectiveLockPath(ByVal editedDocument As ModelDoc2,
+                                                    ByVal childPath As String) As String
+        Dim ownerPath As String = ""
+
+        Try
+            ownerPath = getOwningPhysicalAssemblyPathForVirtualDocument(editedDocument)
+        Catch
+            ownerPath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(ownerPath) AndAlso isPathInsideLocalRepo(ownerPath) Then
+            Return normalizeFullPathSafe(ownerPath)
+        End If
+
+        Return normalizeFullPathSafe(childPath)
+    End Function
+
+    Private Function inContextEditTargetHasRequiredLock(ByVal editedDocument As ModelDoc2,
+                                                         ByVal lockPath As String) As Boolean
+        If String.IsNullOrWhiteSpace(lockPath) Then Return False
+
+        Dim documentPath As String = ""
+        Try
+            If editedDocument IsNot Nothing Then documentPath = editedDocument.GetPathName()
+        Catch
+            documentPath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(documentPath) AndAlso pathsAreSame(documentPath, lockPath) Then
+            Return userHasSvnLockOnDoc(editedDocument)
+        End If
+
+        'Virtual children are authorized by the physical assembly that stores them. A brand-new
+        'owner cannot have an SVN lock yet and remains valid until its first automatic commit.
+        If isNewUnversionedOrAddedFile(lockPath) Then Return True
+        Return userHasLocalSvnLockTokenForPath(lockPath, allowCachedToken:=False)
+    End Function
+
     Private Function pathsAreSame(pathA As String, pathB As String) As Boolean
         If String.IsNullOrWhiteSpace(pathA) Then Return False
         If String.IsNullOrWhiteSpace(pathB) Then Return False
@@ -15713,7 +16599,9 @@ Public Module svnModule
         startCommitProcessBackground(sModDocPathArr, sCommitMessage, bAutoFirstCommitDataset)
         Exit Sub
     End Sub
-    Public Sub tortCommitPathsAsync(ByVal commitPaths() As String, Optional sCommitMessage As String = "")
+    Public Sub tortCommitPathsAsync(ByVal commitPaths() As String,
+                                    Optional sCommitMessage As String = "",
+                                    Optional suppressParentAssemblyNotice As Boolean = False)
         'Path-first commit used by the add-in tree.
         'This lets a user commit the selected child part without requiring the parent assembly
         'to be checked out, as long as the child itself is valid/current/writable.
@@ -15808,9 +16696,14 @@ Public Module svnModule
 
         If Not saveOpenDocsForCommitPaths(sModDocPathArr) Then Exit Sub
 
-        warnIfActiveAssemblyDirtyButNotInCommit(sModDocPathArr)
-
         startCommitProcessBackground(sModDocPathArr, sCommitMessage, bAutoFirstCommitDataset)
+
+        'Show this informational note only after asyncCommitInProgress is set. SendMsgToUser2
+        'pumps UI messages; showing it first allowed a queued save-triggered auto-commit to
+        'start re-entrantly before this manual commit had claimed the same new child.
+        If Not suppressParentAssemblyNotice Then
+            warnIfActiveAssemblyDirtyButNotInCommit(sModDocPathArr)
+        End If
     End Sub
 
     Private Function getLiveLockedManagedCadPaths(ByVal filePaths() As String) As HashSet(Of String)
@@ -16270,8 +17163,9 @@ Public Module svnModule
             Next
 
             iSwApp.SendMsgToUser2(
-                "Child file commit started." & vbCrLf & vbCrLf &
-                "Note: the parent assembly still has unsaved changes. The child can be committed separately, but commit/check out the parent assembly only if you intentionally changed assembly-level mates, positions, references, or display/config state.",
+                "Selected file commit started." & vbCrLf & vbCrLf &
+                "The active parent assembly was not included in this commit. SOLIDWORKS currently marks that parent as modified; this can be normal after in-context child editing or a rebuild." & vbCrLf & vbCrLf &
+                "Commit and lock the parent assembly only if you intentionally changed assembly-level mates, component positions, references, suppression, or display/configuration state.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -16318,6 +17212,10 @@ Public Module svnModule
                 swMessageBoxBtn_e.swMbOk)
             Exit Sub
         End If
+
+        'The user's explicit Commit owns these paths. Remove any older save-triggered request
+        'for the same files before a modal/Tortoise window can pump it as a second commit.
+        claimPendingAutomaticSaveCommitPathsForManualCommit(commitPaths)
 
         Dim pathsForBackground() As String = CType(commitPaths.Clone(), String())
         Dim savedPathForBackground As String = ""
@@ -16429,6 +17327,8 @@ Public Module svnModule
             myUserControl.markCommitResultForFilePathsPublic(commitPaths, True)
         Catch
         End Try
+
+        dropCleanAutomaticSaveCommitDuplicates(commitPaths)
 
         Try
             'A TortoiseSVN commit may retain or release locks depending on its dialog state.
@@ -17442,6 +18342,7 @@ Public Module svnModule
         Dim autoEditWasAttempted As Boolean = False
         Dim autoEditLockOwned As Boolean = False
         Dim autoEditWritableDeferred As Boolean = False
+        Dim closeReviewLockTargetPath As String = pendingCloseReviewLockPath
 
         If pendingInContextAutoEditRequest IsNot Nothing AndAlso result IsNot Nothing Then
             autoEditTargetPath = pendingInContextAutoEditRequest.ChildPath
@@ -17554,6 +18455,18 @@ Public Module svnModule
         If result Is Nothing Then
             writeOperationLog("Get Locks finished with no result object.")
 
+            If Not String.IsNullOrWhiteSpace(closeReviewLockTargetPath) Then
+                pendingCloseReviewLockPath = ""
+                Try
+                    RaiseEvent CloseReviewLockCompleted(
+                        closeReviewLockTargetPath,
+                        False,
+                        "The SVN lock operation ended without returning a result."
+                    )
+                Catch
+                End Try
+            End If
+
             If pendingInContextAutoEditRequest IsNot Nothing Then
                 Dim failedPath As String = pendingInContextAutoEditRequest.ChildPath
                 pendingInContextAutoEditRequest = Nothing
@@ -17563,6 +18476,7 @@ Public Module svnModule
                 )
             End If
 
+            finishPostFirstCommitLockTransition(Nothing)
             Exit Sub
         End If
 
@@ -17611,6 +18525,35 @@ Public Module svnModule
             writeOperationLog("Get Locks SVN phase succeeded.")
         End If
 
+        If Not String.IsNullOrWhiteSpace(closeReviewLockTargetPath) Then
+            Dim closeReviewLockSucceeded As Boolean =
+                resultContainsPath(result.LockedPaths, closeReviewLockTargetPath)
+            Dim closeReviewLockMessage As String = If(result.Message, "").Trim()
+
+            If Not closeReviewLockSucceeded AndAlso String.IsNullOrWhiteSpace(closeReviewLockMessage) Then
+                closeReviewLockMessage =
+                    "SVN did not obtain the lock. Another user may already hold it, or the file may be out of date."
+            End If
+
+            pendingCloseReviewLockPath = ""
+
+            Try
+                RaiseEvent CloseReviewLockCompleted(
+                    closeReviewLockTargetPath,
+                    closeReviewLockSucceeded,
+                    closeReviewLockMessage
+                )
+            Catch ex As Exception
+                writeOperationLog("Could not update the close-review lock row: " & ex.Message)
+            End Try
+
+            'The modal close table owns feedback for this request. Avoid a second generic
+            'SOLIDWORKS alert on top of the row result, especially when another user owns it.
+            result.Message = ""
+            result.IsWarning = False
+            result.IsInfoOnly = False
+        End If
+
         If Not String.IsNullOrWhiteSpace(result.Message) Then
             Try
                 Dim icon As swMessageBoxIcon_e =
@@ -17631,6 +18574,8 @@ Public Module svnModule
                 )
             End Try
         End If
+
+        finishPostFirstCommitLockTransition(result.AttemptedPaths)
     End Sub
 
     Private Function quoteFilePathArgs(ByVal filePaths() As String) As String

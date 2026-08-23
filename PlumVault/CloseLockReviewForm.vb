@@ -14,6 +14,8 @@ Public Class CloseLockReviewItem
     Public Property IsSafeToUnlock As Boolean = True
     Public Property StateText As String = "Clean; nothing to commit"
     Public Property IsStillLocked As Boolean = True
+    Public Property RequiresLockBeforeCommit As Boolean = False
+    Public Property CanGetLock As Boolean = False
     Public Property ResultText As String = "Lock retained"
     Public Property CanCommit As Boolean = False
     Public Property CanRevert As Boolean = False
@@ -32,6 +34,7 @@ Public Class CloseLockReviewForm
     Private ReadOnly continueButton As New Button()
 
     Private unlockInProgress As Boolean = False
+    Private pendingLockPath As String = ""
     Private pendingCommitPath As String = ""
     Private pendingRevertPath As String = ""
 
@@ -64,6 +67,8 @@ Public Class CloseLockReviewForm
     Private Shared ReadOnly LockedRowForeColor As Color = Color.FromArgb(92, 69, 0)
     Private Shared ReadOnly UnlockedRowBackColor As Color = Color.FromArgb(220, 245, 224)
     Private Shared ReadOnly UnlockedRowForeColor As Color = Color.FromArgb(24, 92, 39)
+    Private Shared ReadOnly LockRequiredRowBackColor As Color = Color.FromArgb(255, 226, 226)
+    Private Shared ReadOnly LockRequiredRowForeColor As Color = Color.FromArgb(132, 24, 24)
 
     Public ReadOnly Property Decision As CloseLockReviewDecision
         Get
@@ -80,6 +85,7 @@ Public Class CloseLockReviewForm
 
         AddHandler svnModule.CloseReviewCommitCompleted, AddressOf CloseReviewCommitCompleted
         AddHandler svnModule.CloseReviewRevertCompleted, AddressOf CloseReviewRevertCompleted
+        AddHandler svnModule.CloseReviewLockCompleted, AddressOf CloseReviewLockCompleted
         InitializeWindow()
         PopulateRows()
         UpdateFooter()
@@ -94,13 +100,13 @@ Public Class CloseLockReviewForm
 
         'Keep the dialog usable on smaller/high-DPI displays. The grid scrolls horizontally
         'when the working area cannot show every decision column at once.
-        'Width must actually fit the sum of the grid's own column MinimumWidths (150+220+130+
-        '90+90+120+160=960) plus the root layout's 14px side padding and the grid's own
+        'Width must actually fit the sum of the grid's own column MinimumWidths plus the root
+        'layout's side padding and the grid's own
         'border/scrollbar margin - otherwise the rightmost columns (Result, Unlock), which
         'carry the messages needed to safely resolve a lock, can be clipped or scrolled away
         'at the form's minimum size.
-        MinimumSize = New Size(1020, 430)
-        Size = New Size(1180, 560)
+        MinimumSize = New Size(1090, 430)
+        Size = New Size(1240, 560)
         ShowIcon = False
         ShowInTaskbar = False
         MaximizeBox = True
@@ -125,13 +131,14 @@ Public Class CloseLockReviewForm
         headerLabel.MaximumSize = New Size(1060, 0)
         headerLabel.Padding = New Padding(0, 0, 0, 10)
         headerLabel.Text =
-            "You still have SVN locks on the files below. While a lock is held, edit access is reserved to you." &
+            "These files need a close decision. Red rows contain edits made without your SVN lock; select Get Lock, then Commit. " &
+            "Yellow rows are locked by you and green rows have been successfully unlocked." &
             Environment.NewLine &
             "For each changed file, Commit to keep your work or Revert to discard it. Unlock files whose work is complete. " &
             "You may retain any lock you still need. Continuing close is the final decision: saved local SVN changes remain on disk, " &
             "but unsaved changes still only in SOLIDWORKS will be discarded without another Save/Don't Save prompt." &
             Environment.NewLine &
-            "Yellow rows are still locked. Green rows have been successfully unlocked."
+            "Commit remains unavailable on a red row unless SVN confirms that the lock was obtained by you."
         rootLayout.Controls.Add(headerLabel, 0, 0)
 
         ConfigureGrid()
@@ -219,6 +226,14 @@ Public Class CloseLockReviewForm
         stateColumn.MinimumWidth = 130
         grid.Columns.Add(stateColumn)
 
+        Dim lockColumn As New DataGridViewButtonColumn()
+        lockColumn.Name = "GetLock"
+        lockColumn.HeaderText = "Lock"
+        lockColumn.UseColumnTextForButtonValue = False
+        lockColumn.Width = 95
+        lockColumn.MinimumWidth = 95
+        grid.Columns.Add(lockColumn)
+
         Dim commitColumn As New DataGridViewButtonColumn()
         commitColumn.Name = "Commit"
         commitColumn.HeaderText = "Commit"
@@ -273,6 +288,7 @@ Public Class CloseLockReviewForm
             End Try
 
             Dim buttonText As String = If(item.IsSafeToUnlock, "Unlock", "Return first")
+            Dim lockText As String = If(item.CanGetLock, "Get Lock", If(item.RequiresLockBeforeCommit, "Required", "—"))
             Dim commitText As String = If(item.CanCommit, "Commit", "—")
             Dim revertText As String = If(item.CanRevert, "Revert", "—")
 
@@ -280,6 +296,7 @@ Public Class CloseLockReviewForm
                 fileName,
                 folderPath,
                 item.StateText,
+                lockText,
                 commitText,
                 revertText,
                 buttonText,
@@ -300,7 +317,10 @@ Public Class CloseLockReviewForm
         Dim rowBackColor As Color
         Dim rowForeColor As Color
 
-        If item.IsStillLocked Then
+        If item.RequiresLockBeforeCommit Then
+            rowBackColor = LockRequiredRowBackColor
+            rowForeColor = LockRequiredRowForeColor
+        ElseIf item.IsStillLocked Then
             rowBackColor = LockedRowBackColor
             rowForeColor = LockedRowForeColor
         Else
@@ -317,6 +337,18 @@ Public Class CloseLockReviewForm
 
         row.Cells("State").Style.Font = gridBoldUiFont
         row.Cells("Result").Style.Font = gridBoldUiFont
+
+        Try
+            Dim lockCell As DataGridViewButtonCell = TryCast(row.Cells("GetLock"), DataGridViewButtonCell)
+            If lockCell IsNot Nothing Then
+                lockCell.FlatStyle = FlatStyle.Flat
+                lockCell.Style.BackColor = rowBackColor
+                lockCell.Style.ForeColor = rowForeColor
+                lockCell.Style.SelectionBackColor = rowBackColor
+                lockCell.Style.SelectionForeColor = rowForeColor
+            End If
+        Catch
+        End Try
 
         If item.IsStillLocked AndAlso Not item.IsSafeToUnlock Then
             'The row remains yellow because the lock is still held, but the red
@@ -347,6 +379,11 @@ Public Class CloseLockReviewForm
         Dim row As DataGridViewRow = grid.Rows(e.RowIndex)
         Dim item As CloseLockReviewItem = TryCast(row.Tag, CloseLockReviewItem)
         If item Is Nothing Then Exit Sub
+
+        If e.ColumnIndex = grid.Columns("GetLock").Index Then
+            StartGetLockForItem(row, item)
+            Exit Sub
+        End If
 
         If e.ColumnIndex = grid.Columns("Commit").Index Then
             StartCommitForItem(row, item)
@@ -412,10 +449,100 @@ Public Class CloseLockReviewForm
         End Try
     End Sub
 
+    Private Sub StartGetLockForItem(ByVal row As DataGridViewRow,
+                                    ByVal item As CloseLockReviewItem)
+        If Not item.RequiresLockBeforeCommit OrElse Not item.CanGetLock Then
+            row.Cells("Result").Value = If(item.IsStillLocked,
+                                            "You already own this lock",
+                                            "This row does not require Get Lock")
+            Exit Sub
+        End If
+
+        Dim errorMessage As String = ""
+
+        unlockInProgress = True
+        pendingLockPath = item.FilePath
+        returnButton.Enabled = False
+        continueButton.Enabled = False
+        grid.Enabled = False
+        item.ResultText = "Getting SVN lock..."
+        row.Cells("Result").Value = item.ResultText
+        row.Cells("Result").Style.ForeColor = Color.DarkGoldenrod
+        grid.Refresh()
+
+        If Not svnModule.lockPathFromCloseReviewPublic(item.FilePath, errorMessage) Then
+            item.ResultText = If(String.IsNullOrWhiteSpace(errorMessage),
+                                 "Get Lock could not be started",
+                                 errorMessage)
+            row.Cells("Result").Value = item.ResultText
+            row.Cells("Result").Style.ForeColor = Color.DarkRed
+            pendingLockPath = ""
+            unlockInProgress = False
+            returnButton.Enabled = True
+            continueButton.Enabled = True
+            grid.Enabled = True
+            UpdateFooter()
+        End If
+    End Sub
+
+    Private Sub CloseReviewLockCompleted(ByVal lockedPath As String,
+                                         ByVal success As Boolean,
+                                         ByVal errorMessage As String)
+        If String.IsNullOrWhiteSpace(pendingLockPath) Then Exit Sub
+        If Not PathsAreSame(lockedPath, pendingLockPath) Then Exit Sub
+
+        Dim completedPath As String = pendingLockPath
+        Dim row As DataGridViewRow = grid.Rows.Cast(Of DataGridViewRow)().FirstOrDefault(
+            Function(candidate)
+                Dim candidateItem As CloseLockReviewItem = TryCast(candidate.Tag, CloseLockReviewItem)
+                Return candidateItem IsNot Nothing AndAlso PathsAreSame(candidateItem.FilePath, completedPath)
+            End Function)
+        Dim item As CloseLockReviewItem = If(row Is Nothing, Nothing, TryCast(row.Tag, CloseLockReviewItem))
+
+        Try
+            If item Is Nothing Then Exit Try
+
+            If Not success Then
+                item.ResultText = If(String.IsNullOrWhiteSpace(errorMessage),
+                                     "SVN did not obtain the lock. Another user may already hold it.",
+                                     errorMessage)
+                row.Cells("Result").Value = item.ResultText
+                row.Cells("Result").Style.ForeColor = Color.DarkRed
+                Exit Try
+            End If
+
+            item.RequiresLockBeforeCommit = False
+            item.CanGetLock = False
+            item.IsStillLocked = True
+            item.IsSafeToUnlock = False
+            item.CanCommit = True
+            item.CanRevert = False
+            item.StateText = "Locked; edits need commit"
+            item.ResultText = "Lock obtained. Select Commit."
+
+            row.Cells("State").Value = item.StateText
+            row.Cells("GetLock").Value = "Locked"
+            row.Cells("Commit").Value = "Commit"
+            row.Cells("Revert").Value = "—"
+            row.Cells("Unlock").Value = "Return first"
+            row.Cells("Result").Value = item.ResultText
+            ApplyRowVisualState(row, item)
+        Finally
+            pendingLockPath = ""
+            unlockInProgress = False
+            returnButton.Enabled = True
+            continueButton.Enabled = True
+            grid.Enabled = True
+            UpdateFooter()
+        End Try
+    End Sub
+
     Private Sub StartCommitForItem(ByVal row As DataGridViewRow,
                                    ByVal item As CloseLockReviewItem)
         If Not item.CanCommit Then
-            row.Cells("Result").Value = "This file has no committable local change"
+            row.Cells("Result").Value = If(item.RequiresLockBeforeCommit,
+                                            "Select Get Lock first; Commit is disabled until SVN confirms the lock",
+                                            "This file has no committable local change")
             Exit Sub
         End If
 
@@ -511,6 +638,7 @@ Public Class CloseLockReviewForm
             End If
 
             row.Cells("State").Value = item.StateText
+            row.Cells("GetLock").Value = If(item.CanGetLock, "Get Lock", "—")
             row.Cells("Commit").Value = If(item.CanCommit, "Commit", "—")
             row.Cells("Revert").Value = If(item.CanRevert, "Revert", "—")
             row.Cells("Unlock").Value = If(item.IsStillLocked AndAlso item.IsSafeToUnlock,
@@ -654,6 +782,7 @@ Public Class CloseLockReviewForm
             End If
 
             row.Cells("State").Value = item.StateText
+            row.Cells("GetLock").Value = If(item.CanGetLock, "Get Lock", "—")
             row.Cells("Commit").Value = If(item.CanCommit, "Commit", "—")
             row.Cells("Revert").Value = If(item.CanRevert, "Revert", "—")
             row.Cells("Unlock").Value = If(item.IsStillLocked AndAlso item.IsSafeToUnlock,
@@ -683,11 +812,13 @@ Public Class CloseLockReviewForm
 
     Private Sub UpdateFooter()
         Dim stillLocked As Integer = reviewItems.FindAll(Function(item) item.IsStillLocked).Count
-        Dim unlocked As Integer = reviewItems.Count - stillLocked
+        Dim lockRequired As Integer = reviewItems.FindAll(Function(item) item.RequiresLockBeforeCommit).Count
+        Dim unlocked As Integer = reviewItems.Count - stillLocked - lockRequired
         Dim unsafeCount As Integer = reviewItems.FindAll(Function(item) Not item.IsSafeToUnlock).Count
 
         footerLabel.Text =
             "Locks remaining: " & stillLocked.ToString() &
+            "    Lock required: " & lockRequired.ToString() &
             "    Unlocked now: " & unlocked.ToString()
 
         If unsafeCount > 0 Then
@@ -755,5 +886,6 @@ Public Class CloseLockReviewForm
     Private Sub CloseLockReviewForm_FormClosed(sender As Object, e As FormClosedEventArgs)
         RemoveHandler svnModule.CloseReviewCommitCompleted, AddressOf CloseReviewCommitCompleted
         RemoveHandler svnModule.CloseReviewRevertCompleted, AddressOf CloseReviewRevertCompleted
+        RemoveHandler svnModule.CloseReviewLockCompleted, AddressOf CloseReviewLockCompleted
     End Sub
 End Class
