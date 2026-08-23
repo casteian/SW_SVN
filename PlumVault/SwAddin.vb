@@ -171,6 +171,7 @@ Public Class SwAddin
     Function DisconnectFromSW() As Boolean Implements SolidWorks.Interop.swpublished.SwAddin.DisconnectFromSW
 
         UninstallMainWindowCloseGuard()
+        SolidWorksCtrlWCloseGuardKeyboardHook.Uninstall()
         'RemoveCommandMgr()
         RemoveTaskPane()
         DetachEventHandlers()
@@ -543,8 +544,10 @@ Public Class SwAddin
             'AddHandler iSwApp.DocumentLoadNotify2, AddressOf Me.SldWorks_DocumentLoadNotify2
             AddHandler iSwApp.FileNewNotify2, AddressOf Me.SldWorks_FileNewNotify2
             AddHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.SldWorks_ActiveModelDocChangeNotify
+            AddHandler iSwApp.FileOpenPreNotify, AddressOf Me.SldWorks_FileOpenPreNotify
             AddHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
             AddHandler iSwApp.CommandOpenPreNotify, AddressOf Me.SldWorks_CommandOpenPreNotify
+            AddHandler iSwApp.CommandCloseNotify, AddressOf Me.SldWorks_CommandCloseNotify
 
         Catch e As Exception
             Console.WriteLine(e.Message)
@@ -557,8 +560,10 @@ Public Class SwAddin
             'RemoveHandler iSwApp.DocumentLoadNotify2, AddressOf Me.SldWorks_DocumentLoadNotify2
             RemoveHandler iSwApp.FileNewNotify2, AddressOf Me.SldWorks_FileNewNotify2
             RemoveHandler iSwApp.ActiveModelDocChangeNotify, AddressOf Me.SldWorks_ActiveModelDocChangeNotify
+            RemoveHandler iSwApp.FileOpenPreNotify, AddressOf Me.SldWorks_FileOpenPreNotify
             RemoveHandler iSwApp.FileOpenPostNotify, AddressOf Me.SldWorks_FileOpenPostNotify
             RemoveHandler iSwApp.CommandOpenPreNotify, AddressOf Me.SldWorks_CommandOpenPreNotify
+            RemoveHandler iSwApp.CommandCloseNotify, AddressOf Me.SldWorks_CommandCloseNotify
 
         Catch e As Exception
             Console.WriteLine(e.Message)
@@ -629,6 +634,11 @@ Public Class SwAddin
         Return svnModule.handleSolidWorksCommandOpenPreNotifyPublic(Command, UserCommand)
     End Function
 
+    Private Function SldWorks_CommandCloseNotify(ByVal Command As Integer,
+                                                  ByVal Reason As Integer) As Integer
+        Return svnModule.handleSolidWorksCommandCloseNotifyPublic(Command, Reason)
+    End Function
+
     Function SldWorks_FileNewNotify2(ByVal newDoc As Object, ByVal doctype As Integer, ByVal templateName As String) As Integer
         AttachEventsToAllDocuments()
 
@@ -637,7 +647,11 @@ Public Class SwAddin
 
     Function SldWorks_ActiveModelDocChangeNotify() As Integer
         AttachEventsToAllDocuments()
-        myTaskPaneHost.switchTreeViewToCurrentModel()
+        'A normal window switch should reuse the stored tree. FileOpenPostNotify performs the
+        'full rebuild for newly opened/reopened documents, where stale COM-backed node tags are
+        'actually possible. Rebuilding here as well caused a visible redraw on every jump
+        'between part, subassembly, drawing, and top-level assembly windows.
+        myTaskPaneHost.switchTreeViewToCurrentModel(bRetryWithRefresh:=False)
 
         'Dim mycontextmenu As New UserControl1.myContextMenuClass(iSwApp.ActiveDoc, iSwApp)
         'myTaskPaneHost.ContextMenuStrip.Items.AddRange({mycontextmenu.openLabel})
@@ -645,11 +659,20 @@ Public Class SwAddin
         Return 0
     End Function
 
+    Private Function SldWorks_FileOpenPreNotify(ByVal FileName As String) As Integer
+        Return svnModule.handleSolidWorksFileOpenPreNotifyPublic(FileName)
+    End Function
+
     Function SldWorks_FileOpenPostNotify(ByVal FileName As String) As Integer
         AttachEventsToAllDocuments()
 
         myTaskPaneHost.switchTreeViewToCurrentModel()
-        myTaskPaneHost.externalSetReadWriteFromLockStatus1()
+
+        'ActiveDocChangeNotify already performs the interaction-scoped writable/read-only
+        'reconciliation. Do not run the legacy every-cached-document SetReadOnlyState sweep
+        'again here: before Sync its stale status array can disagree with the live local lock
+        'check, flip documents back and forth, trigger more SOLIDWORKS events, and create
+        'false dirty/save flags.
 
         Return 0
     End Function

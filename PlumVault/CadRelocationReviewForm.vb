@@ -103,6 +103,7 @@ Public Class CadRelocationReviewForm
         nameTextBox.Text = Path.GetFileNameWithoutExtension(sourcePath)
         nameTextBox.ReadOnly = (mode = CadRelocationMode.Move)
         fields.Controls.Add(nameTextBox, 1, 0)
+        fields.SetColumnSpan(nameTextBox, 2)
 
         fields.Controls.Add(New Label() With {.Text = "Destination folder", .AutoSize = True, .Anchor = AnchorStyles.Left}, 0, 1)
         folderTextBox.Dock = DockStyle.Fill
@@ -195,6 +196,8 @@ Public Class CadRelocationReviewForm
         grid.AllowUserToResizeRows = True
         grid.AutoGenerateColumns = False
         grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells
+        grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+        grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize
         grid.RowHeadersVisible = False
         grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
         grid.MultiSelect = False
@@ -204,32 +207,37 @@ Public Class CadRelocationReviewForm
         grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .HeaderText = "File",
             .Name = "File",
-            .Width = 180,
-            .MinimumWidth = 130
+            .Width = 260,
+            .MinimumWidth = 180,
+            .FillWeight = 25.0F
         })
         grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .HeaderText = "Role",
             .Name = "Role",
             .Width = 130,
-            .MinimumWidth = 100
+            .MinimumWidth = 100,
+            .FillWeight = 12.0F
         })
         grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .HeaderText = "State",
             .Name = "State",
             .Width = 155,
-            .MinimumWidth = 120
+            .MinimumWidth = 120,
+            .FillWeight = 14.0F
         })
         grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .HeaderText = "Check",
             .Name = "Check",
             .Width = 90,
-            .MinimumWidth = 75
+            .MinimumWidth = 75,
+            .FillWeight = 9.0F
         })
         grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .HeaderText = "Explanation",
             .Name = "Explanation",
             .AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            .MinimumWidth = 280
+            .MinimumWidth = 280,
+            .FillWeight = 40.0F
         })
     End Sub
 
@@ -301,14 +309,19 @@ Public Class CadRelocationReviewForm
                 'Selection color must match the row's state color, not the WinForms default
                 'blue - otherwise selecting/clicking a row (which DataGridView does on any
                 'cell click) hides the ready/not-ready state the color is there to show.
+                'ForeColor is explicit (Color.Black), not read back from DefaultCellStyle -
+                'that property is never set elsewhere on this grid, so reading it back returns
+                'Color.Empty, which rendered as near-invisible text once used as SelectionForeColor.
                 If Not item.IsReady Then
                     grid.Rows(index).DefaultCellStyle.BackColor = Color.MistyRose
                     grid.Rows(index).DefaultCellStyle.SelectionBackColor = Color.MistyRose
-                    grid.Rows(index).DefaultCellStyle.SelectionForeColor = grid.Rows(index).DefaultCellStyle.ForeColor
+                    grid.Rows(index).DefaultCellStyle.ForeColor = Color.Black
+                    grid.Rows(index).DefaultCellStyle.SelectionForeColor = Color.Black
                 Else
                     grid.Rows(index).DefaultCellStyle.BackColor = Color.Honeydew
                     grid.Rows(index).DefaultCellStyle.SelectionBackColor = Color.Honeydew
-                    grid.Rows(index).DefaultCellStyle.SelectionForeColor = grid.Rows(index).DefaultCellStyle.ForeColor
+                    grid.Rows(index).DefaultCellStyle.ForeColor = Color.Black
+                    grid.Rows(index).DefaultCellStyle.SelectionForeColor = Color.Black
                 End If
             Next
 

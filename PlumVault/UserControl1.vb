@@ -68,6 +68,7 @@ Public Class UserControl1
     Private lastLiveCheckedActivePath As String = ""
     Private lastGraphicalSelectionPath As String = ""
     Private lastGraphicalSelectionComponentName As String = ""
+    Private lastExplicitSvnTreeClickUtc As DateTime = DateTime.MinValue
     Private lastGraphicallyHighlightedTreeNode As TreeNode = Nothing
     Private ReadOnly treeSelectionBackColor As Color = Color.FromArgb(0, 82, 180)
     Private ReadOnly treeSelectionForeColor As Color = Color.White
@@ -1327,7 +1328,13 @@ Public Class UserControl1
                 For Each node As TreeNode In batchSelectedTreeNodes
                     addTreeNodePathToBatchActionList(node, seen, output)
                 Next
-            ElseIf includeSingleSelectedNode AndAlso isCurrentTreeSelectionExplicitForFileAction() Then
+            ElseIf includeSingleSelectedNode AndAlso TreeView1 IsNot Nothing AndAlso
+                   TreeView1.SelectedNode IsNot Nothing Then
+                'The row visibly selected in the SVN pane is the authoritative single-file
+                'target, whether it was selected directly or synchronized from SOLIDWORKS.
+                'Previously the synchronized row looked selected but Commit/Get Locks silently
+                'fell back to ActiveDoc (usually the top assembly), which disconnected UI from
+                'the operation the user actually requested.
                 addTreeNodePathToBatchActionList(TreeView1.SelectedNode, seen, output)
             End If
         Catch
@@ -1672,6 +1679,7 @@ Public Class UserControl1
         ensureCopyLegacyDataToSvnMenuItem()
         ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
+        ToolStripDropDownButUnlock.Visible = False
 
         liveChangeCheckTimer = New System.Windows.Forms.Timer()
         liveChangeCheckTimer.Interval = 30000 '30 seconds
@@ -1783,6 +1791,7 @@ Public Class UserControl1
 
             If iSwApp Is Nothing Then Exit Sub
             If TreeView1 Is Nothing OrElse TreeView1.Nodes Is Nothing OrElse TreeView1.Nodes.Count = 0 Then Exit Sub
+            If (DateTime.UtcNow - lastExplicitSvnTreeClickUtc).TotalSeconds < 5.0 Then Exit Sub
 
             Dim selectedComponentName As String = ""
             Dim selectedPath As String = getCurrentGraphicalSelectionCadPath(selectedComponentName)
@@ -1866,10 +1875,12 @@ Public Class UserControl1
 
         Dim matchedNode As TreeNode = Nothing
         Dim visitedCount As Integer = 0
+        Dim updateStarted As Boolean = False
 
         Try
-            TreeView1.BeginUpdate()
-
+            'Searching is read-only. Do not bracket every 500-ms retry in BeginUpdate/EndUpdate:
+            'when the status/tree cache is not ready yet, a failed lookup used to call EndUpdate
+            'anyway and force a full repaint forever until Sync created the matching node.
             For Each rootNode As TreeNode In TreeView1.Nodes
                 'Large vehicle assemblies can easily exceed 750 visible/lazy nodes. This work
                 'runs only when the selected path changes and performs no SVN/server calls.
@@ -1888,6 +1899,8 @@ Public Class UserControl1
                 Return False
             End If
 
+            TreeView1.BeginUpdate()
+            updateStarted = True
             expandParentsForTreeNode(matchedNode)
             TreeView1.SelectedNode = matchedNode
             matchedNode.EnsureVisible()
@@ -1900,10 +1913,12 @@ Public Class UserControl1
             'If the user wants Sync to target this branch, they can click the node in the SVN tree.
         Catch
         Finally
-            Try
-                TreeView1.EndUpdate()
-            Catch
-            End Try
+            If updateStarted Then
+                Try
+                    TreeView1.EndUpdate()
+                Catch
+                End Try
+            End If
         End Try
 
         Return False
@@ -2375,6 +2390,13 @@ Public Class UserControl1
         'The user does NOT need to keep Ctrl or Shift held while clicking Commit.
         'If there is no batch selection, this helper falls back to the exact single tree node.
         Dim selectedTreePaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
+
+        If selectedTreePaths IsNot Nothing AndAlso selectedTreePaths.Length > 0 Then
+            Try
+                svnModule.logOperationPublic("Commit visible tree selection: " & String.Join(" | ", selectedTreePaths))
+            Catch
+            End Try
+        End If
 
         'A brand-new document has no physical path yet, so the normal path-first Commit
         'workflow cannot act on it. When there is no explicit tree selection, Commit now
@@ -3181,13 +3203,16 @@ Public Class UserControl1
 
             refreshCurrentTreeViewOnly()
 
+            'Writable/read-only state is interaction-scoped. The two former calls below both
+            'ran the legacy bulk SetReadOnlyState loop across every cached open document; they
+            'were duplicates and could produce rebuild/false-dirty cascades during Refresh.
             Try
-                statusOfAllOpenModels.setReadWriteFromLockStatus()
+                svnModule.reconcileWriteAccessForActiveDocumentPublic()
             Catch
             End Try
 
             Try
-                externalSetReadWriteFromLockStatus()
+                svnModule.reconcileReadOnlyForUnlockedActiveDocumentPublic()
             Catch
             End Try
 
@@ -3301,6 +3326,7 @@ Public Class UserControl1
         Try
             If e IsNot Nothing AndAlso e.Node IsNot Nothing Then
                 clickedNode = e.Node
+                lastExplicitSvnTreeClickUtc = DateTime.UtcNow
                 clearGraphicalTreeHighlight()
                 TreeView1.SelectedNode = clickedNode
                 rememberExplicitTreeActionSelection(clickedNode)
@@ -5711,13 +5737,6 @@ Public Class UserControl1
         End Try
 
         If filePaths Is Nothing OrElse filePaths.Length = 0 Then Exit Sub
-
-        If success Then
-            Try
-                setOpenDocsReadOnlyForFilePathsPublic(filePaths)
-            Catch
-            End Try
-        End If
 
         Dim normalizedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 

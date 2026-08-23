@@ -41,7 +41,18 @@ Claude. Always say so explicitly rather than claiming a fix "works."
   `BeginInContextEditNotify`/`EndInContextEditNotify`, etc). Also has the Ctrl+W /
   document-window close guard (`SolidWorksCtrlWCloseGuardKeyboardHook`,
   `SolidWorksDocumentCloseGuardWindowHook`) — the *document-level* close guard, distinct from
-  the app-level one in SwAddin.vb.
+  the app-level one in SwAddin.vb. **`SolidWorksCtrlWCloseGuardKeyboardHook` is a raw
+  `SetWindowsHookEx(WH_KEYBOARD, ...)` low-level hook** (needed because SOLIDWORKS' own
+  accelerator table likely consumes Ctrl+W before it ever reaches a subclassed window's
+  `WM_KEYDOWN`, unlike the small-X/Window-menu-close paths, which route through
+  `SolidWorksDocumentCloseGuardWindowHook`'s normal `WndProc` override). **Never run the full
+  safety check (which can show a modal review dialog) synchronously inside that raw hook
+  callback** — it must return quickly, and a modal dialog there fights the same message pump
+  the hook is currently suspended inside. The keyboard hook now always eats Ctrl+W immediately
+  and defers the real check to `svnModule.queueDeferredCtrlWCloseCheckPublic` (`BeginInvoke`,
+  runs on the normal UI thread), replaying the close itself via `CloseDoc` if that deferred
+  check comes back clean. This was root-caused this session: showing the dialog synchronously
+  in the hook was the likely reason the review table never appeared for Ctrl+W specifically.
 - **`UserControl1.vb` / `UserControl1.Designer.vb`** — the task-pane UI: tree view, the
   toolstrip buttons (Get Locks/Commit/Unlock/Get Latest/Releases in the main `ToolStrip1`,
   Save As/Re-ID/Move in the separate `FileActionToolStrip`), and several `Timer`s (live
@@ -111,16 +122,28 @@ outside of an edit Claude just made:
   (case-insensitive). Canonical copy is `isValidGrc27FileName` in svnModule.vb; each
   review-table form has its own inline copy (`isValidGrcFileName`) rather than a shared
   cross-module call.
-- **Assembly-edit-protection guard**: blocks/undoes structural edits (add/delete component,
-  move, dimension change, new mate) on an assembly the user doesn't hold the lock on, *unless*
+- **CAD edit-protection guard**: cancellable pre-events block edits (including feature/sketch
+  edits and deletes) when the exact part or assembly owner is not locked. Post-events for
+  actions SOLIDWORKS cannot cancel safely are warning-only: **never call `EditUndo2` from a
+  guard callback**. Native Undo during an active feature/assembly transaction caused process
+  crashes and could remove unrelated designer work. Structural assembly edits (add/delete,
+  move, dimension change, new mate) require the owning assembly lock, *unless*
   the edit targets a separately file-backed child that *does* have its own lock and is being
   edited in-context. In-context detection uses `BeginInContextEditNotify`/
   `EndInContextEditNotify` (not just `AssemblyDoc.GetEditTarget()`, which can already be
-  `Nothing` again by the time the corresponding `ModifyNotify` fires). **Explicitly exempt**
-  from this guard: suppress/unsuppress, hide/show, and transparency/visual-property changes —
-  these are local viewing state, not real edits, and the user confirmed this is intentional
-  (a user locked out of the top assembly still needs to hide/suppress siblings while working
-  on one part they do hold the lock on).
+  `Nothing` again by the time the corresponding `ModifyNotify` fires). Suppressing/unsuppressing
+  a component (`ComponentStateChangeNotify`/`Notify2`, `EventHandling.vb`'s
+  `ComponentStateChange`) is guarded the same as add/delete/move — it changes what's actually
+  persisted and computed in the assembly, unlike hide/show and transparency, which remain
+  **explicitly exempt** as pure local viewing state (a user locked out of the top assembly
+  still needs to hide siblings while working on one part they do hold the lock on). This was
+  corrected after initially exempting suppress/unsuppress too; the user clarified suppression
+  is a real edit, not viewing state, and it should be blocked like any other. A feature can be
+  suppressed directly under an expanded, separately file-backed nested assembly without first
+  entering Edit Assembly. In that case the nested assembly that owns the feature requires the
+  lock—not the top-level assembly. Capture that owner in `CommandOpenPreNotify`; the subsequent
+  component-state/Modify events can be broadcast on every ancestor and no longer identify the
+  persisted edit owner reliably.
 - **Rebuild vs. real edit**: `RegenNotify`/`RegenPostNotify` bracket a genuine SolidWorks
   rebuild, tracked per assembly path with a 30-minute staleness expiry (self-healing if a
   `RegenPostNotify` is ever lost) — used to stop a rebuild that only picked up an
@@ -128,15 +151,43 @@ outside of an edit Claude just made:
 - **Writable-state reconciliation is interaction-scoped.** Acquiring locks clears the
   on-disk read-only bit for every successfully locked file, but an already-open SOLIDWORKS
   document is switched out of its internal read-only state only when it is the active
-  document or an actively edited in-context child. Bulk `SetReadOnlyState(False)` calls can
-  trigger rebuild/false-dirty cascades across sibling documents; do not restore broad
-  every-locked-open-document reconciliation.
+  document, an actively edited in-context child, or the exact locked nested assembly whose
+  feature is about to be suppressed/unsuppressed. Edit Part/Edit Assembly/Edit Feature/Edit
+  Sketch never obtains an SVN lock automatically: the user must use Get Locks. Once that exact
+  target's live local lock token is verified, its open document is switched writable
+  synchronously before the native edit command so SOLIDWORKS does not show its own read-only
+  Yes/No prompt. During a valid in-context edit of a locked child, the exact unlocked hosting
+  assembly may be made temporarily writable solely so every native exit route can complete
+  without SOLIDWORKS' repeated parent-read-only prompt. The parent is never saved and its
+  original internal/on-disk read-only state is restored after `EndInContextEditNotify`.
+  A dirty commit target is likewise switched synchronously immediately before
+  its required `Save3`. Bulk `SetReadOnlyState(False)` calls can trigger rebuild/false-dirty
+  cascades across sibling documents; do not restore broad every-locked-open-document
+  reconciliation.
+- **The visibly selected SVN-tree CAD row is the single-file action target.** It is authoritative
+  for Get Locks, Commit, and other single-row file actions whether selected by a direct task-pane
+  click or by graphical-selection synchronization from SOLIDWORKS. Never display one selected
+  row and silently fall back to ActiveDoc/the top assembly for the actual operation.
 - **Verified application close is controlled.** Once the retained-lock table and the open-
-  document/SVN dirty checks have passed, PlumVault queues `CloseAllDocuments(True)` and then
-  `ExitApp` instead of returning to native SOLIDWORKS close. This intentionally discards only
-  dirty flags already classified as noncommittable/SVN-clean and avoids a second misleading
-  native "Save modified documents" prompt after lock release. Any scan error fails closed;
-  never call `CloseAllDocuments(True)` before the safety checks succeed.
+  document/SVN dirty checks have passed, `blockCloseIfOpenDocsUnsafe` calls
+  `queueVerifiedSafeApplicationClose`, which defers (via `BeginInvoke`, outside the WM_CLOSE
+  callback) to `continueVerifiedSafeApplicationClose` → `closeAllVerifiedDocumentsWithoutSaving`
+  — an explicit per-document `CloseDoc(title)` loop (drawings, then assemblies, then parts, up
+  to 8 passes) — and only then `ExitApp`. (Older `CloseAllDocuments(True)` wording describes a
+  prior implementation; the current one is this per-document loop, functionally the same intent
+  — nothing is handed back to native SOLIDWORKS close with a dirty flag still set.) This
+  intentionally discards only dirty flags already classified as noncommittable/SVN-clean and
+  is meant to avoid a second misleading native "Save modified documents" prompt after lock
+  release. **As of the last session this was not fully confirmed live** — the user saw the
+  native prompt appear after using the table's "Close SOLIDWORKS" button at least once; see
+  WORK_PLAN.md. `closeAllVerifiedDocumentsWithoutSaving` closes documents by `GetTitle()`
+  string via `CloseDoc`, which is a plausible failure point if two open documents ever share a
+  title (unverified). Any scan error fails closed; never let a controlled close proceed before
+  the safety checks succeed.
+- **Commit/unlock completion refreshes local status before recoloring the tree.** Updating only
+  `statusCacheByNormalizedPath` is insufficient because the visible task-pane rows are rendered
+  from `statusOfAllOpenModels`; otherwise a released lock remains displayed as `[Locked by you]`
+  until the user manually clicks Refresh.
 - **Locking is per-file, independent; committing is atomic and bundled.** `svnlock` runs one
   `svn.exe` call *per file* (`bEach:=True`) so one file already locked by a teammate doesn't
   cause every other file in the same request to be reported as failed — this was a real,

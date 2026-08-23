@@ -97,6 +97,10 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
                                                ByVal lParam As IntPtr) As IntPtr
     End Function
 
+    <DllImport("user32.dll", SetLastError:=True)>
+    Private Shared Function UnhookWindowsHookEx(ByVal hhk As IntPtr) As Boolean
+    End Function
+
     <DllImport("user32.dll")>
     Private Shared Function GetKeyState(ByVal nVirtKey As Integer) As Short
     End Function
@@ -117,6 +121,18 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
                 )
         Catch
             hookHandle = IntPtr.Zero
+        End Try
+    End Sub
+
+    Public Shared Sub Uninstall()
+        Dim handleToRelease As IntPtr = hookHandle
+        hookHandle = IntPtr.Zero
+
+        If handleToRelease = IntPtr.Zero Then Exit Sub
+
+        Try
+            UnhookWindowsHookEx(handleToRelease)
+        Catch
         End Try
     End Sub
 
@@ -144,9 +160,18 @@ Public Class SolidWorksCtrlWCloseGuardKeyboardHook
                                 IsKeyCurrentlyDown(VK_RCONTROL)
 
                         If ctrlDown Then
-                            If SolidWorksCloseGuardCoordinator.ShouldBlockActiveDocumentClose() Then
-                                Return New IntPtr(1) 'Eat Ctrl+W, preventing SOLIDWORKS from closing the document.
-                            End If
+                            'Always eat Ctrl+W here and defer the actual safety check off this
+                            'raw WH_KEYBOARD callback. Calling ShouldBlockActiveDocumentClose()
+                            '(which can synchronously show the review dialog and query SVN)
+                            'directly inside a low-level keyboard hook is a known-unsafe pattern -
+                            'the hook is expected to return quickly, and a modal dialog shown from
+                            'here fights the same message pump that is currently suspended inside
+                            'the hook procedure. This was the likely cause of the review table
+                            'failing to appear specifically for Ctrl+W, unlike the small-X/
+                            'Window-menu-close paths, which run through a normal WndProc override
+                            'in SolidWorksDocumentCloseGuardWindowHook and are not affected.
+                            svnModule.queueDeferredCtrlWCloseCheckPublic()
+                            Return New IntPtr(1) 'Eat Ctrl+W; the deferred check decides what happens next.
                         End If
                     End If
                 End If
@@ -391,6 +416,10 @@ Public Class PartEventHandler
         AddHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
         AddHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
         AddHandler iPart.ModifyNotify, AddressOf Me.PartDoc_ModifyNotify
+        AddHandler iPart.AddItemNotify, AddressOf Me.PartDoc_AddItemNotify
+        AddHandler iPart.DeleteItemPreNotify, AddressOf Me.PartDoc_DeleteItemPreNotify
+        AddHandler iPart.FeatureEditPreNotify, AddressOf Me.PartDoc_FeatureEditPreNotify
+        AddHandler iPart.FeatureSketchEditPreNotify, AddressOf Me.PartDoc_FeatureSketchEditPreNotify
         AddHandler iPart.RegenNotify, AddressOf Me.PartDoc_RegenNotify
         AddHandler iPart.RegenPostNotify, AddressOf Me.PartDoc_RegenPostNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
@@ -413,6 +442,10 @@ Public Class PartEventHandler
             RemoveHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
             RemoveHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
             RemoveHandler iPart.ModifyNotify, AddressOf Me.PartDoc_ModifyNotify
+            RemoveHandler iPart.AddItemNotify, AddressOf Me.PartDoc_AddItemNotify
+            RemoveHandler iPart.DeleteItemPreNotify, AddressOf Me.PartDoc_DeleteItemPreNotify
+            RemoveHandler iPart.FeatureEditPreNotify, AddressOf Me.PartDoc_FeatureEditPreNotify
+            RemoveHandler iPart.FeatureSketchEditPreNotify, AddressOf Me.PartDoc_FeatureSketchEditPreNotify
             RemoveHandler iPart.RegenNotify, AddressOf Me.PartDoc_RegenNotify
             RemoveHandler iPart.RegenPostNotify, AddressOf Me.PartDoc_RegenPostNotify
             RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
@@ -454,6 +487,29 @@ Public Class PartEventHandler
     Private Function PartDoc_ModifyNotify() As Integer
         svnModule.handlePartOwnedEditPostPublic(iDocument, "editing this part")
         Return 0
+    End Function
+
+    Private Function PartDoc_AddItemNotify(ByVal EntityType As Integer,
+                                            ByVal itemName As String) As Integer
+        svnModule.handlePartOwnedEditPostPublic(iDocument, "adding " & itemName)
+        Return 0
+    End Function
+
+    Private Function PartDoc_DeleteItemPreNotify(ByVal EntityType As Integer,
+                                                  ByVal itemName As String) As Integer
+        Return svnModule.blockSelectedCadDestructiveEditPrePublic(
+            iDocument,
+            "delete " & itemName
+        )
+    End Function
+
+    Private Function PartDoc_FeatureEditPreNotify(ByVal editFeature As Object) As Integer
+        Return svnModule.handleCadFeatureEditPrePublic(iDocument, "editing this part feature", editFeature)
+    End Function
+
+    Private Function PartDoc_FeatureSketchEditPreNotify(ByVal editFeature As Object,
+                                                        ByVal featureSketch As Object) As Integer
+        Return svnModule.handleCadFeatureEditPrePublic(iDocument, "editing this part sketch", editFeature)
     End Function
 
     Private Function PartDoc_RegenNotify() As Integer
@@ -527,7 +583,7 @@ Public Class AssemblyEventHandler
         AddHandler iAssembly.NewSelectionNotify, AddressOf Me.AssemblyDoc_NewSelectionNotify
 
         'Assembly-owned edit protection. Pre-notify events block directly; post-notify
-        'events are safely undone one UI turn later when the assembly is not locked.
+        'events warn without mutating SOLIDWORKS' undo stack.
         AddHandler iAssembly.ModifyNotify, AddressOf Me.AssemblyDoc_ModifyNotify
         AddHandler iAssembly.ComponentMoveNotify2, AddressOf Me.AssemblyDoc_ComponentMoveNotify2
         AddHandler iAssembly.ComponentReorganizeNotify, AddressOf Me.AssemblyDoc_ComponentReorganizeNotify
@@ -535,6 +591,8 @@ Public Class AssemblyEventHandler
         AddHandler iAssembly.DeleteItemPreNotify, AddressOf Me.AssemblyDoc_DeleteItemPreNotify
         AddHandler iAssembly.PreRenameItemNotify, AddressOf Me.AssemblyDoc_PreRenameItemNotify
         AddHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
+        AddHandler iAssembly.FeatureEditPreNotify, AddressOf Me.AssemblyDoc_FeatureEditPreNotify
+        AddHandler iAssembly.FeatureSketchEditPreNotify, AddressOf Me.AssemblyDoc_FeatureSketchEditPreNotify
 
         AddHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
         AddHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
@@ -572,6 +630,8 @@ Public Class AssemblyEventHandler
             RemoveHandler iAssembly.DeleteItemPreNotify, AddressOf Me.AssemblyDoc_DeleteItemPreNotify
             RemoveHandler iAssembly.PreRenameItemNotify, AddressOf Me.AssemblyDoc_PreRenameItemNotify
             RemoveHandler iAssembly.DimensionChangeNotify, AddressOf Me.AssemblyDoc_DimensionChangeNotify
+            RemoveHandler iAssembly.FeatureEditPreNotify, AddressOf Me.AssemblyDoc_FeatureEditPreNotify
+            RemoveHandler iAssembly.FeatureSketchEditPreNotify, AddressOf Me.AssemblyDoc_FeatureSketchEditPreNotify
             RemoveHandler iAssembly.ComponentStateChangeNotify, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify
             RemoveHandler iAssembly.ComponentStateChangeNotify2, AddressOf Me.AssemblyDoc_ComponentStateChangeNotify2
             RemoveHandler iAssembly.ComponentVisibleChangeNotify, AddressOf Me.AssemblyDoc_ComponentVisibleChangeNotify
@@ -633,6 +693,7 @@ Public Class AssemblyEventHandler
 
     Function AssemblyDoc_NewSelectionNotify() As Integer
         svnModule.noteAssemblySelectionContextPublic(iDocument)
+        svnModule.noteSelectedAssemblyFeatureOwnerPublic(iDocument)
 
         Try
             If swAddin IsNot Nothing AndAlso swAddin.myTaskPaneHost IsNot Nothing Then
@@ -653,13 +714,14 @@ Public Class AssemblyEventHandler
         'ModifyNotify is also raised while a child-owned dimension dialog is active.
         'The module permits that narrow case only when the selected external child has its lock.
         svnModule.handleAssemblyOwnedEditPostPublic(
-            iDocument,
+            svnModule.getSelectedAssemblyEditOwnerPublic(iDocument, selectedDocumentOwnsEdit:=True),
             "assembly-level modification",
             allowLockedChildDimensionFallback:=True,
             allowRecentlyEndedInContextEdit:=True,
             allowDisplayOnlyFallback:=True,
             allowRebuildModifyFallback:=True,
-            allowActiveChildEditContext:=True
+            allowActiveChildEditContext:=True,
+            allowPendingSuppressionCommandFallback:=True
         )
         Return 0
     End Function
@@ -690,6 +752,15 @@ Public Class AssemblyEventHandler
     Function AssemblyDoc_EndInContextEditNotify(ByVal docBeingEdited As Object, ByVal docType As Integer) As Integer
         svnModule.noteInContextEditEndedPublic(iDocument, TryCast(docBeingEdited, ModelDoc2))
         Return 0
+    End Function
+
+    Private Function AssemblyDoc_FeatureEditPreNotify(ByVal editFeature As Object) As Integer
+        Return svnModule.handleCadFeatureEditPrePublic(iDocument, "editing the selected feature", editFeature)
+    End Function
+
+    Private Function AssemblyDoc_FeatureSketchEditPreNotify(ByVal editFeature As Object,
+                                                            ByVal featureSketch As Object) As Integer
+        Return svnModule.handleCadFeatureEditPrePublic(iDocument, "editing the selected sketch", editFeature)
     End Function
 
     Private Function AssemblyDoc_ComponentMoveNotify2(ByRef Components As Object) As Integer
@@ -732,8 +803,6 @@ Public Class AssemblyEventHandler
                 End If
             Catch
             End Try
-
-            svnModule.offerFirstSaveAfterInsertOnNewAssemblyPublic(iDocument)
         End If
 
         If currentComponentCount >= 0 Then lastKnownComponentCount = currentComponentCount
@@ -751,7 +820,10 @@ Public Class AssemblyEventHandler
     End Function
 
     Private Function AssemblyDoc_DeleteItemPreNotify(ByVal EntityType As Integer, ByVal itemName As String) As Integer
-        Return svnModule.blockAssemblyOwnedEditPrePublic(iDocument, "deleting " & itemName)
+        Return svnModule.blockSelectedCadDestructiveEditPrePublic(
+            iDocument,
+            "delete " & itemName
+        )
     End Function
 
     Private Function AssemblyDoc_PreRenameItemNotify(ByVal EntityType As Integer,
@@ -761,14 +833,28 @@ Public Class AssemblyEventHandler
     End Function
 
     Private Function AssemblyDoc_DimensionChangeNotify(ByVal displayDim As Object) As Integer
-        svnModule.handleAssemblyDimensionChangePostPublic(iDocument, displayDim)
+        Dim editOwner As ModelDoc2 = svnModule.getSelectedAssemblyEditOwnerPublic(
+            iDocument,
+            selectedDocumentOwnsEdit:=True
+        )
+        svnModule.handleAssemblyDimensionChangePostPublic(editOwner, displayDim)
         Return 0
     End Function
 
-    Protected Function ComponentStateChange(ByVal componentModel As Object, Optional ByVal newCompState As Short = swComponentSuppressionState_e.swComponentResolved) As Integer
+    Protected Function ComponentStateChange(ByVal componentModel As Object,
+                                            Optional ByVal newCompState As Short = swComponentSuppressionState_e.swComponentResolved,
+                                            Optional ByVal componentName As String = "") As Integer
 
         Dim modDoc As ModelDoc2 = componentModel
         Dim newState As swComponentSuppressionState_e = newCompState
+        Dim editOwner As ModelDoc2 = Nothing
+
+        If Not String.IsNullOrWhiteSpace(componentName) Then
+            editOwner = svnModule.getAssemblyEditOwnerForComponentStatePublic(iDocument, componentName)
+        End If
+        If editOwner Is Nothing Then
+            editOwner = svnModule.getSelectedAssemblyEditOwnerPublic(iDocument)
+        End If
 
         Select Case newState
 
@@ -777,6 +863,28 @@ Public Class AssemblyEventHandler
                 If ((Not modDoc Is Nothing) AndAlso Not Me.swAddin.OpenDocumentsTable.Contains(modDoc)) Then
                     Me.swAddin.AttachModelDocEventHandler(modDoc)
                 End If
+
+                'Unsuppressing brings a component back into active computation and is saved to
+                'the assembly file exactly like suppressing it - unlike hide/show/transparency
+                '(pure local viewing state, still exempt), suppression state is real, persisted
+                'assembly data and requires the assembly lock like any other structural edit.
+                svnModule.handleAssemblyOwnedEditPostPublic(
+                    editOwner,
+                    "unsuppressing a component",
+                    allowActiveChildEditContext:=True,
+                    allowPendingSuppressionCommandFallback:=True
+                )
+
+                Exit Select
+
+            Case swComponentSuppressionState_e.swComponentSuppressed
+
+                svnModule.handleAssemblyOwnedEditPostPublic(
+                    editOwner,
+                    "suppressing a component",
+                    allowActiveChildEditContext:=True,
+                    allowPendingSuppressionCommandFallback:=True
+                )
 
                 Exit Select
 
@@ -794,7 +902,7 @@ Public Class AssemblyEventHandler
     'attach events to a component if it becomes resolved
     Public Function AssemblyDoc_ComponentStateChangeNotify2(ByVal componentModel As Object, ByVal CompName As String, ByVal oldCompState As Short, ByVal newCompState As Short) As Integer
 
-        Return ComponentStateChange(componentModel, newCompState)
+        Return ComponentStateChange(componentModel, newCompState, CompName)
 
     End Function
 
@@ -810,10 +918,10 @@ Public Class AssemblyEventHandler
         'Appearance/transparency is a local display preference, not a geometry or structural
         'edit - a user commonly changes it just to see or measure something more clearly
         'while locked out of the assembly (e.g. editing one specific part in context).
-        'Allowed without the assembly lock, same reasoning already applied to suppress/
-        'unsuppress: it cannot be saved to a read-only, unlocked file anyway.
+        'Allowed without the assembly lock. Do not route this through ComponentStateChange:
+        'its default state is Resolved and would misclassify appearance changes as Unsuppress.
         svnModule.noteAssemblyDisplayOnlyChangePublic(iDocument)
-        Return ComponentStateChange(modDoc)
+        Return 0
 
     End Function
 
@@ -846,10 +954,10 @@ Public Class AssemblyEventHandler
 
         'Hide/show and display-state changes are local viewing preferences, not geometry or
         'structural edits - allowed without the assembly lock for the same reason as
-        'suppress/unsuppress and visual-properties changes above (e.g. hiding surrounding
+        'visual-properties changes above (e.g. hiding surrounding
         'components just to take a measurement while locked out of the assembly).
         svnModule.noteAssemblyDisplayOnlyChangePublic(iDocument)
-        Return ComponentStateChange(modDoc)
+        Return 0
 
     End Function
 
