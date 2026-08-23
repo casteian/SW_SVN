@@ -3496,7 +3496,9 @@ Public Class UserControl1
         If modDoc Is Nothing Then Exit Sub
 
         Dim treeNodeIndex As Integer = findStoredTreeView(modDoc.GetPathName, bRetryWithRefresh)
-        If IsNothing(treeNodeIndex) Or IsNothing(allTreeViews) Then Exit Sub
+        If allTreeViews Is Nothing OrElse
+           treeNodeIndex < 0 OrElse
+           treeNodeIndex >= allTreeViews.Length Then Exit Sub
         If Not onlineCheckBox.Checked Then Exit Sub
 
         Try
@@ -3518,22 +3520,13 @@ Public Class UserControl1
 
     End Sub
     Function findStoredTreeView(pathName As String, Optional bRetryWithRefresh As Boolean = True) As Integer
-        Dim activeFileName As String = System.IO.Path.GetFileName(pathName)
+        Dim normalizedPath As String = normalizeTreeActionPath(pathName)
+        If String.IsNullOrWhiteSpace(normalizedPath) Then Return -1
 
-        If String.IsNullOrWhiteSpace(activeFileName) Then Return Nothing
+        Dim storedIndex As Integer = findStoredTreeViewByExactPath(normalizedPath)
+        If storedIndex >= 0 Then Return storedIndex
 
-        If allTreeViews IsNot Nothing AndAlso allTreeViews.Length > 0 Then
-            For i As Integer = 0 To UBound(allTreeViews)
-                If allTreeViews(i) Is Nothing Then Continue For
-                If allTreeViews(i).Nodes.Count = 0 Then Continue For
-
-                If Strings.InStr(allTreeViews(i).Nodes(0).Text, activeFileName, CompareMethod.Text) <> 0 Then
-                    Return i
-                End If
-            Next
-        End If
-
-        If Not bRetryWithRefresh Then Return Nothing
+        If Not bRetryWithRefresh Then Return -1
 
         'Speed fix:
         'If the tree is missing, build only the active tree.
@@ -3543,18 +3536,24 @@ Public Class UserControl1
         Catch
         End Try
 
-        If allTreeViews IsNot Nothing AndAlso allTreeViews.Length > 0 Then
-            For i As Integer = 0 To UBound(allTreeViews)
-                If allTreeViews(i) Is Nothing Then Continue For
-                If allTreeViews(i).Nodes.Count = 0 Then Continue For
+        Return findStoredTreeViewByExactPath(normalizedPath)
+    End Function
 
-                If Strings.InStr(allTreeViews(i).Nodes(0).Text, activeFileName, CompareMethod.Text) <> 0 Then
-                    Return i
-                End If
-            Next
-        End If
+    Private Function findStoredTreeViewByExactPath(ByVal normalizedPath As String) As Integer
+        If String.IsNullOrWhiteSpace(normalizedPath) Then Return -1
+        If allTreeViews Is Nothing OrElse allTreeViews.Length = 0 Then Return -1
 
-        Return Nothing
+        For i As Integer = 0 To UBound(allTreeViews)
+            If allTreeViews(i) Is Nothing Then Continue For
+            If allTreeViews(i).Nodes.Count = 0 Then Continue For
+
+            Dim rootPath As String = getStableTreeNodeCadPath(allTreeViews(i).Nodes(0))
+            If String.Equals(rootPath, normalizedPath, StringComparison.OrdinalIgnoreCase) Then
+                Return i
+            End If
+        Next
+
+        Return -1
     End Function
     Sub refreshAllTreeViewsVariable()
         Dim modDocArray As ModelDoc2() = getAllOpenDocs(bMustBeVisible:=True)
@@ -3609,18 +3608,7 @@ Public Class UserControl1
             allTreeViews(0) = New TreeView
         End If
 
-        Dim treeIndex As Integer = -1
-        Dim activeFileName As String = System.IO.Path.GetFileName(activePath)
-
-        For i As Integer = 0 To UBound(allTreeViews)
-            If allTreeViews(i) Is Nothing Then Continue For
-            If allTreeViews(i).Nodes.Count = 0 Then Continue For
-
-            If Strings.InStr(allTreeViews(i).Nodes(0).Text, activeFileName, CompareMethod.Text) <> 0 Then
-                treeIndex = i
-                Exit For
-            End If
-        Next
+        Dim treeIndex As Integer = findStoredTreeView(activePath, bRetryWithRefresh:=False)
 
         If treeIndex < 0 Then
             treeIndex = allTreeViews.Length

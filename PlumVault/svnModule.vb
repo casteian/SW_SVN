@@ -3214,6 +3214,18 @@ Public Module svnModule
         Dim normalizedPath As String = normalizeFullPathSafe(filePath)
         If Not allowWithoutCloseReview AndAlso Not documentCloseReviewIsApproved(normalizedPath) Then Return False
 
+        'The reviewed decision may be followed by several UI turns while SOLIDWORKS leaves a
+        'nested Edit Part/Edit Assembly context. Remember only a proven-clean baseline so a
+        'new edit made during that gap is not silently discarded. Files already dirty at the
+        'decision point were explicitly covered by the user's close-without-saving choice.
+        Dim mustRemainClean As Boolean = False
+        Try
+            Dim queuedDocument As ModelDoc2 = getOpenModelByPathSafe(normalizedPath)
+            If queuedDocument IsNot Nothing Then mustRemainClean = Not queuedDocument.GetSaveFlag()
+        Catch
+            'A missing baseline preserves the existing reviewed-close behavior.
+        End Try
+
         SyncLock assemblyGuardSync
             If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedPath) Then Return True
             addControlledCloseQueuedPathLocked(normalizedPath)
@@ -3221,7 +3233,7 @@ Public Module svnModule
 
         Dim closeAction As New MethodInvoker(
             Sub()
-                continueUserApprovedDocumentCloseWithoutSave(normalizedPath, 0, "", 0)
+                continueUserApprovedDocumentCloseWithoutSave(normalizedPath, mustRemainClean, 0, "", 0)
             End Sub
         )
 
@@ -3239,6 +3251,7 @@ Public Module svnModule
     End Function
 
     Private Sub continueUserApprovedDocumentCloseWithoutSave(ByVal normalizedPath As String,
+                                                               ByVal mustRemainClean As Boolean,
                                                                ByVal attempt As Integer,
                                                                ByVal previousContextSignature As String,
                                                                ByVal repeatedContextCount As Integer)
@@ -3277,8 +3290,25 @@ Public Module svnModule
                     Throw New InvalidOperationException("The PlumVault task pane closed before SOLIDWORKS completed the document close.")
                 End If
 
-                myUserControl.BeginInvoke(New MethodInvoker(Sub() continueUserApprovedDocumentCloseWithoutSave(normalizedPath, attempt + 1, contextSignature, nextRepeatedCount)))
+                myUserControl.BeginInvoke(New MethodInvoker(Sub() continueUserApprovedDocumentCloseWithoutSave(normalizedPath, mustRemainClean, attempt + 1, contextSignature, nextRepeatedCount)))
                 Exit Sub
+            End If
+
+            If mustRemainClean Then
+                Dim becameDirty As Boolean = False
+
+                Try
+                    becameDirty = currentDoc.GetSaveFlag()
+                Catch
+                    becameDirty = False
+                End Try
+
+                If becameDirty AndAlso Not isAssemblyGuardFalseDirtyCandidate(normalizedPath) Then
+                    Throw New InvalidOperationException(
+                        Path.GetFileName(normalizedPath) & " changed after the close decision. " &
+                        "PlumVault left it open so the latest change can be reviewed. Close it again when ready."
+                    )
+                End If
             End If
 
             Dim documentName As String = ""
@@ -7596,6 +7626,138 @@ Public Module svnModule
         Return Not hasAnyOpenSolidWorksDocument()
     End Function
 
+    Private Function getDeferredCloseDocumentIdentity(ByVal document As ModelDoc2,
+                                                        ByRef displayName As String,
+                                                        ByRef physicalPath As String) As String
+        displayName = ""
+        physicalPath = ""
+        If document Is Nothing Then Return ""
+
+        Try
+            physicalPath = normalizeFullPathSafe(document.GetPathName())
+        Catch
+            physicalPath = ""
+        End Try
+
+        If Not String.IsNullOrWhiteSpace(physicalPath) Then
+            Try
+                displayName = Path.GetFileName(physicalPath)
+            Catch
+                displayName = physicalPath
+            End Try
+
+            Return "PATH|" & physicalPath
+        End If
+
+        Try
+            displayName = document.GetTitle()
+        Catch
+            displayName = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(displayName) Then Return ""
+        Return "UNSAVED|" & displayName.Trim()
+    End Function
+
+    Private Function captureDeferredApplicationCloseState() As Dictionary(Of String, Boolean)
+        Dim snapshot As New Dictionary(Of String, Boolean)(StringComparer.OrdinalIgnoreCase)
+        If iSwApp Is Nothing Then Return snapshot
+
+        Dim documents As Object() = Nothing
+        Try
+            documents = TryCast(iSwApp.GetDocuments(), Object())
+        Catch
+            documents = Nothing
+        End Try
+
+        If documents Is Nothing Then Return snapshot
+
+        For Each documentObject As Object In documents
+            Dim document As ModelDoc2 = TryCast(documentObject, ModelDoc2)
+            If document Is Nothing Then Continue For
+
+            Dim displayName As String = ""
+            Dim physicalPath As String = ""
+            Dim identity As String = getDeferredCloseDocumentIdentity(document, displayName, physicalPath)
+            If String.IsNullOrWhiteSpace(identity) Then Continue For
+
+            Dim wasDirty As Boolean = True
+            Try
+                wasDirty = document.GetSaveFlag()
+            Catch
+                'Unknown state is treated as already dirty so this extra race check does not
+                'override the close review that already completed successfully.
+                wasDirty = True
+            End Try
+
+            snapshot(identity) = wasDirty
+        Next
+
+        Return snapshot
+    End Function
+
+    Private Function deferredApplicationCloseStateIsStillSafe(
+        ByVal snapshot As Dictionary(Of String, Boolean),
+        ByRef changedDocumentName As String
+    ) As Boolean
+        changedDocumentName = ""
+        If snapshot Is Nothing OrElse iSwApp Is Nothing Then Return True
+
+        Dim documents As Object() = Nothing
+        Try
+            documents = TryCast(iSwApp.GetDocuments(), Object())
+        Catch
+            'The established close guard already fails closed when the document collection
+            'cannot be read. Preserve that behavior at the final destructive boundary.
+            changedDocumentName = "an open SOLIDWORKS document"
+            Return False
+        End Try
+
+        If documents Is Nothing Then Return True
+
+        For Each documentObject As Object In documents
+            Dim document As ModelDoc2 = TryCast(documentObject, ModelDoc2)
+            If document Is Nothing Then Continue For
+
+            Dim displayName As String = ""
+            Dim physicalPath As String = ""
+            Dim identity As String = getDeferredCloseDocumentIdentity(document, displayName, physicalPath)
+            If String.IsNullOrWhiteSpace(identity) Then
+                changedDocumentName = "an unidentified SOLIDWORKS document"
+                Return False
+            End If
+
+            Dim wasDirty As Boolean = False
+            If Not snapshot.TryGetValue(identity, wasDirty) Then
+                changedDocumentName = If(String.IsNullOrWhiteSpace(displayName), "a newly opened document", displayName)
+                Return False
+            End If
+
+            If wasDirty Then Continue For
+
+            Dim isDirtyNow As Boolean = False
+            Try
+                isDirtyNow = document.GetSaveFlag()
+            Catch
+                changedDocumentName = If(String.IsNullOrWhiteSpace(displayName), "an open SOLIDWORKS document", displayName)
+                Return False
+            End Try
+
+            If Not isDirtyNow Then Continue For
+
+            'Leaving a legitimate in-context child edit can set an unlocked ancestor's
+            'SaveFlag without changing that assembly file. Event-proven candidates remain
+            'covered by the existing close logic; real assembly-owned edits clear the marker.
+            If Not String.IsNullOrWhiteSpace(physicalPath) AndAlso
+               isAssemblyGuardFalseDirtyCandidate(physicalPath) Then Continue For
+
+            changedDocumentName = If(String.IsNullOrWhiteSpace(displayName), identity, displayName)
+            Return False
+        Next
+
+        Return True
+    End Function
+
     Private Function queueVerifiedSafeApplicationClose() As Boolean
         If controlledApplicationCloseQueued OrElse controlledApplicationExitInProgress Then Return True
         If iSwApp Is Nothing OrElse myUserControl Is Nothing Then Return False
@@ -7606,11 +7768,12 @@ Public Module svnModule
             Return False
         End Try
 
+        Dim reviewedDocumentState As Dictionary(Of String, Boolean) = captureDeferredApplicationCloseState()
         controlledApplicationCloseQueued = True
 
         Dim closeAction As New System.Windows.Forms.MethodInvoker(
             Sub()
-                continueVerifiedSafeApplicationClose(0, "", 0)
+                continueVerifiedSafeApplicationClose(reviewedDocumentState, 0, "", 0)
             End Sub
         )
 
@@ -7659,7 +7822,8 @@ Public Module svnModule
         End Try
     End Sub
 
-    Private Sub continueVerifiedSafeApplicationClose(ByVal attempt As Integer,
+    Private Sub continueVerifiedSafeApplicationClose(ByVal reviewedDocumentState As Dictionary(Of String, Boolean),
+                                                       ByVal attempt As Integer,
                                                        ByVal previousContextSignature As String,
                                                        ByVal repeatedContextCount As Integer)
         Try
@@ -7705,6 +7869,7 @@ Public Module svnModule
                     New MethodInvoker(
                         Sub()
                             continueVerifiedSafeApplicationClose(
+                                reviewedDocumentState,
                                 attempt + 1,
                                 contextSignature,
                                 nextRepeatedCount
@@ -7713,6 +7878,14 @@ Public Module svnModule
                     )
                 )
                 Exit Sub
+            End If
+
+            Dim changedDocumentName As String = ""
+            If Not deferredApplicationCloseStateIsStillSafe(reviewedDocumentState, changedDocumentName) Then
+                Throw New InvalidOperationException(
+                    changedDocumentName & " changed or opened after the close decision. " &
+                    "PlumVault left SOLIDWORKS open so the latest state can be reviewed. Close it again when ready."
+                )
             End If
 
             'The PlumVault checks/table have already established what must be committed,
