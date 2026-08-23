@@ -1330,12 +1330,17 @@ Public Class UserControl1
                 Next
             ElseIf includeSingleSelectedNode AndAlso TreeView1 IsNot Nothing AndAlso
                    TreeView1.SelectedNode IsNot Nothing Then
-                'The row visibly selected in the SVN pane is the authoritative single-file
-                'target, whether it was selected directly or synchronized from SOLIDWORKS.
-                'Previously the synchronized row looked selected but Commit/Get Locks silently
-                'fell back to ActiveDoc (usually the top assembly), which disconnected UI from
-                'the operation the user actually requested.
-                addTreeNodePathToBatchActionList(TreeView1.SelectedNode, seen, output)
+                Dim selectedNode As TreeNode = TreeView1.SelectedNode
+                Dim isGraphicallySynchronized As Boolean =
+                    lastGraphicallyHighlightedTreeNode IsNot Nothing AndAlso
+                    Object.ReferenceEquals(selectedNode, lastGraphicallyHighlightedTreeNode)
+
+                'The visibly selected row is authoritative when it came from a task-pane click
+                'or graphical synchronization. A root row selected automatically after a tree
+                'rebuild is not a user target and falls back to the active/SW selection.
+                If isCurrentTreeSelectionExplicitForFileAction() OrElse isGraphicallySynchronized Then
+                    addTreeNodePathToBatchActionList(selectedNode, seen, output)
+                End If
             End If
         Catch
         End Try
@@ -1679,7 +1684,30 @@ Public Class UserControl1
         ensureCopyLegacyDataToSvnMenuItem()
         ensureOnlineCheckbox()
         applyDpiFriendlyTaskPaneUi()
+
+        'Broad "With Dependents" actions are intentionally not exposed.  Designers should
+        'select the exact files they intend to change; internal dependency traversal remains
+        'available for close safety, drawing/reference handling, and other integrity checks.
+        dropDownGetLocksWithDependents.Visible = False
+        dropDownCommitWithDependents.Visible = False
+        dropDownCommitAll.Visible = False
+        dropDownUnlockWithDependents.Visible = False
+        CopyFileNameWithDependentsToolStripMenuItem.Visible = False
+        CopyFilesPathsWithDependentsToolStripMenuItem.Visible = False
+        CopySvnUrlWithDependentsToolStripMenuItem.Visible = False
+        CreateSvnFilelistWithDependentsToolStripMenuItem.Visible = False
         ToolStripDropDownButUnlock.Visible = False
+
+        'Remove broad actions from their parent menus as well as hiding them. This avoids
+        'empty drop-down arrows and prevents indirect invocation of dependency expansion.
+        ToolStripDropDownButGetLocks.DropDownItems.Remove(dropDownGetLocksWithDependents)
+        ToolStripDropDownButCommit.DropDownItems.Remove(dropDownCommitWithDependents)
+        ToolStripDropDownButCommit.DropDownItems.Remove(dropDownCommitAll)
+        ToolStripDropDownButUnlock.DropDownItems.Remove(dropDownUnlockWithDependents)
+        CopyFileNameToolStripMenuItem.DropDownItems.Remove(CopyFileNameWithDependentsToolStripMenuItem)
+        CopyFullPathToolStripMenuItem.DropDownItems.Remove(CopyFilesPathsWithDependentsToolStripMenuItem)
+        CopySvnUrlToolStripMenuItem.DropDownItems.Remove(CopySvnUrlWithDependentsToolStripMenuItem)
+        CreateSvnFilelistToolStripMenuItem.DropDownItems.Remove(CreateSvnFilelistWithDependentsToolStripMenuItem)
 
         liveChangeCheckTimer = New System.Windows.Forms.Timer()
         liveChangeCheckTimer.Interval = 30000 '30 seconds
@@ -1908,9 +1936,9 @@ Public Class UserControl1
             Return True
 
             'Important:
-            'A graphics-area click is only a visual/tree alignment helper.
-            'Do not mark it as a deliberate Sync branch selection.
-            'If the user wants Sync to target this branch, they can click the node in the SVN tree.
+            'A graphics-area click is a visual/tree alignment helper. The visibly selected row
+            'remains authoritative for file actions, while it is not marked as a deliberate
+            'task-pane branch selection for Sync.
         Catch
         Finally
             If updateStarted Then
@@ -2342,41 +2370,8 @@ Public Class UserControl1
     End Sub
 
     Private Sub dropDownGetLocksWithDependents_Click(sender As Object, e As EventArgs) Handles dropDownGetLocksWithDependents.Click
-        Dim selectedDocs() As ModelDoc2
-        Dim modDocArr() As ModelDoc2
-
-        selectedDocs = GetSelectedModDocList(iSwApp)
-
-        If selectedDocs Is Nothing Then
-            iSwApp.SendMsgToUser("Error: Active Document not found")
-            Exit Sub
-        End If
-
-        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
-
-        If modDocArr Is Nothing Then
-            iSwApp.SendMsgToUser("Error: Active Document not found")
-            Exit Sub
-        End If
-
-        If Not svnModule.prepareExternalReferencesForSvnAction(modDocArr) Then Exit Sub
-
-        'Important: rebuild the dependency list after external references are relinked.
-        selectedDocs = GetSelectedModDocList(iSwApp)
-        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
-
-        If modDocArr Is Nothing Then
-            iSwApp.SendMsgToUser("Error: Could not rebuild dependents after relinking external references.")
-            Exit Sub
-        End If
-
-        If documentArrayContainsDrawing(selectedDocs) Then
-            Dim drawingActionPaths() As String = getCadFilePathsIncludingDrawingDependencies(selectedDocs)
-            getLocksOfPathsAsync(drawingActionPaths)
-        Else
-            getLocksOfDocs(modDocArr)
-        End If
-        updateStatusStrip()
+        'Kept for designer/binary compatibility. Broad dependency actions are retired.
+        ToolStripDropDownGetLocks_ButtonClick(sender, e)
     End Sub
 
     ' ### Commit
@@ -2428,45 +2423,10 @@ Public Class UserControl1
     End Sub
 
     Private Sub dropDownCommitWithDependents_Click(sender As Object, e As EventArgs) Handles dropDownCommitWithDependents.Click
-        Dim selectedDocs() As ModelDoc2
-        Dim modDocArr() As ModelDoc2
-
-        selectedDocs = GetSelectedModDocList(iSwApp)
-
-        If selectedDocs Is Nothing Then
-            iSwApp.SendMsgToUser("Error: Active Document not found")
-            Exit Sub
-        End If
-
-        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
-
-        If modDocArr Is Nothing Then
-            iSwApp.SendMsgToUser("Error: Active Document not found")
-            Exit Sub
-        End If
-
-        If Not svnModule.prepareExternalReferencesForSvnAction(modDocArr) Then Exit Sub
-
-        'Important: rebuild the dependency list after external references are relinked.
-        selectedDocs = GetSelectedModDocList(iSwApp)
-        modDocArr = getComponentsOfAssemblyOptionalUpdateTree(selectedDocs, bResolveLightweight:=True)
-
-        If modDocArr Is Nothing Then
-            iSwApp.SendMsgToUser("Error: Could not rebuild dependents after relinking external references.")
-            Exit Sub
-        End If
-
-        If documentArrayContainsDrawing(selectedDocs) Then
-            Dim drawingActionPaths() As String = getCadFilePathsIncludingDrawingDependencies(selectedDocs)
-            tortCommitPathsAsync(drawingActionPaths)
-        Else
-            tortCommitDocs(modDocArr)
-        End If
-        updateStatusStrip()
+        ToolStripDropDownButCommit_ButtonClick(sender, e)
     End Sub
     Private Sub dropDownCommitAll_Click(sender As Object, e As EventArgs) Handles dropDownCommitAll.Click
-        myCommitAll()
-        updateStatusStrip()
+        ToolStripDropDownButCommit_ButtonClick(sender, e)
     End Sub
 
     ' ### Unlock
@@ -2482,23 +2442,12 @@ Public Class UserControl1
         updateStatusStrip()
     End Sub
     Private Sub dropDownUnlockWithDependents_Click(sender As Object, e As EventArgs) Handles dropDownUnlockWithDependents.Click
-        Dim modDoc As ModelDoc2 = iSwApp.ActiveDoc
-        If modDoc Is Nothing Then iSwApp.SendMsgToUser("Error: Active Document not found") : Exit Sub
-
-        'Optimized path: build the dependent candidate list, then the backend filters to files you actually locked.
-        Dim selectedDocs() As ModelDoc2 = GetSelectedModDocList(iSwApp)
-
-        If documentArrayContainsDrawing(selectedDocs) Then
-            unlockPathsLockedOnly(getCadFilePathsIncludingDrawingDependencies(selectedDocs))
-        Else
-            unlockDocs(getComponentsOfAssemblyOptionalUpdateTree(selectedDocs))
-        End If
-        updateStatusStrip()
+        ToolStripDropDownButUnlock_ButtonClick(sender, e)
     End Sub
     Private Sub dropDownUnlockAll_Click(sender As Object, e As EventArgs) Handles dropDownUnlockAll.Click
         iSwApp.SendMsgToUser2(
             "Release Locks All has been disabled for safety." & vbCrLf & vbCrLf &
-            "Select the file(s) in the SVN tree, or use Unlock && Revert > With Dependents. The backend will only unlock/revert files you actually have locked.",
+            "Select the exact file(s) in the SVN tree. The backend will only unlock/revert files you actually have locked.",
             swMessageBoxIcon_e.swMbInformation,
             swMessageBoxBtn_e.swMbOk
         )
@@ -4877,7 +4826,6 @@ Public Class UserControl1
 
         Public Shared iSwApp2 As SldWorks
         Dim modDoc As ModelDoc2
-        Dim modDocArr As ModelDoc2()
         Dim parentUserControl2 As UserControl1
         'Dim comp As Component2
         Public collapse As New ToolStripMenuItem("Collapse", My.Resources.PlumVault_128, AddressOf collapseTreeViewHandler)
@@ -4915,22 +4863,13 @@ Public Class UserControl1
             unlockDocs({modDoc})
         End Sub
         Sub unlockWithDependentsEventHandler(sender As Object, e As EventArgs)
-            If modDoc IsNot Nothing AndAlso modDoc.GetType() = swDocumentTypes_e.swDocDRAWING Then
-                unlockPathsLockedOnly(parentUserControl2.getCadFilePathsIncludingDrawingDependencies(New ModelDoc2() {modDoc}))
-            Else
-                myUnlockWithDependents(modDoc)
-            End If
+            If modDoc IsNot Nothing Then unlockDocs({modDoc})
         End Sub
         Sub commitEventHandler(sender As Object, e As EventArgs)
             tortCommitDocsAsync({modDoc})
         End Sub
         Public Sub commitWithDependentsEventHandler(sender As Object, e As EventArgs)
-            modDocArr = parentUserControl2.GetSelectedModDocList(iSwApp2)
-            If modDoc IsNot Nothing AndAlso modDoc.GetType() = swDocumentTypes_e.swDocDRAWING Then
-                tortCommitPathsAsync(parentUserControl2.getCadFilePathsIncludingDrawingDependencies(New ModelDoc2() {modDoc}))
-            Else
-                tortCommitDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(modDocArr))
-            End If
+            If modDoc IsNot Nothing Then tortCommitDocsAsync({modDoc})
         End Sub
         Sub getLockStealLockEventHandler(sender As Object, e As EventArgs)
             If swMessageBoxResult_e.swMbHitOk =
@@ -4947,11 +4886,7 @@ Public Class UserControl1
             getLocksOfDocsAsync({modDoc})
         End Sub
         Sub getLocksActiveWithDependentsEventHandler(sender As Object, e As EventArgs)
-            If modDoc IsNot Nothing AndAlso modDoc.GetType() = swDocumentTypes_e.swDocDRAWING Then
-                getLocksOfPathsAsync(parentUserControl2.getCadFilePathsIncludingDrawingDependencies(New ModelDoc2() {modDoc}))
-            Else
-                getLocksOfDocs(parentUserControl2.getComponentsOfAssemblyOptionalUpdateTree(parentUserControl2.GetSelectedModDocList(iSwApp2)))
-            End If
+            If modDoc IsNot Nothing Then getLocksOfDocsAsync({modDoc})
         End Sub
         Sub addToRepoEventHandler(sender As Object, e As EventArgs)
 
@@ -5891,9 +5826,6 @@ Public Class UserControl1
 
             If bModelDocAttached Then
                 docMenu.Items.Add(myContextMenu.commitLabel)
-                If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    docMenu.Items.Add(myContextMenu.commitWithDependentsLabel)
-                End If
             End If
 
         ElseIf status1.fp(0).lock6 = "K" Then
@@ -5906,9 +5838,7 @@ Public Class UserControl1
                 If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
                     docMenu.Items.AddRange(
                         {myContextMenu.commitLabel,
-                        myContextMenu.commitWithDependentsLabel,
-                        myContextMenu.unlockLabel,
-                        myContextMenu.unlockWithDependentsLabel})
+                        myContextMenu.unlockLabel})
                 Else
                     docMenu.Items.AddRange(
                         {myContextMenu.commitLabel,
@@ -5930,10 +5860,6 @@ Public Class UserControl1
             End If
             If bModelDocAttached Then
                 docMenu.Items.AddRange({myContextMenu.getLocksStealLabel})
-                'If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    docMenu.Items.Add(myContextMenu.commitWithDependentsLabel)
-                End If
             End If
             'If bCM Then rootNode.ContextMenuStrip.Items.Add(myContextMenu.getLocksStealLabel)
         ElseIf status1.fp(0).released = "||RELEASED||" Then
@@ -5947,10 +5873,6 @@ Public Class UserControl1
             rootNode.ToolTipText = "Available"
             If bModelDocAttached Then
                 docMenu.Items.Add(myContextMenu.getLockActiveDoc)
-                If modDoc.GetType = swDocumentTypes_e.swDocASSEMBLY Then
-                    docMenu.Items.AddRange({myContextMenu.commitWithDependentsLabel,
-                                           myContextMenu.getLockWithDependents})
-                End If
             End If
         Else
             rootNode.BackColor = myCol.unknown
@@ -6198,35 +6120,55 @@ Public Class UserControl1
         myCleanup()
         hideButton(ToolStripSplitButFolder)
     End Sub
-    Public Sub copyFileToClipboard(bWithDependents As Boolean, bTitleOnly As Boolean)
-        Dim modDocArr As ModelDoc2()
-        Dim sOutput As String() = {""}
-        Dim eIncludeDrawings As swMessageBoxResult_e
+    Private Function getExactSelectedCadPathsForUtilityAction() As String()
+        Dim selectedPaths() As String = getBatchSelectedTreeCadPathsForAction(includeSingleSelectedNode:=True)
+        If selectedPaths IsNot Nothing AndAlso selectedPaths.Length > 0 Then Return selectedPaths
 
-        If bWithDependents Then
-            modDocArr = getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp), bResolveLightweight:=True)
-            If IsNothing(modDocArr) Then modDocArr = getComponentsOfAssemblyOptionalUpdateTree(iSwApp.ActiveDoc, bResolveLightweight:=True)
-            eIncludeDrawings = iSwApp.SendMsgToUser2("Include drawings with names matching files?", swMessageBoxIcon_e.swMbQuestion, swMessageBoxBtn_e.swMbYesNoCancel)
-        Else
-            modDocArr = GetSelectedModDocList(iSwApp)
-            If IsNothing(modDocArr) Then modDocArr = {iSwApp.ActiveDoc}
-            eIncludeDrawings = swMessageBoxResult_e.swMbHitNo
+        Dim selectedDocs() As ModelDoc2 = GetSelectedModDocList(iSwApp)
+        If selectedDocs Is Nothing OrElse selectedDocs.Length = 0 Then
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc IsNot Nothing Then selectedDocs = {activeDoc}
         End If
 
-        If IsNothing(modDocArr) Then
+        If selectedDocs Is Nothing OrElse selectedDocs.Length = 0 Then Return Nothing
+
+        Dim output As New List(Of String)()
+        Dim seen As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each selectedDoc As ModelDoc2 In selectedDocs
+            If selectedDoc Is Nothing Then Continue For
+
+            Dim selectedPath As String = getSafeModelPath(selectedDoc)
+            If String.IsNullOrWhiteSpace(selectedPath) Then Continue For
+
+            selectedPath = normalizeTreeActionPath(selectedPath)
+            If Not isCadPathForSync(selectedPath) OrElse seen.Contains(selectedPath) Then Continue For
+
+            seen.Add(selectedPath)
+            output.Add(selectedPath)
+        Next
+
+        If output.Count = 0 Then Return Nothing
+        Return output.ToArray()
+    End Function
+
+    Public Sub copyFileToClipboard(bWithDependents As Boolean, bTitleOnly As Boolean)
+        'bWithDependents remains in the signature for designer/binary compatibility only.
+        'Every exposed and indirect route now copies the exact selected files.
+        Dim selectedPaths() As String = getExactSelectedCadPathsForUtilityAction()
+
+        If selectedPaths Is Nothing OrElse selectedPaths.Length = 0 Then
             iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
             Exit Sub
         End If
 
-        Select Case eIncludeDrawings
-            Case swMessageBoxResult_e.swMbHitYes
-                sOutput = getMatchingDrawingForArrayPath(modDocArr, bTitleOnly)
-            Case swMessageBoxResult_e.swMbHitNo
-                sOutput = getFilePathsFromModDocArr(modDocArr, bTitleOnly)
-            Case swMessageBoxResult_e.swMbHitCancel
-                hideButton(ToolStripSplitButFolder)
-                Exit Sub
-        End Select
+        Dim sOutput() As String
+
+        If bTitleOnly Then
+            sOutput = selectedPaths.Select(Function(selectedPath) Path.GetFileName(selectedPath)).ToArray()
+        Else
+            sOutput = selectedPaths
+        End If
 
         CopyToClipboard(String.Join(vbCrLf, sOutput))
 
@@ -6248,55 +6190,28 @@ Public Class UserControl1
     End Sub
 
     Private Sub CopySvnUrlToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles CopySvnUrlToolStripMenuItem.Click
-        'copy url to clipboard
-        Dim modDocArr As ModelDoc2() = GetSelectedModDocList(iSwApp)
-        If IsNothing(modDocArr) Then modDocArr = getComponentsOfAssemblyOptionalUpdateTree(iSwApp.ActiveDoc, bResolveLightweight:=True)
-        If IsNothing(modDocArr) Then
+        Dim selectedPaths() As String = getExactSelectedCadPathsForUtilityAction()
+        If selectedPaths Is Nothing OrElse selectedPaths.Length = 0 Then
             iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
             Exit Sub
         End If
 
-        Dim urls As String() = getUrlfromPaths(getFilePathsFromModDocArr(modDocArr))
+        Dim urls As String() = getUrlfromPaths(selectedPaths)
 
         CopyToClipboard(String.Join(vbCrLf, urls))
         hideButton(ToolStripSplitButFolder)
     End Sub
     Private Sub CopySvnUrlWithDependentsToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles CopySvnUrlWithDependentsToolStripMenuItem.Click
-        'copy url to clipboard, with dependents
-        Dim sOutput As String() = {""}
-        Dim modDocArr As ModelDoc2() = getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp), bResolveLightweight:=True)
-        If IsNothing(modDocArr) Then modDocArr = getComponentsOfAssemblyOptionalUpdateTree(iSwApp.ActiveDoc, bResolveLightweight:=True)
-        If IsNothing(modDocArr) Then
-            iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
-            Exit Sub
-        End If
-
-        Dim eIncludeDrawings As swMessageBoxResult_e = iSwApp.SendMsgToUser2("Include drawings with names matching files?", swMessageBoxIcon_e.swMbQuestion, swMessageBoxBtn_e.swMbYesNoCancel)
-
-        Select Case eIncludeDrawings
-            Case swMessageBoxResult_e.swMbHitYes
-                sOutput = getUrlfromPaths(getMatchingDrawingForArrayPath(modDocArr))
-            Case swMessageBoxResult_e.swMbHitNo
-                sOutput = getUrlfromPaths(getFilePathsFromModDocArr(modDocArr))
-            Case swMessageBoxResult_e.swMbHitCancel
-                hideButton(ToolStripSplitButFolder)
-                CloseDropDown(CopySvnUrlToolStripMenuItem)
-                Exit Sub
-        End Select
-
-        CopyToClipboard(String.Join(vbCrLf, sOutput))
-        hideButton(ToolStripSplitButFolder)
+        CopySvnUrlToolStripMenuItem_Click(sender, e)
     End Sub
     Private Sub CopyActiveFilesParentFolderToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles CopyActiveFilesParentFolderToolStripMenuItem.Click
-
-        Dim modDocArr As ModelDoc2() = GetSelectedModDocList(iSwApp)
-        If IsNothing(modDocArr) Then modDocArr = {iSwApp.ActiveDoc}
-        If IsNothing(modDocArr) Then
+        Dim selectedPaths() As String = getExactSelectedCadPathsForUtilityAction()
+        If selectedPaths Is Nothing OrElse selectedPaths.Length = 0 Then
             iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
             Exit Sub
         End If
 
-        Dim currentDir As DirectoryInfo = New FileInfo(modDocArr(0).GetPathName).Directory
+        Dim currentDir As DirectoryInfo = New FileInfo(selectedPaths(0)).Directory
 
         CopyToClipboard(currentDir.ToString)
         hideButton(ToolStripSplitButFolder)
@@ -6304,22 +6219,13 @@ Public Class UserControl1
     End Sub
 
     Private Sub ShareWithColleagueToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles ShareWithColleagueToolStripMenuItem.Click
-
-        Dim stringArr As String()
-
-        Dim modDocArr As ModelDoc2() = GetSelectedModDocList(iSwApp)
-        If IsNothing(modDocArr) Then modDocArr = {iSwApp.ActiveDoc}
-
-        If IsNothing(modDocArr) Then
-            iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
-            Exit Sub
-        End If
-        If IsNothing(modDocArr(0)) Then
+        Dim selectedPaths() As String = getExactSelectedCadPathsForUtilityAction()
+        If selectedPaths Is Nothing OrElse selectedPaths.Length = 0 Then
             iSwApp.SendMsgToUser("Couldn't find an active document! Exiting.")
             Exit Sub
         End If
 
-        stringArr = getUrlfromPaths({modDocArr(0).GetPathName})
+        Dim stringArr() As String = getUrlfromPaths({selectedPaths(0)})
 
         If IsNothing(stringArr) Then
             iSwApp.SendMsgToUser("Couldn't find get URL(s)! Exiting.")
@@ -6328,7 +6234,7 @@ Public Class UserControl1
 
         Dim stringToClip As String = "CAD is available on svn" & vbCrLf & "My Local Path (yours may be different):" & vbCrLf
 
-        stringToClip &= modDocArr(0).GetPathName & vbCrLf & vbCrLf & "or remote path: " & vbCrLf
+        stringToClip &= selectedPaths(0) & vbCrLf & vbCrLf & "or remote path: " & vbCrLf
         stringToClip &= stringArr(0)
 
         CopyToClipboard(stringToClip)
@@ -6336,30 +6242,17 @@ Public Class UserControl1
     End Sub
 
     Private Sub CreateSvnFilelistToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles CreateSvnFilelistToolStripMenuItem.Click
-        'filelist, file only
         If Not verifyLocalRepoPath() Then Exit Sub
 
         Dim sDest As String = localRepoPath.Text & "\" & "fileList.txt"
-        Dim sFileNames As String
-        Dim eIncludeDrawings As Integer = iSwApp.SendMsgToUser2("Include drawings with names matching files?", swMessageBoxIcon_e.swMbQuestion, swMessageBoxBtn_e.swMbYesNoCancel)
-        Dim bIncludeDrawings As Boolean = False
-        Dim modDocArr As ModelDoc2()
+        Dim selectedPaths() As String = getExactSelectedCadPathsForUtilityAction()
 
-        If eIncludeDrawings = swMessageBoxResult_e.swMbHitCancel Then Exit Sub
-        If eIncludeDrawings = swMessageBoxResult_e.swMbHitYes Then bIncludeDrawings = True
-
-        modDocArr = GetSelectedModDocList(iSwApp)
-
-        If IsNothing(modDocArr) Then
+        If selectedPaths Is Nothing OrElse selectedPaths.Length = 0 Then
             iSwApp.SendMsgToUser("Couldn't find document! Exiting.")
             Exit Sub
         End If
 
-        If bIncludeDrawings Then
-            sFileNames = formatFilePathArrForProc(getMatchingDrawingForArrayPath(modDocArr), sDelimiter:=vbCrLf)
-        Else
-            sFileNames = formatFilePathArrForProc(getFilePathsFromModDocArr(modDocArr), sDelimiter:=vbCrLf)
-        End If
+        Dim sFileNames As String = formatFilePathArrForProc(selectedPaths, sDelimiter:=vbCrLf)
 
         Try
             File.WriteAllText(sDest, sFileNames)
@@ -6371,47 +6264,7 @@ Public Class UserControl1
     End Sub
 
     Private Sub CreateSvnFilelistWithDependentsToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles CreateSvnFilelistWithDependentsToolStripMenuItem.Click
-        'filelist with dependents
-        If Not verifyLocalRepoPath() Then Exit Sub
-
-        Dim sDest As String = localRepoPath.Text & "\" & "fileList.txt"
-        Dim sFileNames As String
-        Dim eMsgBoxResult As Integer = iSwApp.SendMsgToUser2("Include drawings with names matching files?", swMessageBoxIcon_e.swMbQuestion, swMessageBoxBtn_e.swMbYesNoCancel)
-        Dim bIncludeDrawings As Boolean = False
-        Dim bIncludeDependents As Boolean = False
-        Dim modDocArr As ModelDoc2()
-
-        If eMsgBoxResult = swMessageBoxResult_e.swMbHitCancel Then Exit Sub
-        If eMsgBoxResult = swMessageBoxResult_e.swMbHitYes Then bIncludeDrawings = True
-
-        eMsgBoxResult = iSwApp.SendMsgToUser2("Include Dependents?", swMessageBoxIcon_e.swMbQuestion, swMessageBoxBtn_e.swMbYesNoCancel)
-        If eMsgBoxResult = swMessageBoxResult_e.swMbHitCancel Then Exit Sub
-        If eMsgBoxResult = swMessageBoxResult_e.swMbHitYes Then bIncludeDependents = True
-
-        If bIncludeDependents Then
-            modDocArr = getComponentsOfAssemblyOptionalUpdateTree(GetSelectedModDocList(iSwApp), bResolveLightweight:=True)
-        Else
-            modDocArr = GetSelectedModDocList(iSwApp)
-        End If
-
-        If IsNothing(modDocArr) Then
-            iSwApp.SendMsgToUser("Error Getting Files")
-            Exit Sub
-        End If
-
-        If bIncludeDrawings Then
-            sFileNames = formatFilePathArrForProc(getMatchingDrawingForArrayPath(modDocArr), sDelimiter:=vbCrLf)
-        Else
-            sFileNames = formatFilePathArrForProc(getFilePathsFromModDocArr(modDocArr), sDelimiter:=vbCrLf)
-        End If
-
-        Try
-            File.WriteAllText(sDest, sFileNames)
-            iSwApp.SendMsgToUser("Wrote Filelist to " & vbCrLf & sDest)
-        Catch ex As Exception
-            iSwApp.SendMsgToUser("ERROR writing Filelist to " & vbCrLf & sDest)
-        End Try
-        hideButton(ToolStripSplitButFolder)
+        CreateSvnFilelistToolStripMenuItem_Click(sender, e)
     End Sub
 
     Private Sub OpenFileFromURLToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles OpenFileFromURLToolStripMenuItem.Click

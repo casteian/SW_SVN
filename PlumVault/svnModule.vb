@@ -47,6 +47,7 @@ Public Module svnModule
     Private controlledDocumentCloseNativeCallInProgress As Boolean = False
     Private lastCloseGuardPromptTime As DateTime = DateTime.MinValue
     Private unsafeForceCloseApprovedUntil As DateTime = DateTime.MinValue
+    Private unsafeForceCloseApprovedPath As String = ""
     Private documentLockReviewApprovedUntil As DateTime = DateTime.MinValue
     Private documentLockReviewApprovedPath As String = ""
     Private documentLockReviewApprovedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -1132,18 +1133,23 @@ Public Module svnModule
         If userHasSvnLockOnDoc(editedDocument) Then Exit Sub
 
         'An already-loaded child can enter Edit Part without either CommandOpenPreNotify or
-        'FileOpenPreNotify firing. If the user has explicitly started Get Locks for this exact
-        'child, do not immediately kick them back out while that request is still in flight.
-        'Wait for its authoritative local result: success keeps this edit session; failure
-        'leaves it without saving. No lock is ever started from the edit action itself.
-        If asyncGetLocksInProgress AndAlso asyncGetLocksIncludesPath(childPath) Then
-            If waitForCurrentGetLocksBeforeEnforcingInContextEdit(
-                assemblyDocument,
-                editedDocument,
-                assemblyKey,
-                childPath
-            ) Then Exit Sub
-        End If
+        'FileOpenPreNotify firing. Never leave that child editable while a pending network lock
+        'might still fail because another user owns it. The normal command-pre route defers and
+        'replays the edit automatically; this post-facto fallback exits promptly unless the K
+        'token becomes authoritative before the deferred check runs.
+        Dim lockWasPendingAtNotify As Boolean =
+            asyncGetLocksInProgress AndAlso asyncGetLocksIncludesPath(childPath)
+
+        'If this edit raced an explicit Get Locks click, let that one authoritative request
+        'finish. Keep the edit only when the local K token is then present; if the lock fails
+        '(including another user owning it), the waiter exits the edit context safely.
+        If lockWasPendingAtNotify AndAlso
+           waitForCurrentGetLocksBeforeEnforcingInContextEdit(
+               assemblyDocument,
+               editedDocument,
+               assemblyKey,
+               childPath
+           ) Then Exit Sub
 
         Dim kickOutAction As New System.Windows.Forms.MethodInvoker(
             Sub()
@@ -1184,7 +1190,17 @@ Public Module svnModule
                     'CommandOpenPreNotify. Never start a network lock request from an Edit command:
                     'selection can change while it runs, producing delayed replay and parent/child
                     'confusion. Back out safely and require the explicit Get Locks action instead.
-                    showManualLockRequired(childPath, "start Edit Part or Edit Assembly")
+                    If lockWasPendingAtNotify Then
+                        iSwApp.SendMsgToUser2(
+                            "Get Locks is still finishing for " & childName & "." & vbCrLf & vbCrLf &
+                            "PlumVault left Edit Part/Edit Assembly so the file could not be changed before the lock result was known." & vbCrLf & vbCrLf &
+                            "If the lock succeeds, select the item and start the edit again.",
+                            swMessageBoxIcon_e.swMbInformation,
+                            swMessageBoxBtn_e.swMbOk
+                        )
+                    Else
+                        showManualLockRequired(childPath, "start Edit Part or Edit Assembly")
+                    End If
                     writeOperationLog(
                         "Post-notify in-context edit blocked; manual Get Locks required: " & childName
                     )
@@ -3093,19 +3109,25 @@ Public Module svnModule
     Private Function hasAnyOpenSolidWorksDocument() As Boolean
         If iSwApp Is Nothing Then Return False
 
+        Dim documentCountQueryFailed As Boolean = False
+
         Try
             If iSwApp.GetDocumentCount() > 0 Then Return True
         Catch
+            documentCountQueryFailed = True
         End Try
 
         Try
             Dim docsObj As Object = iSwApp.GetDocuments()
-            If docsObj Is Nothing Then Return False
+            If docsObj Is Nothing Then Return documentCountQueryFailed
 
             Dim docs As Object() = CType(docsObj, Object())
             Return docs IsNot Nothing AndAlso docs.Length > 0
         Catch
-            Return False
+            'During controlled application close, an unreadable COM document collection must
+            'not be treated as proof that every document is gone.  Assume one remains so the
+            'watchdog can retry/recover instead of silently leaving the close state half-open.
+            Return documentCountQueryFailed
         End Try
     End Function
 
@@ -3184,12 +3206,13 @@ Public Module svnModule
         Return False
     End Function
 
-    Private Function queueUserApprovedDocumentCloseWithoutSave(ByVal filePath As String) As Boolean
+    Private Function queueUserApprovedDocumentCloseWithoutSave(ByVal filePath As String,
+                                                                Optional ByVal allowWithoutCloseReview As Boolean = False) As Boolean
         If iSwApp Is Nothing OrElse myUserControl Is Nothing Then Return False
         If String.IsNullOrWhiteSpace(filePath) Then Return False
 
         Dim normalizedPath As String = normalizeFullPathSafe(filePath)
-        If Not documentCloseReviewIsApproved(normalizedPath) Then Return False
+        If Not allowWithoutCloseReview AndAlso Not documentCloseReviewIsApproved(normalizedPath) Then Return False
 
         SyncLock assemblyGuardSync
             If assemblyGuardControlledCloseQueuedPaths.Contains(normalizedPath) Then Return True
@@ -3261,12 +3284,18 @@ Public Module svnModule
             Dim documentName As String = ""
 
             Try
-                documentName = currentDoc.GetTitle()
+                documentName = Path.GetFileName(normalizedPath)
             Catch
                 documentName = ""
             End Try
 
-            If String.IsNullOrWhiteSpace(documentName) Then documentName = Path.GetFileName(normalizedPath)
+            If String.IsNullOrWhiteSpace(documentName) Then
+                Try
+                    documentName = currentDoc.GetTitle()
+                Catch
+                    documentName = ""
+                End Try
+            End If
 
             'CloseDoc is reached only after every owner/target edit relationship involving
             'this exact file has disappeared. Referenced documents may remain loaded invisibly.
@@ -4302,9 +4331,12 @@ Public Module svnModule
                                                   Optional ByVal allowDisplayOnlyFallback As Boolean = False,
                                                   Optional ByVal allowRebuildModifyFallback As Boolean = False,
                                                   Optional ByVal allowActiveChildEditContext As Boolean = False,
-                                                  Optional ByVal allowPendingSuppressionCommandFallback As Boolean = False)
+                                                  Optional ByVal allowPendingSuppressionCommandFallback As Boolean = False,
+                                                  Optional ByVal pendingSuppressionEventAssembly As ModelDoc2 = Nothing)
         If allowPendingSuppressionCommandFallback AndAlso
-           allowPendingAssemblySuppressionNotification(assemblyDocument) Then Exit Sub
+           allowPendingAssemblySuppressionNotification(
+               If(pendingSuppressionEventAssembly, assemblyDocument)
+           ) Then Exit Sub
 
         If allowRebuildModifyFallback Then
             If consumeAssemblyRebuildGenericModifyAllowance(assemblyDocument) Then Exit Sub
@@ -4720,10 +4752,17 @@ Public Module svnModule
 
             If managedActiveDocumentSaveQueued Then Return -1
 
-            If myUserControl Is Nothing OrElse Not myUserControl.IsHandleCreated Then
-                'Without the task-pane UI dispatcher we cannot safely leave this COM callback
-                'and perform the isolated save. Preserve native SOLIDWORKS behavior as fallback.
-                Return 0
+            If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
+                'A native save of a managed assembly may save/rebuild referenced documents and
+                'reintroduce the alert cascade this isolated-save route exists to prevent.
+                'Fail closed when the UI dispatcher is unavailable.
+                iSwApp.SendMsgToUser2(
+                    "Save was cancelled because the SVN task pane is not ready." & vbCrLf & vbCrLf &
+                    "Wait for the task pane to finish loading, then try Save again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Return -1
             End If
 
             managedActiveDocumentSaveQueued = True
@@ -4737,9 +4776,18 @@ Public Module svnModule
                         End Sub
                     )
                 )
-            Catch
+            Catch ex As Exception
                 managedActiveDocumentSaveQueued = False
-                Return 0
+                Try
+                    iSwApp.SendMsgToUser2(
+                        "Save could not be queued safely, so the native save was cancelled." & vbCrLf & vbCrLf &
+                        "Try Save again." & vbCrLf & vbCrLf & ex.Message,
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                Catch
+                End Try
+                Return -1
             End Try
 
             'Cancel native Ctrl+S. The queued Save3 deliberately omits
@@ -6025,6 +6073,7 @@ Public Module svnModule
                 result.Summary = "Choose a different name, then Check again."
                 Return result
             End If
+
         End If
 
         If Not automaticSaveTargetHasRequiredLock(destinationPath) Then
@@ -6573,7 +6622,8 @@ Public Module svnModule
 
     Private Function automaticSaveCommitPathsHaveRequiredLocks(ByVal commitPaths() As String,
                                                                  Optional ByVal operationLabel As String = "Automatic commit",
-                                                                 Optional ByVal retryInstruction As String = "Get Locks, save again, and the plugin will commit automatically.") As Boolean
+                                                                 Optional ByVal retryInstruction As String = "Get Locks, save again, and the plugin will commit automatically.",
+                                                                 Optional ByVal knownLiveLockedPaths As HashSet(Of String) = Nothing) As Boolean
         If commitPaths Is Nothing Then Return False
 
         Dim missingLocks As New List(Of String)()
@@ -6585,7 +6635,13 @@ Public Module svnModule
             If Not isCadFilePath(p) Then Continue For
             If isFirstCommitCandidatePath(p) Then Continue For
 
-            If Not userHasLocalSvnLockTokenForPath(p, allowCachedToken:=False) Then
+            Dim hasRequiredLock As Boolean = If(
+                knownLiveLockedPaths Is Nothing,
+                userHasLocalSvnLockTokenForPath(p, allowCachedToken:=False),
+                knownLiveLockedPaths.Contains(normalizeFullPathSafe(p))
+            )
+
+            If Not hasRequiredLock Then
                 missingLocks.Add(p)
             End If
         Next
@@ -7442,34 +7498,102 @@ Public Module svnModule
     Private Function closeAllVerifiedDocumentsWithoutSaving() As Boolean
         If iSwApp Is Nothing Then Return False
 
-        'Every save/SVN/lock check and the user's final review decision have already passed
-        'before this helper is reached. Use SOLIDWORKS' purpose-built bulk close-without-save
-        'API instead of closing documents by title one at a time. The former CloseDoc loop
-        'could leave a dirty document open when titles collided or a referenced model was
-        'rebound during parent close; ExitApp then exposed SOLIDWORKS' native Save/Don't Save
-        'dialog after PlumVault had already completed its review table.
-        Dim closeSucceeded As Boolean = False
-
+        'Every save/SVN/lock check and the user's final review decision have already passed.
+        'Close documents explicitly so SOLIDWORKS cannot show its native bulk Save Modified
+        'Documents dialog after the PlumVault table. Drawings and parent assemblies close before
+        'their referenced models. Multiple passes handle documents that SOLIDWORKS reorders or
+        'temporarily keeps alive while a parent is closing.
         controlledApplicationNativeCloseCallInProgress = True
         Try
-            closeSucceeded = iSwApp.CloseAllDocuments(True)
-        Catch ex As Exception
-            writeOperationLog("CloseAllDocuments(True) failed after verified review: " & ex.Message)
-            closeSucceeded = False
+            For pass As Integer = 1 To 8
+                Dim beforeCount As Integer = 0
+
+                Try
+                    beforeCount = iSwApp.GetDocumentCount()
+                Catch ex As Exception
+                    writeOperationLog("Could not count documents during verified close: " & ex.Message)
+                    Return False
+                End Try
+
+                If beforeCount <= 0 Then Return True
+
+                Dim docsObject As Object = Nothing
+
+                Try
+                    docsObject = iSwApp.GetDocuments()
+                Catch ex As Exception
+                    writeOperationLog("Could not enumerate documents during verified close: " & ex.Message)
+                    Return False
+                End Try
+
+                Dim docs As Object() = TryCast(docsObject, Object())
+                If docs Is Nothing OrElse docs.Length = 0 Then Return Not hasAnyOpenSolidWorksDocument()
+
+                Dim closeNames As New List(Of KeyValuePair(Of Integer, String))()
+
+                For Each docObject As Object In docs
+                    Dim doc As ModelDoc2 = TryCast(docObject, ModelDoc2)
+                    If doc Is Nothing Then Continue For
+
+                    Dim closeOrder As Integer = 3
+                    Dim documentName As String = ""
+
+                    Try
+                        Select Case CInt(doc.GetType())
+                            Case swDocumentTypes_e.swDocDRAWING
+                                closeOrder = 0
+                            Case swDocumentTypes_e.swDocASSEMBLY
+                                closeOrder = 1
+                            Case swDocumentTypes_e.swDocPART
+                                closeOrder = 2
+                        End Select
+                    Catch
+                    End Try
+
+                    'The physical file name includes the extension and is less ambiguous than a
+                    'display title. Unsaved documents have no path, so fall back to GetTitle.
+                    Try
+                        documentName = Path.GetFileName(doc.GetPathName())
+                    Catch
+                        documentName = ""
+                    End Try
+
+                    If String.IsNullOrWhiteSpace(documentName) Then
+                        Try
+                            documentName = doc.GetTitle()
+                        Catch
+                            documentName = ""
+                        End Try
+                    End If
+
+                    If Not String.IsNullOrWhiteSpace(documentName) Then
+                        closeNames.Add(New KeyValuePair(Of Integer, String)(closeOrder, documentName))
+                    End If
+                Next
+
+                For Each closeEntry As KeyValuePair(Of Integer, String) In closeNames.OrderBy(Function(entry) entry.Key)
+                    Try
+                        iSwApp.CloseDoc(closeEntry.Value)
+                    Catch ex As Exception
+                        writeOperationLog("CloseDoc failed for " & closeEntry.Value & ": " & ex.Message)
+                    End Try
+                Next
+
+                Dim afterCount As Integer = beforeCount
+
+                Try
+                    afterCount = iSwApp.GetDocumentCount()
+                Catch
+                End Try
+
+                If afterCount <= 0 OrElse Not hasAnyOpenSolidWorksDocument() Then Return True
+                If afterCount >= beforeCount Then Return False
+            Next
         Finally
             controlledApplicationNativeCloseCallInProgress = False
         End Try
 
-        'The Boolean return is useful, but the live document collection is authoritative.
-        If Not hasAnyOpenSolidWorksDocument() Then Return True
-
-        If Not closeSucceeded Then
-            writeOperationLog("CloseAllDocuments(True) returned False and documents remain open.")
-        Else
-            writeOperationLog("CloseAllDocuments(True) returned True but documents remain open.")
-        End If
-
-        Return False
+        Return Not hasAnyOpenSolidWorksDocument()
     End Function
 
     Private Function queueVerifiedSafeApplicationClose() As Boolean
@@ -7790,7 +7914,8 @@ Public Module svnModule
         End Try
     End Function
 
-    Public Function blockCloseIfSingleDocUnsafe(ByVal closingDoc As ModelDoc2) As Boolean
+    Public Function blockCloseIfSingleDocUnsafe(ByVal closingDoc As ModelDoc2,
+                                                Optional ByVal approveControlledDocumentClose As Boolean = False) As Boolean
         If controlledApplicationExitInProgress Then Return False
         If cadRelocationInProgress Then Return False
         If iSwApp Is Nothing Then Return False
@@ -7798,7 +7923,7 @@ Public Module svnModule
 
         'Uses only GetSaveFlag and local SVN status while offline.
         'If the user just chose "No = close anyway", allow duplicate close events through briefly.
-        If DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
+        If Not approveControlledDocumentClose AndAlso DateTime.Now < unsafeForceCloseApprovedUntil Then Return False
 
         'A duplicate close message can arrive while the modal warning is open.
         'Block it; allowing it through can destroy the document behind the prompt.
@@ -7806,6 +7931,7 @@ Public Module svnModule
         If closingDoc Is Nothing Then Return False
 
         Dim openPaths As New List(Of String)
+        Dim closingPath As String = ""
 
         Try
             Dim docPath As String = ""
@@ -7813,6 +7939,7 @@ Public Module svnModule
 
             Try
                 docPath = closingDoc.GetPathName()
+                closingPath = docPath
             Catch
                 docPath = ""
             End Try
@@ -7875,7 +8002,10 @@ Public Module svnModule
 
         Try
             closeGuardMessageShowing = True
-            Return showUnsafeClosePrompt(unsafeMsg)
+            Return showUnsafeClosePrompt(
+                unsafeMsg,
+                approvedDocumentPath:=If(approveControlledDocumentClose, closingPath, "")
+            )
 
         Finally
             closeGuardMessageShowing = False
@@ -7924,6 +8054,29 @@ Public Module svnModule
 
             Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
             If activeDoc Is Nothing Then Exit Sub
+
+            Dim activePath As String = ""
+
+            Try
+                activePath = activeDoc.GetPathName()
+            Catch
+                activePath = ""
+            End Try
+
+            If Not String.IsNullOrWhiteSpace(activePath) Then
+                If queueUserApprovedDocumentCloseWithoutSave(
+                    activePath,
+                    allowWithoutCloseReview:=True
+                ) Then Exit Sub
+
+                iSwApp.SendMsgToUser2(
+                    "The verified Ctrl+W close could not be started." & vbCrLf & vbCrLf &
+                    "The file was left open. Try closing it again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+                Exit Sub
+            End If
 
             Dim docName As String = ""
             Try
@@ -8003,7 +8156,12 @@ Public Module svnModule
         'locked, run the ordinary unsafe-file guard before inheriting the table approval.
         If documentCloseReviewIsApproved(activePath) Then
             If Not documentCloseReviewCoveredPath(activePath) AndAlso
-               blockCloseIfSingleDocUnsafe(activeDoc) Then Return True
+               blockCloseIfSingleDocUnsafe(activeDoc, approveControlledDocumentClose:=True) Then Return True
+
+            'The unsafe-file prompt's explicit "close without saving" choice is consumed by
+            'this controlled CloseDoc path.  Clear its short-lived approval so it cannot leak
+            'into a later close of another document.
+            consumeUnsafeDocumentCloseApproval(activePath)
 
             'Swallow the native window close and use CloseDoc so SOLIDWORKS cannot append its
             'own ambiguous Save/Don't Save prompt.
@@ -8030,8 +8188,33 @@ Public Module svnModule
             guardGeneratedFalseDirty = False
         End Try
 
-        Dim blockedByUnsafeChanges As Boolean = blockCloseIfSingleDocUnsafe(activeDoc)
+        Dim blockedByUnsafeChanges As Boolean = blockCloseIfSingleDocUnsafe(
+            activeDoc,
+            approveControlledDocumentClose:=True
+        )
         If blockedByUnsafeChanges Then Return True
+
+        If consumeUnsafeDocumentCloseApproval(activePath) Then
+            'Never let the native close continue after the user chose "close without saving";
+            'SOLIDWORKS would append its own Save/Don't Save prompt.  Use the same verified,
+            'context-aware CloseDoc route as the close-review table instead.
+            If queueUserApprovedDocumentCloseWithoutSave(
+                activePath,
+                allowWithoutCloseReview:=True
+            ) Then Return True
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "The close-without-saving request could not be started." & vbCrLf & vbCrLf &
+                    "The file was left open. Try closing it again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Return True
+        End If
 
         If guardGeneratedFalseDirty Then
             'SOLIDWORKS has no public API to clear GetSaveFlag. Swallow this native close
@@ -8292,7 +8475,13 @@ Public Module svnModule
 
         For startIndex As Integer = 0 To paths.Length - 1 Step chunkSize
             Dim chunk As String() = paths.Skip(startIndex).Take(chunkSize).ToArray()
-            output.AddRange(getOwnedLockReviewItems(chunk, scanWholeWorkingCopy:=False))
+            Dim refreshedChunk As List(Of CloseLockReviewItem) = getOwnedLockReviewItems(
+                chunk,
+                scanWholeWorkingCopy:=False,
+                returnNothingOnFailure:=True
+            )
+            If refreshedChunk Is Nothing Then Return Nothing
+            output.AddRange(refreshedChunk)
         Next
 
         Return output.
@@ -8349,7 +8538,8 @@ Public Module svnModule
 
                 reviewItems = getOwnedLockReviewItems(
                     candidatePaths:=documentScopePaths,
-                    scanWholeWorkingCopy:=False
+                    scanWholeWorkingCopy:=False,
+                    returnNothingOnFailure:=True
                 )
             End If
         Catch
@@ -8371,18 +8561,12 @@ Public Module svnModule
                 Return True
             End If
 
-            Dim response As Integer = iSwApp.SendMsgToUser2(
+            iSwApp.SendMsgToUser2(
                 "PlumVault could not verify whether SVN locks are still held in the working copy." & vbCrLf & vbCrLf &
-                "Yes = Cancel close and retry after checking the working copy/SVN installation" & vbCrLf &
-                "No = Close SOLIDWORKS without verifying retained locks",
+                "The close was cancelled. Click Sync and try again after checking the working copy and SVN installation.",
                 swMessageBoxIcon_e.swMbWarning,
-                swMessageBoxBtn_e.swMbYesNo
+                swMessageBoxBtn_e.swMbOk
             )
-
-            If response = swMessageBoxResult_e.swMbHitNo Then
-                applicationLockReviewApprovedUntil = DateTime.Now.AddSeconds(10)
-                Return False
-            End If
 
             Return True
         End If
@@ -8420,10 +8604,20 @@ Public Module svnModule
             End Using
 
             Return True
-        Catch
-            'The lock table is advisory after the existing save/commit failsafe has
-            'already passed. Never crash SOLIDWORKS if the review UI itself fails.
-            Return False
+        Catch ex As Exception
+            'The review table is a required close decision point whenever retained locks exist.
+            'If its UI fails, leave SOLIDWORKS open rather than bypassing the lock review.
+            Try
+                iSwApp.SendMsgToUser2(
+                    "The close was cancelled because the SVN lock review window could not be opened." & vbCrLf & vbCrLf &
+                    "Click Sync and try again." & vbCrLf & vbCrLf & ex.Message,
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Return True
         Finally
             lockReviewMessageShowing = False
         End Try
@@ -8441,6 +8635,13 @@ Public Module svnModule
            isPathInsideLocalRepo(normalizedDocumentPath) AndAlso
            seen.Add(normalizedDocumentPath) Then
             output.Add(normalizedDocumentPath)
+        End If
+
+        'Closing a part window does not close its referenced/derived source documents. Review
+        'the part's own lock only; this also avoids a fragile COM dependency walk on the most
+        'common mini-X/Ctrl+W path. Assembly and drawing closes still review their full closure.
+        If String.Equals(Path.GetExtension(normalizedDocumentPath), ".SLDPRT", StringComparison.OrdinalIgnoreCase) Then
+            Return output.ToArray()
         End If
 
         'One local SOLIDWORKS dependency query returns the complete recursive closure for
@@ -8481,11 +8682,13 @@ Public Module svnModule
                 Next
             End If
         Catch ex As Exception
-            'The root document remains in scope even if SOLIDWORKS cannot enumerate one of
-            'its dependencies. The normal full-application close scan remains the final net.
             writeOperationLog(
-                "Mini-X dependency lock review used root-only fallback for " &
+                "Mini-X dependency lock review failed for " &
                 Path.GetFileName(normalizedDocumentPath) & ": " & ex.Message
+            )
+            Throw New InvalidOperationException(
+                "SOLIDWORKS could not enumerate the document dependencies safely.",
+                ex
             )
         End Try
 
@@ -8922,8 +9125,10 @@ Public Module svnModule
 
     Private Function tryGetLocalSvnChangeState(ByVal filePath As String,
                                                ByRef hasLocalChanges As Boolean,
-                                               ByRef errorMessage As String) As Boolean
+                                               ByRef errorMessage As String,
+                                               Optional ByRef hasLocalLockToken As Boolean = False) As Boolean
         hasLocalChanges = False
+        hasLocalLockToken = False
         errorMessage = ""
 
         Try
@@ -8945,6 +9150,8 @@ Public Module svnModule
 
             For Each line As String In lines
                 If String.IsNullOrWhiteSpace(line) Then Continue For
+
+                If line.Length >= 6 AndAlso line(5) = "K"c Then hasLocalLockToken = True
 
                 Dim workingCopyState As Char = If(line.Length >= 1, line(0), " "c)
                 Dim propertyState As Char = If(line.Length >= 2, line(1), " "c)
@@ -8970,9 +9177,8 @@ Public Module svnModule
         errorMessage = ""
 
         Dim hasLocalChanges As Boolean = False
-        If Not tryGetLocalSvnChangeState(filePath, hasLocalChanges, errorMessage) Then Return False
-
-        Dim hadLock As Boolean = userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False)
+        Dim hadLock As Boolean = False
+        If Not tryGetLocalSvnChangeState(filePath, hasLocalChanges, errorMessage, hadLock) Then Return False
         Dim openDocument As ModelDoc2 = getOpenModelByPathSafe(filePath)
         Dim documentType As Integer = swDocumentTypes_e.swDocNONE
         Dim documentWasDirty As Boolean = False
@@ -9017,10 +9223,18 @@ Public Module svnModule
                 If hasLocalChanges Then
                     Dim drawingTitle As String = ""
                     Try
-                        drawingTitle = openDocument.GetTitle()
-                    Catch
                         drawingTitle = Path.GetFileName(filePath)
+                    Catch
+                        drawingTitle = ""
                     End Try
+
+                    If String.IsNullOrWhiteSpace(drawingTitle) Then
+                        Try
+                            drawingTitle = openDocument.GetTitle()
+                        Catch
+                            drawingTitle = ""
+                        End Try
+                    End If
 
                     controlledDocumentCloseNativeCallInProgress = True
                     Try
@@ -9268,8 +9482,14 @@ Public Module svnModule
         'release a file that was edited after the review window opened.
         Dim currentItems As List(Of CloseLockReviewItem) = getOwnedLockReviewItems(
             candidatePaths:=New String() {filePath},
-            scanWholeWorkingCopy:=False
+            scanWholeWorkingCopy:=False,
+            returnNothingOnFailure:=True
         )
+
+        If currentItems Is Nothing Then
+            errorMessage = "PlumVault could not verify the file's current SVN lock and change state. Click Sync and try again."
+            Return False
+        End If
 
         Dim currentItem As CloseLockReviewItem = currentItems.
             FirstOrDefault(Function(item) String.Equals(
@@ -9375,7 +9595,18 @@ Public Module svnModule
         Return False
     End Function
 
-    Private Function showUnsafeClosePrompt(ByVal unsafeMsg As String) As Boolean
+    Private Function consumeUnsafeDocumentCloseApproval(ByVal filePath As String) As Boolean
+        If DateTime.Now >= unsafeForceCloseApprovedUntil Then Return False
+        If String.IsNullOrWhiteSpace(filePath) OrElse String.IsNullOrWhiteSpace(unsafeForceCloseApprovedPath) Then Return False
+        If Not pathsAreSame(filePath, unsafeForceCloseApprovedPath) Then Return False
+
+        unsafeForceCloseApprovedUntil = DateTime.MinValue
+        unsafeForceCloseApprovedPath = ""
+        Return True
+    End Function
+
+    Private Function showUnsafeClosePrompt(ByVal unsafeMsg As String,
+                                           Optional ByVal approvedDocumentPath As String = "") As Boolean
         Dim response As Integer = iSwApp.SendMsgToUser2(
             "One or more open CAD files are not safe to close yet." & vbCrLf & vbCrLf &
             unsafeMsg & vbCrLf &
@@ -9401,6 +9632,11 @@ Public Module svnModule
             'Allow duplicate close events through briefly.
             'This prevents the same force-close choice from prompting multiple times.
             unsafeForceCloseApprovedUntil = DateTime.Now.AddSeconds(10)
+            unsafeForceCloseApprovedPath = If(
+                String.IsNullOrWhiteSpace(approvedDocumentPath),
+                "",
+                normalizeFullPathSafe(approvedDocumentPath)
+            )
             Return False 'Allow close anyway
         End If
 
@@ -11012,14 +11248,6 @@ Public Module svnModule
             Return output
         End Try
     End Function
-    Sub myUnlockWithDependents(modDoc As ModelDoc2)
-
-        'Dim modDoc() As ModelDoc2 = {iSwApp.ActiveDoc()}
-        If modDoc Is Nothing Then iSwApp.SendMsgToUser("Active Document not found") : Exit Sub
-
-        unlockDocs(myUserControl.getComponentsOfAssemblyOptionalUpdateTree(myUserControl.GetSelectedModDocList(iSwApp)))
-
-    End Sub
     Public Function editNewRev(modDocArr() As ModelDoc2) As Boolean
         Dim modDocPath As String
         Dim extension As String
@@ -15342,11 +15570,6 @@ Public Module svnModule
             Exit Sub
         End If
 
-        'The tree intentionally uses a cache for display, but that cache is not authority for
-        'whether Commit may proceed. Reconcile positive live local K tokens before any commit
-        'preparation so a stale tree row cannot force the user through Get Locks a second time.
-        refreshCachedLockTokensFromWorkingCopy(sModDocPathArr)
-
         'Assembly safety with almost no normal slowdown:
         'Only when the selected commit target is an open assembly, locally check for external CAD refs.
         'If external CAD is found, prompt vendor vs normal CAD, copy into the proper SVN folder, relink, and commit it too.
@@ -15373,6 +15596,12 @@ Public Module svnModule
             Exit Sub
         End If
 
+        'One live local status pass is authoritative for every lock-dependent commit check below.
+        'It also reconciles positive K tokens into the display cache so stale tree rows cannot
+        'force a second Get Locks operation.
+        Dim liveLockedCommitPaths As HashSet(Of String) = getLiveLockedManagedCadPaths(sModDocPathArr)
+        refreshCachedLockTokensFromWorkingCopy(sModDocPathArr, liveLockedCommitPaths)
+
         If Not validateCadPathNamesBeforeCommit(sModDocPathArr) Then Exit Sub
         If Not validateNoDuplicateCadFileNamesForPaths(sModDocPathArr) Then Exit Sub
         If Not commitPathsAllowedOnlyIfUpToDate(sModDocPathArr) Then Exit Sub
@@ -15380,9 +15609,10 @@ Public Module svnModule
         If Not automaticSaveCommitPathsHaveRequiredLocks(
             sModDocPathArr,
             operationLabel:="Commit",
-            retryInstruction:="Click Sync to refresh status if these locks were changed outside PlumVault; otherwise use Get Locks and try Commit again."
+            retryInstruction:="Click Sync to refresh status if these locks were changed outside PlumVault; otherwise use Get Locks and try Commit again.",
+            knownLiveLockedPaths:=liveLockedCommitPaths
         ) Then Exit Sub
-        If Not ensureLiveLockedCommitPathsWritable(sModDocPathArr) Then Exit Sub
+        If Not ensureLiveLockedCommitPathsWritable(sModDocPathArr, liveLockedCommitPaths) Then Exit Sub
 
         makeFirstCommitCandidatePathsWritable(sModDocPathArr)
 
@@ -15410,10 +15640,9 @@ Public Module svnModule
         startCommitProcessBackground(sModDocPathArr, sCommitMessage, bAutoFirstCommitDataset)
     End Sub
 
-    Private Sub refreshCachedLockTokensFromWorkingCopy(ByVal filePaths() As String)
-        If filePaths Is Nothing Then Exit Sub
-
-        Dim liveLockedPaths As New List(Of String)()
+    Private Function getLiveLockedManagedCadPaths(ByVal filePaths() As String) As HashSet(Of String)
+        Dim liveLockedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        If filePaths Is Nothing Then Return liveLockedPaths
 
         For Each filePath As String In filePaths
             If String.IsNullOrWhiteSpace(filePath) Then Continue For
@@ -15422,16 +15651,29 @@ Public Module svnModule
             If isFirstCommitCandidatePath(filePath) Then Continue For
 
             If userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False) Then
-                liveLockedPaths.Add(filePath)
+                liveLockedPaths.Add(normalizeFullPathSafe(filePath))
             End If
         Next
+
+        Return liveLockedPaths
+    End Function
+
+    Private Sub refreshCachedLockTokensFromWorkingCopy(ByVal filePaths() As String,
+                                                        Optional ByVal knownLiveLockedPaths As HashSet(Of String) = Nothing)
+        If filePaths Is Nothing Then Exit Sub
+
+        Dim liveLockedPaths As HashSet(Of String) = If(
+            knownLiveLockedPaths,
+            getLiveLockedManagedCadPaths(filePaths)
+        )
 
         If liveLockedPaths.Count > 0 Then
             updateStatusCacheForKnownPaths(liveLockedPaths.ToArray(), forceLock6:="K")
         End If
     End Sub
 
-    Private Function ensureLiveLockedCommitPathsWritable(ByVal filePaths() As String) As Boolean
+    Private Function ensureLiveLockedCommitPathsWritable(ByVal filePaths() As String,
+                                                          Optional ByVal knownLiveLockedPaths As HashSet(Of String) = Nothing) As Boolean
         If filePaths Is Nothing Then Return False
 
         For Each filePath As String In filePaths
@@ -15439,7 +15681,12 @@ Public Module svnModule
             If Directory.Exists(filePath) OrElse Not File.Exists(filePath) Then Continue For
             If Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then Continue For
             If isFirstCommitCandidatePath(filePath) Then Continue For
-            If Not userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False) Then Continue For
+            Dim hasRequiredLock As Boolean = If(
+                knownLiveLockedPaths Is Nothing,
+                userHasLocalSvnLockTokenForPath(filePath, allowCachedToken:=False),
+                knownLiveLockedPaths.Contains(normalizeFullPathSafe(filePath))
+            )
+            If Not hasRequiredLock Then Continue For
 
             Try
                 File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
@@ -15944,17 +16191,6 @@ Public Module svnModule
                              success = runTortoiseProcBackgroundNoUi(tortoiseArgs, repoRootForBackground, pathsForBackground, savedPathForBackground, errorMessage)
                          End If
 
-                         If success Then
-                             For Each commitPath As String In pathsForBackground
-                                 Try
-                                     If File.Exists(commitPath) Then
-                                         File.SetAttributes(commitPath, File.GetAttributes(commitPath) Or FileAttributes.ReadOnly)
-                                     End If
-                                 Catch
-                                 End Try
-                             Next
-                         End If
-
                      Catch ex As Exception
                          success = False
                          errorMessage = ex.Message
@@ -15962,7 +16198,18 @@ Public Module svnModule
 
                      Try
                          If myUserControl IsNot Nothing AndAlso myUserControl.IsHandleCreated Then
-                             myUserControl.BeginInvoke(New MethodInvoker(Sub() finishCommitProcessOnMainThread(pathsForBackground, success, errorMessage, bAutoFirstCommitDataset)))
+                             myUserControl.BeginInvoke(
+                                 New MethodInvoker(
+                                     Sub()
+                                         finishCommitProcessOnMainThread(
+                                             pathsForBackground,
+                                             success,
+                                             errorMessage,
+                                             bAutoFirstCommitDataset
+                                         )
+                                     End Sub
+                                 )
+                             )
                          Else
                              asyncCommitInProgress = False
                          End If
@@ -16011,7 +16258,10 @@ Public Module svnModule
         End Try
 
         Try
-            updateStatusCacheForKnownPaths(commitPaths, forceAddDelChg1:=" ", forceLock6:=" ", forceUpToDate9:=" ")
+            'A TortoiseSVN commit may retain or release locks depending on its dialog state.
+            'Do not guess that every lock was released; refresh live status and reconcile the
+            'active document's write access from the authoritative result.
+            updateStatusCacheForKnownPaths(commitPaths, forceAddDelChg1:=" ", forceUpToDate9:=" ")
             'The task-pane tree is rendered from statusOfAllOpenModels, not only the keyed
             'cache. Refresh local working-copy state immediately so a lock released by Commit
             'does not remain green until the user manually clicks Refresh.

@@ -228,7 +228,7 @@ Public Class ExternalReferenceImportForm
             .Name = COL_OLD_NAME,
             .HeaderText = "Old file name",
             .ReadOnly = True,
-            .Width = 165,
+            .Width = 150,
             .MinimumWidth = 120
         })
 
@@ -236,7 +236,7 @@ Public Class ExternalReferenceImportForm
             .Name = COL_ORIGINAL_PATH,
             .HeaderText = "Original path",
             .ReadOnly = True,
-            .Width = 235,
+            .Width = 190,
             .MinimumWidth = 160
         })
 
@@ -244,14 +244,14 @@ Public Class ExternalReferenceImportForm
             .Name = COL_SOURCE_TYPE,
             .HeaderText = "Source type",
             .ReadOnly = True,
-            .Width = 78,
+            .Width = 72,
             .MinimumWidth = 70
         })
 
         Dim targetColumn As New DataGridViewComboBoxColumn()
         targetColumn.Name = COL_TARGET_TYPE
         targetColumn.HeaderText = "Import type"
-        targetColumn.Width = 105
+        targetColumn.Width = 100
         targetColumn.MinimumWidth = 95
         targetColumn.FlatStyle = FlatStyle.Flat
         targetColumn.Items.Add("GRC CAD")
@@ -261,14 +261,14 @@ Public Class ExternalReferenceImportForm
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
             .HeaderText = "New ID / filename",
-            .Width = 170,
+            .Width = 150,
             .MinimumWidth = 130
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_DESTINATION,
             .HeaderText = "Destination folder",
-            .Width = 235,
+            .Width = 190,
             .MinimumWidth = 160
         })
 
@@ -277,8 +277,8 @@ Public Class ExternalReferenceImportForm
         browseColumn.HeaderText = ""
         browseColumn.Text = "Browse..."
         browseColumn.UseColumnTextForButtonValue = True
-        browseColumn.Width = 92
-        browseColumn.MinimumWidth = 92
+        browseColumn.Width = 82
+        browseColumn.MinimumWidth = 78
         browseColumn.FlatStyle = FlatStyle.Standard
         browseColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
         browseColumn.DefaultCellStyle.Padding = New Padding(2, 1, 2, 1)
@@ -289,7 +289,7 @@ Public Class ExternalReferenceImportForm
             .Name = COL_FINAL_NAME,
             .HeaderText = "Final filename",
             .ReadOnly = True,
-            .Width = 175,
+            .Width = 150,
             .MinimumWidth = 130
         })
 
@@ -298,8 +298,8 @@ Public Class ExternalReferenceImportForm
         checkColumn.HeaderText = "Check"
         checkColumn.Text = "Check"
         checkColumn.UseColumnTextForButtonValue = True
-        checkColumn.Width = 84
-        checkColumn.MinimumWidth = 84
+        checkColumn.Width = 78
+        checkColumn.MinimumWidth = 72
         checkColumn.FlatStyle = FlatStyle.Standard
         checkColumn.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter
         checkColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
@@ -311,8 +311,8 @@ Public Class ExternalReferenceImportForm
         statusColumn.Name = COL_STATUS
         statusColumn.HeaderText = "Status"
         statusColumn.ReadOnly = True
-        statusColumn.Width = 72
-        statusColumn.MinimumWidth = 72
+        statusColumn.Width = 68
+        statusColumn.MinimumWidth = 64
         statusColumn.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter
         statusColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter
         statusColumn.DefaultCellStyle.Font = New Font("Segoe UI", 10.0F, FontStyle.Bold)
@@ -323,7 +323,7 @@ Public Class ExternalReferenceImportForm
             .HeaderText = "Explanation",
             .ReadOnly = True,
             .AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            .MinimumWidth = 260
+            .MinimumWidth = 220
         }
         'Explanation messages are full sentences (e.g. "Vendor parts may be saved anywhere
         'inside the working copy, but the path must contain a folder named Vendor Parts.").

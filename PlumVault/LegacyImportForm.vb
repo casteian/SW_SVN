@@ -288,7 +288,7 @@ Public Class LegacyImportForm
             .Name = COL_OLD_NAME,
             .HeaderText = "Old file name",
             .ReadOnly = True,
-            .Width = 230,
+            .Width = 200,
             .MinimumWidth = 150
         }
 
@@ -296,7 +296,7 @@ Public Class LegacyImportForm
             .Name = COL_ORIGINAL,
             .HeaderText = "Original path",
             .ReadOnly = True,
-            .Width = 285,
+            .Width = 220,
             .MinimumWidth = 180
         }
 
@@ -304,14 +304,14 @@ Public Class LegacyImportForm
             .Name = COL_SOURCE_TYPE,
             .HeaderText = "Source type",
             .ReadOnly = True,
-            .Width = 90,
+            .Width = 80,
             .MinimumWidth = 80
         }
 
         Dim targetTypeColumn As New DataGridViewComboBoxColumn() With {
             .Name = COL_TARGET_TYPE,
             .HeaderText = "Import type",
-            .Width = 110,
+            .Width = 100,
             .MinimumWidth = 100,
             .DisplayStyle = DataGridViewComboBoxDisplayStyle.DropDownButton,
             .FlatStyle = FlatStyle.Standard
@@ -321,7 +321,7 @@ Public Class LegacyImportForm
         Dim newIdColumn As New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
             .HeaderText = "New ID / filename",
-            .Width = 225,
+            .Width = 180,
             .MinimumWidth = 150
         }
 
@@ -329,7 +329,7 @@ Public Class LegacyImportForm
             .Name = COL_FINAL_NAME,
             .HeaderText = "Final filename",
             .ReadOnly = True,
-            .Width = 235,
+            .Width = 190,
             .MinimumWidth = 160
         }
 

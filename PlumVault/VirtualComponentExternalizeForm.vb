@@ -215,7 +215,7 @@ Public Class VirtualComponentExternalizeForm
             .Name = COL_COMPONENT,
             .HeaderText = "Virtual component",
             .ReadOnly = True,
-            .Width = 165,
+            .Width = 145,
             .MinimumWidth = 120
         })
 
@@ -223,7 +223,7 @@ Public Class VirtualComponentExternalizeForm
             .Name = COL_OWNER,
             .HeaderText = "Physical owner assembly",
             .ReadOnly = True,
-            .Width = 180,
+            .Width = 160,
             .MinimumWidth = 140
         })
 
@@ -231,14 +231,14 @@ Public Class VirtualComponentExternalizeForm
             .Name = COL_SOURCE_TYPE,
             .HeaderText = "Type",
             .ReadOnly = True,
-            .Width = 72,
+            .Width = 68,
             .MinimumWidth = 65
         })
 
         Dim handlingColumn As New DataGridViewComboBoxColumn()
         handlingColumn.Name = COL_HANDLING
         handlingColumn.HeaderText = "Handling"
-        handlingColumn.Width = 120
+        handlingColumn.Width = 110
         handlingColumn.MinimumWidth = 110
         handlingColumn.FlatStyle = FlatStyle.Flat
         handlingColumn.Items.Add("Save externally")
@@ -248,7 +248,7 @@ Public Class VirtualComponentExternalizeForm
         Dim targetColumn As New DataGridViewComboBoxColumn()
         targetColumn.Name = COL_TARGET_TYPE
         targetColumn.HeaderText = "File type"
-        targetColumn.Width = 100
+        targetColumn.Width = 95
         targetColumn.MinimumWidth = 90
         targetColumn.FlatStyle = FlatStyle.Flat
         targetColumn.Items.Add("GRC CAD")
@@ -258,14 +258,14 @@ Public Class VirtualComponentExternalizeForm
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
             .HeaderText = "New ID / filename",
-            .Width = 170,
+            .Width = 150,
             .MinimumWidth = 130
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_DESTINATION,
             .HeaderText = "Destination folder",
-            .Width = 220,
+            .Width = 190,
             .MinimumWidth = 160
         })
 
@@ -282,7 +282,7 @@ Public Class VirtualComponentExternalizeForm
             .Name = COL_FINAL_NAME,
             .HeaderText = "Final filename",
             .ReadOnly = True,
-            .Width = 175,
+            .Width = 155,
             .MinimumWidth = 130
         })
 
@@ -308,7 +308,7 @@ Public Class VirtualComponentExternalizeForm
             .HeaderText = "Explanation",
             .ReadOnly = True,
             .AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-            .MinimumWidth = 260
+            .MinimumWidth = 220
         }
         'Explanation messages are full sentences. Wrap instead of clipping -
         'AutoSizeRowsMode above grows the row to fit.
@@ -650,7 +650,7 @@ Public Class VirtualComponentExternalizeForm
         If Not finalName.EndsWith(ext, StringComparison.OrdinalIgnoreCase) Then finalName &= ext
 
         If item.TargetType = VirtualComponentTargetType.GrcCad Then
-            If Not isValidGrc27FileName(finalName) Then
+            If Not isValidExternalizedComponentFileName(finalName) Then
                 setInvalid(item, row,
                            "Invalid GRC27/CFD27 filename. Use PREFIX_CODE_00000_R# or the approved letter-number variants.")
                 Return
@@ -713,7 +713,10 @@ Public Class VirtualComponentExternalizeForm
         updateSummaryAndContinueState()
     End Sub
 
-    Private Function isValidGrc27FileName(ByVal fileName As String) As Boolean
+    'Virtual components can only externalize as parts or assemblies. Keep this narrower rule
+    'explicitly named so it cannot be mistaken for the module-wide CAD validator (which also
+    'accepts drawings).
+    Private Function isValidExternalizedComponentFileName(ByVal fileName As String) As Boolean
         If String.IsNullOrWhiteSpace(fileName) Then Return False
 
         Return Regex.IsMatch(
@@ -806,15 +809,21 @@ Public Class VirtualComponentExternalizeForm
     Private Sub applyPendingRowStyle(ByVal row As DataGridViewRow)
         row.DefaultCellStyle.BackColor = Color.LightYellow
         row.DefaultCellStyle.ForeColor = SystemColors.ControlText
+        row.DefaultCellStyle.SelectionBackColor = Color.Khaki
+        row.DefaultCellStyle.SelectionForeColor = Color.Black
     End Sub
 
     Private Sub applyValidRowStyle(ByVal row As DataGridViewRow)
         row.DefaultCellStyle.BackColor = Color.Honeydew
         row.DefaultCellStyle.ForeColor = SystemColors.ControlText
+        row.DefaultCellStyle.SelectionBackColor = Color.PaleGreen
+        row.DefaultCellStyle.SelectionForeColor = Color.Black
     End Sub
 
     Private Sub applyInvalidRowStyle(ByVal row As DataGridViewRow)
         row.DefaultCellStyle.BackColor = Color.MistyRose
         row.DefaultCellStyle.ForeColor = Color.DarkRed
+        row.DefaultCellStyle.SelectionBackColor = Color.LightSalmon
+        row.DefaultCellStyle.SelectionForeColor = Color.Black
     End Sub
 End Class

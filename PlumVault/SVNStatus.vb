@@ -490,7 +490,14 @@ Public Class SVNStatus
                 ' This allows the file to be overwritten by the New version
                 If fp(index(i)).modDoc.GetType = swDocumentTypes_e.swDocDRAWING Then
                     'forcereleaselocks isn't a thing for drawings. Need to close and reopen it. 
-                    iSwApp.CloseDoc(fp(index(i)).modDoc.GetTitle)
+                    Dim drawingName As String = ""
+                    Try
+                        drawingName = System.IO.Path.GetFileName(fp(index(i)).filename)
+                    Catch
+                        drawingName = ""
+                    End Try
+                    If String.IsNullOrWhiteSpace(drawingName) Then drawingName = fp(index(i)).modDoc.GetTitle()
+                    iSwApp.CloseDoc(drawingName)
                     fp(index(i)).modDoc = Nothing
                 Else
                     'The method doesn't work for Drawings

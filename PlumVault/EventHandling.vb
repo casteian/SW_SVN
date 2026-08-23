@@ -721,7 +721,8 @@ Public Class AssemblyEventHandler
             allowDisplayOnlyFallback:=True,
             allowRebuildModifyFallback:=True,
             allowActiveChildEditContext:=True,
-            allowPendingSuppressionCommandFallback:=True
+            allowPendingSuppressionCommandFallback:=True,
+            pendingSuppressionEventAssembly:=iDocument
         )
         Return 0
     End Function
@@ -872,7 +873,8 @@ Public Class AssemblyEventHandler
                     editOwner,
                     "unsuppressing a component",
                     allowActiveChildEditContext:=True,
-                    allowPendingSuppressionCommandFallback:=True
+                    allowPendingSuppressionCommandFallback:=True,
+                    pendingSuppressionEventAssembly:=iDocument
                 )
 
                 Exit Select
@@ -883,7 +885,8 @@ Public Class AssemblyEventHandler
                     editOwner,
                     "suppressing a component",
                     allowActiveChildEditContext:=True,
-                    allowPendingSuppressionCommandFallback:=True
+                    allowPendingSuppressionCommandFallback:=True,
+                    pendingSuppressionEventAssembly:=iDocument
                 )
 
                 Exit Select
@@ -907,14 +910,6 @@ Public Class AssemblyEventHandler
     End Function
 
     Public Function AssemblyDoc_ComponentVisiblePropertiesChangeNotify(ByVal swObject As Object) As Integer
-
-        Dim component As Component2
-        Dim modDoc As ModelDoc2
-
-        component = swObject
-
-        modDoc = component.GetModelDoc
-
         'Appearance/transparency is a local display preference, not a geometry or structural
         'edit - a user commonly changes it just to see or measure something more clearly
         'while locked out of the assembly (e.g. editing one specific part in context).
@@ -944,14 +939,6 @@ Public Class AssemblyEventHandler
     'End Function
 
     Public Function AssemblyDoc_ComponentDisplayStateChangeNotify(ByVal swObject As Object) As Integer
-
-        Dim component As Component2
-        Dim modDoc As ModelDoc2
-
-        component = swObject
-
-        modDoc = component.GetModelDoc
-
         'Hide/show and display-state changes are local viewing preferences, not geometry or
         'structural edits - allowed without the assembly lock for the same reason as
         'visual-properties changes above (e.g. hiding surrounding
@@ -1250,10 +1237,11 @@ Public Class DocView
 
                     If keyCode = CInt(Keys.W) AndAlso
                            ((Control.ModifierKeys And Keys.Control) = Keys.Control) Then
-
-                        If SolidWorksCloseGuardCoordinator.ShouldBlockActiveDocumentClose() Then
-                            Return
-                        End If
+                        'Use the same deferred Ctrl+W path as the global keyboard hook.  Running a
+                        'second synchronous close decision here could race the first path's modal
+                        'table and its controlled-close flags.
+                        svnModule.queueDeferredCtrlWCloseCheckPublic()
+                        Return
                     End If
                 Catch
                 End Try
