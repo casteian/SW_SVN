@@ -390,6 +390,9 @@ Public Class PartEventHandler
         AddHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
         AddHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
         AddHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
+        AddHandler iPart.ModifyNotify, AddressOf Me.PartDoc_ModifyNotify
+        AddHandler iPart.RegenNotify, AddressOf Me.PartDoc_RegenNotify
+        AddHandler iPart.RegenPostNotify, AddressOf Me.PartDoc_RegenPostNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
         'AddHandler iPart.NewSelectionNotify, AddressOf Me.PartDoc_NewSelectionNotify
@@ -409,6 +412,9 @@ Public Class PartEventHandler
             RemoveHandler iPart.FileSaveNotify, AddressOf Me.PartDoc_FileSaveNotify
             RemoveHandler iPart.FileSaveAsNotify2, AddressOf Me.PartDoc_FileSaveAsNotify2
             RemoveHandler iPart.FileSavePostNotify, AddressOf Me.PartDoc_FileSavePostNotify
+            RemoveHandler iPart.ModifyNotify, AddressOf Me.PartDoc_ModifyNotify
+            RemoveHandler iPart.RegenNotify, AddressOf Me.PartDoc_RegenNotify
+            RemoveHandler iPart.RegenPostNotify, AddressOf Me.PartDoc_RegenPostNotify
             RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
         Catch
             'The SOLIDWORKS document may already have released its COM connection.
@@ -443,6 +449,21 @@ Public Class PartEventHandler
         'UC1.getComponentsOfAssemblyOptionalUpdateTree(modDoc, status)
 
         'swAddin.myTaskPaneHost.switchTreeViewToCurrentModel()
+    End Function
+
+    Private Function PartDoc_ModifyNotify() As Integer
+        svnModule.handlePartOwnedEditPostPublic(iDocument, "editing this part")
+        Return 0
+    End Function
+
+    Private Function PartDoc_RegenNotify() As Integer
+        svnModule.beginAssemblyRebuildPublic(iDocument)
+        Return 0
+    End Function
+
+    Private Function PartDoc_RegenPostNotify() As Integer
+        svnModule.endAssemblyRebuildPublic(iDocument)
+        Return 0
     End Function
 
     Private Function PartDoc_FileSaveNotify(ByVal FileName As String) As Integer
@@ -711,6 +732,8 @@ Public Class AssemblyEventHandler
                 End If
             Catch
             End Try
+
+            svnModule.offerFirstSaveAfterInsertOnNewAssemblyPublic(iDocument)
         End If
 
         If currentComponentCount >= 0 Then lastKnownComponentCount = currentComponentCount

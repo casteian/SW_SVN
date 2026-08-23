@@ -298,10 +298,17 @@ Public Class CadRelocationReviewForm
                 )
                 grid.Rows(index).Tag = item.FilePath
 
+                'Selection color must match the row's state color, not the WinForms default
+                'blue - otherwise selecting/clicking a row (which DataGridView does on any
+                'cell click) hides the ready/not-ready state the color is there to show.
                 If Not item.IsReady Then
                     grid.Rows(index).DefaultCellStyle.BackColor = Color.MistyRose
+                    grid.Rows(index).DefaultCellStyle.SelectionBackColor = Color.MistyRose
+                    grid.Rows(index).DefaultCellStyle.SelectionForeColor = grid.Rows(index).DefaultCellStyle.ForeColor
                 Else
                     grid.Rows(index).DefaultCellStyle.BackColor = Color.Honeydew
+                    grid.Rows(index).DefaultCellStyle.SelectionBackColor = Color.Honeydew
+                    grid.Rows(index).DefaultCellStyle.SelectionForeColor = grid.Rows(index).DefaultCellStyle.ForeColor
                 End If
             Next
 

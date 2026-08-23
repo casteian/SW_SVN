@@ -203,6 +203,13 @@ Public Module svnModule
     Private Const CONTROLLED_CLOSE_QUEUE_STALE_MINUTES As Double = 2.0
     Private lastControlledCloseQueueBlockedMessageUtc As DateTime = DateTime.MinValue
 
+    'A component inserted into a brand-new, never-saved assembly leaves that assembly with no
+    'SVN identity - the lock/status checks around it can then produce a confusing run of
+    'warnings the next time a locked child is edited in-context. Offer the first-save/commit
+    'flow right after the first real component insert instead of leaving the assembly unsaved
+    'indefinitely; once per assembly per session so this never nags on every subsequent insert.
+    Private ReadOnly firstSaveOfferedAssemblyKeys As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
     'Callers must already hold assemblyGuardSync.
     Private Sub addControlledCloseQueuedPathLocked(ByVal normalizedPath As String)
         If assemblyGuardControlledCloseQueuedPaths.Count = 0 Then
@@ -2488,6 +2495,126 @@ Public Module svnModule
         End Try
     End Sub
 
+    'A standalone part opened directly (not in-context through an assembly) had no equivalent
+    'of the assembly-edit-protection guard - the OS read-only attribute was the only thing
+    'standing between "not locked" and "can edit", and nothing re-verified it once SOLIDWORKS
+    'had the document open. This mirrors handleAssemblyOwnedEditPostPublic's undo-based pattern
+    'for a part's own ModifyNotify, reusing the same fast-lock-check, rebuild-tracking, and
+    'queued-undo infrastructure (all already generic across document types despite the
+    '"assembly" naming - none of it touches assembly-specific APIs).
+    Public Sub handlePartOwnedEditPostPublic(ByVal partDocument As ModelDoc2, ByVal actionDescription As String)
+        If partDocument Is Nothing Then Exit Sub
+        If assemblyEditGuardSuppressed(partDocument) Then Exit Sub
+        If assemblyHasRequiredLockFast(partDocument) Then Exit Sub
+        If consumeAssemblyRebuildGenericModifyAllowance(partDocument) Then Exit Sub
+
+        Dim partPath As String = getAssemblyPathKeySafe(partDocument)
+        If String.IsNullOrWhiteSpace(partPath) Then Exit Sub
+
+        SyncLock assemblyGuardSync
+            If assemblyGuardQueuedPaths.Contains(partPath) Then Exit Sub
+            assemblyGuardQueuedPaths.Add(partPath)
+        End SyncLock
+
+        Dim undoAction As New System.Windows.Forms.MethodInvoker(
+            Sub()
+                Try
+                    Dim currentPart As ModelDoc2 = getOpenModelByPathSafe(partPath)
+                    If currentPart Is Nothing Then Exit Sub
+                    If assemblyEditGuardSuppressed(currentPart) Then Exit Sub
+                    If assemblyHasRequiredLockFast(currentPart) Then Exit Sub
+
+                    assemblyGuardUndoInProgress = True
+                    Try
+                        currentPart.EditUndo2(1)
+                    Finally
+                        assemblyGuardUndoInProgress = False
+                    End Try
+
+                    Dim actionText As String = ""
+                    If Not String.IsNullOrWhiteSpace(actionDescription) Then
+                        actionText = vbCrLf & vbCrLf & "Attempted action: " & actionDescription
+                    End If
+
+                    iSwApp.SendMsgToUser2(
+                        "Edit was undone." & vbCrLf & vbCrLf &
+                        Path.GetFileName(partPath) & " is not locked by you." & vbCrLf &
+                        "Get Locks on it before editing." &
+                        actionText,
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                Catch
+                Finally
+                    SyncLock assemblyGuardSync
+                        assemblyGuardQueuedPaths.Remove(partPath)
+                    End SyncLock
+                End Try
+            End Sub
+        )
+
+        Try
+            If myUserControl IsNot Nothing AndAlso
+               Not myUserControl.IsDisposed AndAlso
+               myUserControl.IsHandleCreated Then
+
+                myUserControl.BeginInvoke(undoAction)
+            End If
+        Catch
+        End Try
+    End Sub
+
+    Public Sub offerFirstSaveAfterInsertOnNewAssemblyPublic(ByVal assemblyDocument As ModelDoc2)
+        Try
+            If assemblyDocument Is Nothing Then Exit Sub
+            If iSwApp Is Nothing OrElse myUserControl Is Nothing Then Exit Sub
+            If automaticSaveEventsSuppressed() Then Exit Sub
+
+            Dim assemblyPath As String = ""
+            Try
+                assemblyPath = assemblyDocument.GetPathName()
+            Catch
+                assemblyPath = ""
+            End Try
+
+            'Only the never-saved case - an assembly that already has a path is either already
+            'versioned or mid-review through the normal Save flow.
+            If Not String.IsNullOrWhiteSpace(assemblyPath) Then Exit Sub
+
+            Dim assemblyKey As String = ""
+            Try
+                assemblyKey = assemblyDocument.GetTitle()
+            Catch
+                assemblyKey = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(assemblyKey) Then Exit Sub
+
+            SyncLock assemblyGuardSync
+                If firstSaveOfferedAssemblyKeys.Contains(assemblyKey) Then Exit Sub
+                firstSaveOfferedAssemblyKeys.Add(assemblyKey)
+            End SyncLock
+
+            Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
+                "This new assembly has not been saved to SVN yet." & vbCrLf & vbCrLf &
+                "Save and commit it now? Doing this before editing an inserted part avoids a series of lock/status warnings while the assembly still has no SVN identity." & vbCrLf & vbCrLf &
+                "No = keep working; you can save it later from Commit or Ctrl+S.",
+                swMessageBoxIcon_e.swMbQuestion,
+                swMessageBoxBtn_e.swMbYesNo
+            )
+
+            If response <> swMessageBoxResult_e.swMbHitYes Then Exit Sub
+
+            Try
+                myUserControl.BeginInvoke(
+                    New MethodInvoker(Sub() startNewDocumentFirstSaveFromCommitPublic())
+                )
+            Catch
+            End Try
+        Catch
+        End Try
+    End Sub
+
     Public Function blockAssemblyOwnedEditPrePublic(ByVal assemblyDocument As ModelDoc2,
                                                      ByVal actionDescription As String) As Integer
         Dim childEditContext As Boolean = assemblyIsEditingExternalPhysicalChild(assemblyDocument)
@@ -3623,20 +3750,40 @@ Public Module svnModule
         Catch
         End Try
 
-        Dim destinationReady As Boolean =
-            Not String.IsNullOrWhiteSpace(destinationPath) AndAlso
-            Not pathsAreSame(sourcePath, destinationPath) AndAlso
-            String.Equals(Path.GetExtension(sourcePath), Path.GetExtension(destinationPath), StringComparison.OrdinalIgnoreCase) AndAlso
-            isPathInsideLocalRepo(destinationPath) AndAlso
-            Directory.Exists(destinationFolder) AndAlso
-            Not pathContainsSvnAdministrativeSegment(destinationPath) AndAlso
-            Not File.Exists(destinationPath) AndAlso
-            svnFolderIsVersioned(destinationFolder)
+        'Built as a single specific reason (checked in order) rather than one generic message
+        'for every possible cause - "not ready" alone doesn't tell the user which of several
+        'unrelated problems (same path, wrong extension, outside the working copy, folder
+        'missing, folder not yet under version control, name collision, naming convention)
+        'actually applies.
+        Dim destinationNotReadyReason As String = ""
 
-        If destinationReady AndAlso Not isVendorPartPath(destinationPath) AndAlso
-           Not shouldIgnoreGrc27NamingConventionForDebug() Then
-            destinationReady = isValidGrc27FileName(destinationPath)
+        If String.IsNullOrWhiteSpace(destinationPath) Then
+            destinationNotReadyReason = "Choose a destination file name."
+        ElseIf pathsAreSame(sourcePath, destinationPath) Then
+            destinationNotReadyReason = "Choose a different name or folder than the source file."
+        ElseIf Not String.Equals(Path.GetExtension(sourcePath), Path.GetExtension(destinationPath), StringComparison.OrdinalIgnoreCase) Then
+            destinationNotReadyReason = "The destination must keep the same file extension (" & Path.GetExtension(sourcePath) & ")."
+        ElseIf Not isPathInsideLocalRepo(destinationPath) Then
+            destinationNotReadyReason = "Choose a folder inside the configured SVN working copy."
+        ElseIf Not Directory.Exists(destinationFolder) Then
+            destinationNotReadyReason = "The destination folder does not exist yet."
+        ElseIf pathContainsSvnAdministrativeSegment(destinationPath) Then
+            destinationNotReadyReason = "Choose a normal project folder, not an SVN .svn administration folder."
+        ElseIf File.Exists(destinationPath) Then
+            destinationNotReadyReason = "A file already exists at this destination."
+        ElseIf Not isVendorPartPath(destinationPath) AndAlso
+               Not shouldIgnoreGrc27NamingConventionForDebug() AndAlso
+               Not isValidGrc27FileName(destinationPath) Then
+            destinationNotReadyReason = "The file name must follow the GRC27/CFD27 naming convention (or be placed under Vendor Parts)."
         End If
+
+        Dim destinationReady As Boolean = String.IsNullOrWhiteSpace(destinationNotReadyReason)
+
+        'A destination folder that exists on disk but isn't versioned yet (e.g. just created
+        'via Browse's "Make New Folder") is not blocked here - executeCadRelocation adds it to
+        'SVN automatically right before the move, so it rides along in the same commit.
+        Dim destinationFolderIsNewToSvn As Boolean =
+            destinationReady AndAlso Not svnFolderIsVersioned(destinationFolder)
 
         rows.Add(New CadRelocationReviewRow With {
             .FilePath = destinationPath,
@@ -3644,8 +3791,10 @@ Public Module svnModule
             .StateText = If(destinationReady, "Available", "Not ready"),
             .CheckText = If(destinationReady, "Ready", "Fix"),
             .Explanation = If(destinationReady,
-                              "Existing versioned folder; name and extension are valid.",
-                              "Choose a different valid name in an existing versioned folder inside the working copy."),
+                              If(destinationFolderIsNewToSvn,
+                                 "Name and extension are valid. This folder is not yet in SVN and will be added automatically.",
+                                 "Existing versioned folder; name and extension are valid."),
+                              destinationNotReadyReason),
             .IsReady = destinationReady
         })
 
@@ -4004,6 +4153,22 @@ Public Module svnModule
                 Return
             End If
 
+            Dim destinationFolderForMove As String = ""
+            Try
+                destinationFolderForMove = Path.GetDirectoryName(destinationPath)
+            Catch
+            End Try
+
+            Dim folderVersionError As String = ""
+            If Not ensureCadRelocationDestinationFolderVersioned(destinationFolderForMove, folderVersionError) Then
+                reopenCadRelocationDocuments(finalCheck.OpenPathsToReopen, sourcePath, destinationPath, finalCheck.ActivePathBeforeOperation)
+                iSwApp.SendMsgToUser2("The file was not moved." & vbCrLf & vbCrLf &
+                                      "Could not add the new destination folder to SVN: " & folderVersionError,
+                                      swMessageBoxIcon_e.swMbStop,
+                                      swMessageBoxBtn_e.swMbOk)
+                Return
+            End If
+
             Dim moveError As String = ""
             If Not moveCadWorkingCopyPath(sourcePath, destinationPath, moveError) Then
                 reopenCadRelocationDocuments(finalCheck.OpenPathsToReopen, sourcePath, destinationPath, finalCheck.ActivePathBeforeOperation)
@@ -4190,6 +4355,66 @@ Public Module svnModule
             End If
         Next
 
+        Return True
+    End Function
+
+    'Move requires the destination folder to already be under version control - a raw
+    '`svn move` fails outright into an unversioned folder - but a folder just created through
+    'the Browse dialog's "Make New Folder" is not versioned yet. Auto-add any unversioned
+    'ancestor folders (bounded by the repo root, --depth=empty so pre-existing unrelated files
+    'inside them are never swept in) so a physically new folder does not require a separate
+    'manual svn add before Move will accept it. Adding (not yet committing) is sufficient for
+    'svn move to succeed; the folder add rides along in the same commit as the moved file.
+    Private Function ensureCadRelocationDestinationFolderVersioned(ByVal destinationFolder As String,
+                                                                    ByRef errorMessage As String) As Boolean
+        errorMessage = ""
+        If String.IsNullOrWhiteSpace(destinationFolder) Then Return False
+        If svnFolderIsVersioned(destinationFolder) Then Return True
+
+        Dim repoRoot As String = ""
+        Try
+            repoRoot = Path.GetFullPath(myUserControl.localRepoPath.Text.TrimEnd("\"c)).TrimEnd("\"c)
+        Catch
+            repoRoot = ""
+        End Try
+
+        If String.IsNullOrWhiteSpace(repoRoot) Then
+            errorMessage = "Could not resolve the configured SVN working copy root."
+            Return False
+        End If
+
+        Dim unversionedChain As New List(Of String)()
+        Dim currentDir As String = destinationFolder
+
+        Try
+            While Not String.IsNullOrWhiteSpace(currentDir) AndAlso
+                  currentDir.StartsWith(repoRoot, StringComparison.OrdinalIgnoreCase) AndAlso
+                  Not svnFolderIsVersioned(currentDir)
+
+                unversionedChain.Insert(0, currentDir)
+
+                Dim parentInfo As DirectoryInfo = Directory.GetParent(currentDir)
+                If parentInfo Is Nothing Then Exit While
+                currentDir = parentInfo.FullName.TrimEnd("\"c)
+            End While
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return False
+        End Try
+
+        If unversionedChain.Count = 0 Then Return True
+
+        Dim addResult As rawProcessReturn = runSvnProcess(
+            sSVNPath,
+            "add --non-interactive --depth=empty " & quoteFilePathArgs(unversionedChain.ToArray())
+        )
+
+        If Not String.IsNullOrWhiteSpace(If(addResult.outputError, "")) Then
+            errorMessage = addResult.outputError.Trim()
+            Return False
+        End If
+
+        writeOperationLog("Auto-added new destination folder(s) to SVN for Move: " & String.Join(" | ", unversionedChain.ToArray()))
         Return True
     End Function
 
@@ -4643,6 +4868,14 @@ Public Module svnModule
                 )
                 Exit Sub
             End If
+
+            iSwApp.SendMsgToUser2(
+                "New file saved:" & vbCrLf &
+                selectedPath & vbCrLf & vbCrLf &
+                "It will be committed to SVN automatically.",
+                swMessageBoxIcon_e.swMbInformation,
+                swMessageBoxBtn_e.swMbOk
+            )
 
             queueAutomaticSaveCommitPath(selectedPath)
 
@@ -5598,6 +5831,69 @@ Public Module svnModule
             If priorityLockedPaths IsNot Nothing AndAlso priorityLockedPaths.Length > 0 Then
                 myUserControl.forceWriteAccessForLockedFilePathsPublic(priorityLockedPaths)
             End If
+        Catch
+        End Try
+    End Sub
+
+    'Complements reconcileWriteAccessForActiveDocumentPublic above: restores read-only for the
+    'active document when it is NOT locked but SOLIDWORKS still shows it writable (a stale OS
+    'attribute, or a lock later broken elsewhere - nothing else re-verifies this once a document
+    'is simply open). Deliberately scoped to a document with no unsaved changes (GetSaveFlag=
+    'False): forcing read-only on a document that might carry a real pending edit is the exact
+    'false-dirty-flag risk documented elsewhere in this add-in. handlePartOwnedEditPostPublic and
+    'the assembly guard already undo an unauthorized edit regardless of this attribute's state,
+    'so this is a cosmetic/defense-in-depth correction, not the primary safety mechanism.
+    Public Sub reconcileReadOnlyForUnlockedActiveDocumentPublic()
+        Try
+            If iSwApp Is Nothing Then Exit Sub
+
+            Dim activeDoc As ModelDoc2 = TryCast(iSwApp.ActiveDoc, ModelDoc2)
+            If activeDoc Is Nothing Then Exit Sub
+            If Not isCadDocument(activeDoc) Then Exit Sub
+
+            Dim activePath As String = ""
+            Try
+                activePath = activeDoc.GetPathName()
+            Catch
+                activePath = ""
+            End Try
+
+            If String.IsNullOrWhiteSpace(activePath) Then Exit Sub
+            If Not isPathInsideLocalRepo(activePath) Then Exit Sub
+            If isNewUnversionedOrAddedFile(activePath) Then Exit Sub
+            If assemblyHasRequiredLockFast(activeDoc) Then Exit Sub
+
+            Dim isDirty As Boolean = True
+            Try
+                isDirty = activeDoc.GetSaveFlag()
+            Catch
+                isDirty = True
+            End Try
+
+            If isDirty Then Exit Sub
+
+            Dim isReadOnly As Boolean = True
+            Try
+                isReadOnly = activeDoc.IsOpenedReadOnly()
+            Catch
+                isReadOnly = True
+            End Try
+
+            If isReadOnly Then Exit Sub
+
+            Try
+                activeDoc.SetReadOnlyState(True)
+            Catch
+            End Try
+
+            Try
+                If File.Exists(activePath) Then
+                    File.SetAttributes(activePath, File.GetAttributes(activePath) Or FileAttributes.ReadOnly)
+                End If
+            Catch
+            End Try
+
+            writeOperationLog("Restored read-only for unlocked, clean active document: " & activePath)
         Catch
         End Try
     End Sub

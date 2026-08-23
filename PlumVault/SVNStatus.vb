@@ -604,6 +604,16 @@ Public Class SVNStatus
 
             fp(oldIndex).lock6 = newOutput.fp(i).lock6
             If Not IsNothing(sRelease(oldIndex)) Then fp(oldIndex).released = sRelease(oldIndex)
+
+            'addDelChg1 (the "?"/"A"/"M" modification-status column) is genuinely knowable from
+            'a local-only status check, unlike upToDate9 above which needs the server. Without
+            'this, a file that just went from unversioned to committed (or vice versa) keeps
+            'showing its pre-commit "?" state - the tree stays labeled "Not in SVN" after a
+            'successful commit until a full server Sync replaces fp wholesale instead of
+            'merging it, even though a plain Refresh could have picked this up locally.
+            If Not IsNothing(newOutput.fp(i).addDelChg1) Then
+                fp(oldIndex).addDelChg1 = newOutput.fp(i).addDelChg1
+            End If
         Next
 
         oldUboundFp = UBound(fp)

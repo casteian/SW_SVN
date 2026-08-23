@@ -617,6 +617,7 @@ Public Class SwAddin
     Function SldWorks_ActiveDocChangeNotify() As Integer
         AttachEventsToAllDocuments()
         svnModule.reconcileWriteAccessForActiveDocumentPublic()
+        svnModule.reconcileReadOnlyForUnlockedActiveDocumentPublic()
         Return 0
     End Function
 
