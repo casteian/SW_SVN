@@ -5115,7 +5115,8 @@ Public Class UserControl1
             " [Committing",
             " [Saving to SVN",
             " [Pending",
-            " [Not in SVN]"
+            " [Not in SVN]",
+            " [Not synced"
         }
 
         For Each suffix As String In knownSuffixes
@@ -6015,8 +6016,11 @@ Public Class UserControl1
             rootNode.Text &= " [Not in SVN]"
 
         ElseIf status1 Is Nothing Then
+            'The tree must never silently look "fine" for a file whose SVN status has not
+            'been loaded. Name the state and the remedy so the visible tree stays gospel.
             rootNode.BackColor = myCol.unknown
-            rootNode.ToolTipText = "Unknown"
+            rootNode.ToolTipText = "Status not synced yet. Click Sync to load this file's SVN status."
+            rootNode.Text &= " [Not synced]"
 
         ElseIf status1.fp(0).addDelChg1 = "?" Then
             rootNode.BackColor = myCol.notOnVault

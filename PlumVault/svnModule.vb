@@ -3957,7 +3957,8 @@ Public Module svnModule
                 "Please select Get Locks first." & vbCrLf & vbCrLf &
                 fileName & " is not locked by you, so PlumVault stopped this action before it changed the file." & vbCrLf & vbCrLf &
                 "Requested action: " & actionText & vbCrLf & vbCrLf &
-                "Select this file in the SVN tree, click Get Locks, then try again.",
+                "Select this file in the SVN tree, click Get Locks, then try again." & vbCrLf & vbCrLf &
+                "If the SVN tree already shows this file as locked by you, click Sync to refresh, then retry.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -4325,7 +4326,8 @@ Public Module svnModule
                 firstLine & vbCrLf & vbCrLf &
                 assemblyName & " is not locked by you." & vbCrLf & vbCrLf &
                 resultText & actionText & vbCrLf & vbCrLf &
-                "You may still hide/show components, change transparency for inspection, or edit a separately file-backed child in context when that child has its own lock.",
+                "You may still hide/show components, change transparency for inspection, or edit a separately file-backed child in context when that child has its own lock." & vbCrLf & vbCrLf &
+                "If the SVN tree already shows this file as locked by you, click Sync to refresh, then retry.",
                 swMessageBoxIcon_e.swMbInformation,
                 swMessageBoxBtn_e.swMbOk
             )
@@ -4394,7 +4396,8 @@ Public Module svnModule
                                 Path.GetFileName(partPath) & " is not locked by you." & vbCrLf & vbCrLf &
                                 "This change remains local and cannot be committed through PlumVault without the file lock. " &
                                 "PlumVault did not use automatic Undo. If the change was unintended, use Ctrl+Z yourself." &
-                                actionText,
+                                actionText & vbCrLf & vbCrLf &
+                                "If the SVN tree already shows this file as locked by you, click Sync to refresh, then retry.",
                                 swMessageBoxIcon_e.swMbInformation,
                                 swMessageBoxBtn_e.swMbOk
                             )
@@ -8060,6 +8063,71 @@ Public Module svnModule
     Private Function getActiveInteractionLockedPaths(ByVal status As SVNStatus) As String()
         Return getActiveInteractionPathsFromCandidates(getLockedPathsFromStatus(status))
     End Function
+
+    'Read-only enforcement for documents whose lock the user just RELEASED while they are
+    'still open. Without this, the document stays internally writable and SOLIDWORKS will
+    'happily accept drags/dimension edits that only the warn-only post guards can catch.
+    'Restoring the internal read-only state makes SOLIDWORKS itself refuse those edits.
+    '
+    'Deliberately narrow, because broad SetReadOnlyState(True) sweeps during FileOpen/
+    'ActiveDocChange are a documented source of native prompts, false save flags, and
+    'unstable feature-edit state. This runs only on explicit Release Locks completion,
+    'deferred to a clean UI turn, and every path must pass all gates:
+    '  - the document is open, and SOLIDWORKS reports it currently writable
+    '  - it is CLEAN (GetSaveFlag=False; Release Locks just reverted it) - a dirty document
+    '    is never transitioned, so this can never create a discard/save question
+    '  - it is not virtual/slow-flagged (unknown native rebuild cost) and not an in-flight
+    '    Edit Component replay target
+    'Failures are logged, never shown: the edit guards remain the warning backstop.
+    Public Sub restoreInternalReadOnlyForReleasedPathsPublic(ByVal releasedPaths() As String)
+        If releasedPaths Is Nothing OrElse releasedPaths.Length = 0 Then Exit Sub
+        If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse
+           Not myUserControl.IsHandleCreated Then Exit Sub
+
+        Dim pathsCopy() As String = releasedPaths.Clone()
+
+        Try
+            myUserControl.BeginInvoke(
+                New MethodInvoker(
+                    Sub()
+                        For Each releasedPath As String In pathsCopy
+                            Try
+                                If String.IsNullOrWhiteSpace(releasedPath) Then Continue For
+                                If shouldSkipBackgroundWritableTransitionPublic(releasedPath) Then Continue For
+                                If isPendingInContextAutoEditTargetPublic(releasedPath) Then Continue For
+
+                                Dim openDocument As ModelDoc2 = getOpenModelByPathSafe(releasedPath)
+                                If openDocument Is Nothing Then Continue For
+                                If openDocument.IsOpenedReadOnly() Then Continue For
+                                If openDocument.GetSaveFlag() Then
+                                    writeOperationLog(
+                                        "Released document kept writable (unsaved changes present): " & releasedPath
+                                    )
+                                    Continue For
+                                End If
+
+                                openDocument.SetReadOnlyState(True)
+
+                                writeOperationLog(
+                                    "Internal read-only restored after lock release: " & releasedPath &
+                                    "; nowReadOnly=" & openDocument.IsOpenedReadOnly().ToString()
+                                )
+                            Catch ex As Exception
+                                Try
+                                    writeOperationLog(
+                                        "Internal read-only restore failed (edit guards remain active): " &
+                                        releasedPath & "; " & ex.Message
+                                    )
+                                Catch
+                                End Try
+                            End Try
+                        Next
+                    End Sub
+                )
+            )
+        Catch
+        End Try
+    End Sub
 
     'Called on ActiveDocChangeNotify and right after an in-context edit begins, so a document
     'the user just switched/edited into is reconciled immediately rather than waiting for the
@@ -16490,6 +16558,13 @@ Public Module svnModule
         Catch
         End Try
 
+        'Read-only enforcement: the locks above are gone, so any of these documents still
+        'open must go back to SOLIDWORKS' native read-only protection (gated + deferred).
+        Try
+            restoreInternalReadOnlyForReleasedPathsPublic(lockedPaths)
+        Catch
+        End Try
+
         Try
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
             updateLockStatusPublic(bRefreshAllTreeViews:=False)
@@ -16699,6 +16774,13 @@ Public Module svnModule
             If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
                 updateStatusCacheForKnownPaths(modifiedPaths, forceAddDelChg1:=" ")
             End If
+        Catch
+        End Try
+
+        'Read-only enforcement: the locks above are gone, so any of these documents still
+        'open must go back to SOLIDWORKS' native read-only protection (gated + deferred).
+        Try
+            restoreInternalReadOnlyForReleasedPathsPublic(lockedPaths)
         Catch
         End Try
 
