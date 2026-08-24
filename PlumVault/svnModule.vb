@@ -1893,7 +1893,34 @@ Public Module svnModule
 
     Public Sub noteWritableTransitionDurationPublic(ByVal filePath As String, ByVal elapsedMs As Long)
         If String.IsNullOrWhiteSpace(filePath) Then Exit Sub
-        If elapsedMs < SLOW_WRITABLE_TRANSITION_THRESHOLD_MS Then Exit Sub
+
+        If elapsedMs < SLOW_WRITABLE_TRANSITION_THRESHOLD_MS Then
+            'Self-un-poison: a one-off system hitch (antivirus scan, disk wake) can mark an
+            'ordinary file slow forever, since the persisted store has no other removal path.
+            'A later transition proving fast removes the stale entry so background
+            'reconciliation resumes normally for that file.
+            Dim fastKey As String = normalizeFullPathSafe(filePath)
+
+            SyncLock slowWritableTransitionSync
+                ensureSlowWritableTransitionPathsLoaded()
+                If Not slowWritableTransitionPaths.Remove(fastKey) Then Exit Sub
+
+                Try
+                    Dim fastStorePath As String = getSlowWritableTransitionStorePath()
+                    If Not String.IsNullOrWhiteSpace(fastStorePath) Then
+                        Directory.CreateDirectory(Path.GetDirectoryName(fastStorePath))
+                        File.WriteAllLines(fastStorePath, slowWritableTransitionPaths.ToArray())
+                    End If
+                Catch
+                End Try
+            End SyncLock
+
+            writeOperationLog(
+                "Slow writable transition record cleared after fast measurement (" &
+                elapsedMs.ToString() & " ms): " & fastKey
+            )
+            Exit Sub
+        End If
 
         Dim key As String = normalizeFullPathSafe(filePath)
 

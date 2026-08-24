@@ -4878,6 +4878,15 @@ Public Class UserControl1
             Dim lazyChildStablePath As String = getSafeComponentPath(childComp)
             If isComponentVirtualSafe(childComp) Then
                 lazyChildStablePath = getPhysicalOwnerAssemblyPathForComponent(childComp, TryCast(iSwApp.ActiveDoc, ModelDoc2))
+
+                'Virtual components discovered through lazy expansion (deeper than the initial
+                'depth-1 tree build) must also disable background writable transitions - and
+                'here the exact OWNING assembly is already computed, which is the file whose
+                'native transition would rebuild the embedded imported data.
+                Try
+                    svnModule.noteAssemblyContainsVirtualComponentsPublic(lazyChildStablePath)
+                Catch
+                End Try
             End If
             setStableTreeNodeCadPath(childNode, lazyChildStablePath)
             setNodeColorFromStatus(childNode)
