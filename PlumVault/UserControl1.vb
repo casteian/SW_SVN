@@ -1784,14 +1784,12 @@ Public Class UserControl1
             setRefreshTreeButtonNormal()
         End If
 
-        Dim quietStatusPath As String = activePath
-        Try
-            quietStatusPath = svnModule.getActiveInteractionStatusPathPublic(activeModDoc)
-        Catch
-            quietStatusPath = activePath
-        End Try
-
-        tryStartQuietActiveDocumentStatusCheck(quietStatusPath)
+        'The three-minute background "quiet" server status heartbeat was removed. It started a
+        'background svn.exe every three minutes and, on every 30-second tick, asked SOLIDWORKS
+        'for the active assembly's in-context edit target (a COM GetEditTarget call) purely to
+        'decide what that poll should look at. Neither is needed: every edit/save/commit guard
+        'already performs its own live local lock check for its exact target before acting.
+        'This timer is now visual-only bookkeeping and makes no SVN or COM traversal calls.
     End Sub
 
     Private Sub tryStartQuietActiveDocumentStatusCheck(ByVal activePath As String)
