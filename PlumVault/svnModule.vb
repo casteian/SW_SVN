@@ -16163,12 +16163,22 @@ Public Module svnModule
 
         If Not userAcceptsLossOfChangesPaths(filteredPaths, "Release Locks, and revert changes to vault version?") Then Exit Sub
 
+        'saveAllOpenFiles writes EVERY open dirty document, not only the selected ones. Run it
+        'inside the internal-save gate so PlumVault's own save guard does not treat each of
+        'those writes as a user-initiated save: without this, one Release Locks click could
+        'raise a modal "save blocked" dialog per open document and queue an automatic commit
+        'for files the user never selected. The inner Try/Catch keeps the original retry.
+        beginInternalSolidWorksSave()
         Try
-            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
-            saveAllOpenFiles(bShowError:=True)
-            If debugWatch IsNot Nothing Then debugNotes.Add("Save open files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
-        Catch
-            saveAllOpenFiles(bShowError:=True)
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                saveAllOpenFiles(bShowError:=True)
+                If debugWatch IsNot Nothing Then debugNotes.Add("Save open files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+                saveAllOpenFiles(bShowError:=True)
+            End Try
+        Finally
+            endInternalSolidWorksSave()
         End Try
 
         If debugWatch IsNot Nothing Then debugNotes.Add("Selected path candidates: " & filteredPaths.Length.ToString())
@@ -16233,7 +16243,26 @@ Public Module svnModule
             bSuccess = False
         End Try
 
-        If Not bSuccess Then iSwApp.SendMsgToUserv("Releasing Locks Failed.")
+        If Not bSuccess Then
+            'Do not fall through to the revert below. The unlock did not complete, so these
+            'files are almost certainly still locked by this working copy, and discarding the
+            'local changes now would destroy the user's work while they still hold the lock -
+            'the worst possible outcome for this action. The status-cache update further down
+            'would additionally have recoloured the tree as unlocked, a state that was never
+            'true. Leave the files and the displayed state untouched and let the user retry.
+            Try
+                iSwApp.SendMsgToUser2(
+                    "Releasing locks failed, so nothing was changed." & vbCrLf & vbCrLf &
+                    "Your files are still locked and your local changes were kept." & vbCrLf & vbCrLf &
+                    "Try Release Locks again. If it keeps failing, click Cleanup first, then retry.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Exit Sub
+        End If
 
         If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
             Try
@@ -16295,12 +16324,19 @@ Public Module svnModule
 
         If Not userAcceptsLossOfChanges(modDocArr, "Release Locks, and revert changes to vault version?") Then Exit Sub
 
+        'Same reasoning as unlockPathsLockedOnly above: gate the every-open-document save so it
+        'cannot fire PlumVault's per-document save guard or queue automatic commits.
+        beginInternalSolidWorksSave()
         Try
-            If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
-            saveAllOpenFiles(bShowError:=True)
-            If debugWatch IsNot Nothing Then debugNotes.Add("Save open files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
-        Catch
-            saveAllOpenFiles(bShowError:=True)
+            Try
+                If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
+                saveAllOpenFiles(bShowError:=True)
+                If debugWatch IsNot Nothing Then debugNotes.Add("Save open files: " & (debugWatch.ElapsedMilliseconds - phaseStartMs).ToString() & " ms")
+            Catch
+                saveAllOpenFiles(bShowError:=True)
+            End Try
+        Finally
+            endInternalSolidWorksSave()
         End Try
 
         If IsNothing(modDocArr) Then
@@ -16314,7 +16350,23 @@ Public Module svnModule
                 bSuccess = False
             End Try
 
-            If Not bSuccess Then iSwApp.SendMsgToUserv("Releasing Locks Failed.")
+            If Not bSuccess Then
+                'Whole-working-copy Release Locks. Same reasoning as the selected-path variant:
+                'a failed unlock means the locks are still held, so reverting every file in the
+                'working copy here would discard the user's work while they still own the locks.
+                Try
+                    iSwApp.SendMsgToUser2(
+                        "Releasing locks failed, so nothing was changed." & vbCrLf & vbCrLf &
+                        "Your files are still locked and your local changes were kept." & vbCrLf & vbCrLf &
+                        "Try Release Locks again. If it keeps failing, click Cleanup first, then retry.",
+                        swMessageBoxIcon_e.swMbWarning,
+                        swMessageBoxBtn_e.swMbOk
+                    )
+                Catch
+                End Try
+
+                Exit Sub
+            End If
 
             If debugWatch IsNot Nothing Then phaseStartMs = debugWatch.ElapsedMilliseconds
             myGetLatestOrRevert(modDocArr, getLatestType.revert)
@@ -16400,7 +16452,26 @@ Public Module svnModule
             bSuccess = False
         End Try
 
-        If Not bSuccess Then iSwApp.SendMsgToUserv("Releasing Locks Failed.")
+        If Not bSuccess Then
+            'Do not fall through to the revert below. The unlock did not complete, so these
+            'files are almost certainly still locked by this working copy, and discarding the
+            'local changes now would destroy the user's work while they still hold the lock -
+            'the worst possible outcome for this action. The status-cache update further down
+            'would additionally have recoloured the tree as unlocked, a state that was never
+            'true. Leave the files and the displayed state untouched and let the user retry.
+            Try
+                iSwApp.SendMsgToUser2(
+                    "Releasing locks failed, so nothing was changed." & vbCrLf & vbCrLf &
+                    "Your files are still locked and your local changes were kept." & vbCrLf & vbCrLf &
+                    "Try Release Locks again. If it keeps failing, click Cleanup first, then retry.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
+            Exit Sub
+        End If
 
         If modifiedPaths IsNot Nothing AndAlso modifiedPaths.Length > 0 Then
             Try

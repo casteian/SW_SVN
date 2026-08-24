@@ -96,9 +96,9 @@ Module swModelFunctions
             If modDocArr(i).GetSaveFlag() And (Not modDocArr(i).IsOpenedReadOnly) Then
                 If False = modDocArr(i).Save3(0, errors, warnings) Then
                     Debug.Print("Save error: " & modDocArr(i).GetTitle & " Error:" & errors & " Warning:" & warnings)
-                    numFailed += numFailed
+                    numFailed += 1
                 Else
-                    numSaved += numSaved
+                    numSaved += 1
                 End If
             End If
         Next

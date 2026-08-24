@@ -5325,7 +5325,20 @@ Public Class UserControl1
         If taskPaneClosing Then Exit Sub
 
         ensureDeferredSolidWorksUiTimer()
-        deferredSolidWorksUiAttemptCount = 0
+
+        'Only restart the attempt budget for a genuinely new deferred batch.
+        'reconcileWriteAccessForActiveDocumentPublic re-arms this timer on every document
+        'activation, so resetting the counter unconditionally meant
+        'MAX_DEFERRED_SOLIDWORKS_UI_ATTEMPTS was never reached while the user kept switching
+        'windows: a document SOLIDWORKS refuses to switch writable stayed queued forever and
+        'the 350 ms tick kept re-issuing its expensive native SetReadOnlyState call, which on
+        'a virtual/imported-heavy assembly can block the SOLIDWORKS UI thread for minutes at a
+        'time. It also meant the "did not safely switch to writable" warning below never fired.
+        'The tick handler still clears this counter and stops the timer once the queues drain,
+        'so an ordinary batch continues to get its full retry budget.
+        If Not deferredSolidWorksUiTimer.Enabled Then
+            deferredSolidWorksUiAttemptCount = 0
+        End If
 
         Try
             deferredSolidWorksUiTimer.Stop()
