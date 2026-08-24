@@ -112,10 +112,10 @@
             "ComponentsUrl" = "8:"
                 "Items"
                 {
-                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.7.2"
+                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.8"
                     {
-                    "Name" = "8:Microsoft .NET Framework 4.7.2 (x86 and x64)"
-                    "ProductCode" = "8:.NETFramework,Version=v4.7.2"
+                    "Name" = "8:Microsoft .NET Framework 4.8 (x86 and x64)"
+                    "ProductCode" = "8:.NETFramework,Version=v4.8"
                     }
                 }
             }
@@ -125,7 +125,7 @@
         "DisplayName" = "8:Release"
         "IsDebugOnly" = "11:FALSE"
         "IsReleaseOnly" = "11:TRUE"
-        "OutputFilename" = "8:Release\\plumVault_25.10.1601.msi"
+        "OutputFilename" = "8:Release\\PlumVault_26.08.24.1.msi"
         "PackageFilesAs" = "3:2"
         "PackageFileSize" = "3:-2147483648"
         "CabType" = "3:1"
@@ -144,10 +144,10 @@
             "ComponentsUrl" = "8:"
                 "Items"
                 {
-                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.7.2"
+                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.8"
                     {
-                    "Name" = "8:Microsoft .NET Framework 4.7.2 (x86 and x64)"
-                    "ProductCode" = "8:.NETFramework,Version=v4.7.2"
+                    "Name" = "8:Microsoft .NET Framework 4.8 (x86 and x64)"
+                    "ProductCode" = "8:.NETFramework,Version=v4.8"
                     }
                 }
             }
@@ -172,7 +172,7 @@
                 {
                 "Name" = "8:.NET Framework"
                 "Message" = "8:[VSDNETMSG]"
-                "FrameworkVersion" = "8:.NETFramework,Version=v4.7.2"
+                "FrameworkVersion" = "8:.NETFramework,Version=v4.8"
                 "AllowLaterVersions" = "11:FALSE"
                 "InstallUrl" = "8:http://go.microsoft.com/fwlink/?LinkId=863262"
                 }
@@ -449,15 +449,15 @@
         {
         "Name" = "8:Microsoft Visual Studio"
         "ProductName" = "8:PlumVault"
-        "ProductCode" = "8:{A4C6C330-EDF5-42BE-8B86-A58813FD0D03}"
-        "PackageCode" = "8:{A59B7FFC-5169-4955-B0F9-FE54D88573E2}"
+        "ProductCode" = "8:{4C541D0F-A03B-4D2C-B3B9-241952A73B1C}"
+        "PackageCode" = "8:{D33166F2-0CAC-47D4-9794-DB95CB6420CE}"
         "UpgradeCode" = "8:{DFE55A88-84D2-4146-8D97-E4179D874B4A}"
         "AspNetVersion" = "8:2.0.50727.0"
         "RestartWWWService" = "11:FALSE"
         "RemovePreviousVersions" = "11:TRUE"
         "DetectNewerInstalledVersion" = "11:TRUE"
         "InstallAllUsers" = "11:TRUE"
-        "ProductVersion" = "8:26.02.12"
+        "ProductVersion" = "8:26.08.2401"
         "Manufacturer" = "8:PlumVault"
         "ARPHELPTELEPHONE" = "8:"
         "ARPHELPLINK" = "8:"
@@ -1003,7 +1003,7 @@
         {
             "{5259A561-127C-4D43-A0A1-72F10C7B3BF8}:_C1A6513773194ECFA2AF56DE96F45B79"
             {
-            "SourcePath" = "8:..\\PlumVault\\obj\\Debug\\PlumVault.dll"
+            "SourcePath" = "8:..\\PlumVault\\obj\\Release\\PlumVault.dll"
             "TargetName" = "8:"
             "Tag" = "8:"
             "Folder" = "8:_EE7E9DD25247421E87492B320EF561BD"

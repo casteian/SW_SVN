@@ -557,15 +557,28 @@ Public Class SVNStatus
             End If
         Next
     End Sub
-    Function updateStatusLocally(iSwApp As SolidWorks.Interop.sldworks.SldWorks) As Boolean
+    Function updateStatusLocally(iSwApp As SolidWorks.Interop.sldworks.SldWorks,
+                                 Optional ByVal filePathsToRefresh() As String = Nothing) As Boolean
         'Updates locks and release status without contacting server
 
-        Dim newOutput As SVNStatus = getFileSVNStatus(bCheckServer:=False,, bUpdateStatusOfAllOpenModels:=False)
+        Dim newOutput As SVNStatus
+
+        If filePathsToRefresh IsNot Nothing AndAlso filePathsToRefresh.Length > 0 Then
+            'Refresh is an interaction-scoped action. Keep it proportional to the active,
+            'visible tree instead of scanning the entire working copy on SOLIDWORKS' UI
+            'thread. The no-path behavior is retained for callers that intentionally need a
+            'whole-working-copy reconciliation.
+            newOutput = getFileSVNStatus(
+                bCheckServer:=False,
+                bUpdateStatusOfAllOpenModels:=False,
+                sDirectFilePathArr:=filePathsToRefresh
+            )
+        Else
+            newOutput = getFileSVNStatus(bCheckServer:=False,, bUpdateStatusOfAllOpenModels:=False)
+        End If
+
         Dim i, oldIndex, oldUboundFp As Integer
         Dim filePptyToAdd As New List(Of filePpty)
-        'Dim nToAdd As Integer = 0
-        Dim sPropArr(,) As String
-        Dim sRelease(UBound(fp)) As String
 
         If newOutput Is Nothing Then Return False
 
@@ -582,11 +595,6 @@ Public Class SVNStatus
             'iSwApp.EnableBackgroundProcessing = False 'bProcessingTemp
             Return False
         End If
-
-        sPropArr = svnPropget()
-        For j = 0 To UBound(fp)
-            sRelease(j) = vLookup(fp(j).filename.Replace("\", "/"), sPropArr, 1)
-        Next
 
         For i = 0 To UBound(newOutput.fp)
             oldIndex = -1
@@ -610,7 +618,9 @@ Public Class SVNStatus
 
 
             fp(oldIndex).lock6 = newOutput.fp(i).lock6
-            If Not IsNothing(sRelease(oldIndex)) Then fp(oldIndex).released = sRelease(oldIndex)
+            If Not IsNothing(newOutput.fp(i).released) Then
+                fp(oldIndex).released = newOutput.fp(i).released
+            End If
 
             'addDelChg1 (the "?"/"A"/"M" modification-status column) is genuinely knowable from
             'a local-only status check, unlike upToDate9 above which needs the server. Without

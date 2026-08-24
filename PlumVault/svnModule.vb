@@ -31,6 +31,11 @@ Public Module svnModule
         Public HasOutOfDateViews As Boolean = False
     End Class
 
+    Private Class AsyncLocalSvnState
+        Public StatusChar As Char = ChrW(0)
+        Public HasLocalLockToken As Boolean = False
+    End Class
+
     Dim myUserControl As UserControl1
     Dim iSwApp As SldWorks
     Dim statusOfAllOpenModels As SVNStatus
@@ -7992,8 +7997,9 @@ Public Module svnModule
     End Function
 
 
-    Public Function updateLockStatusPublic(Optional bRefreshAllTreeViews As Boolean = True) As Boolean
-        updateLockStatusPublic = statusOfAllOpenModels.updateStatusLocally(iSwApp)
+    Public Function updateLockStatusPublic(Optional bRefreshAllTreeViews As Boolean = True,
+                                           Optional ByVal filePathsToRefresh() As String = Nothing) As Boolean
+        updateLockStatusPublic = statusOfAllOpenModels.updateStatusLocally(iSwApp, filePathsToRefresh)
 
         'Local lock/status refreshes may preserve the last server-aware upToDate9 values,
         'but they are not a new Sync and must not reset the displayed Sync age.
@@ -11877,7 +11883,8 @@ Public Module svnModule
             Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
                 sSVNPath,
                 args,
-                savedPathForBackground
+                savedPathForBackground,
+                15000
             )
 
             Dim errorText As String = ""
@@ -18280,18 +18287,14 @@ Public Module svnModule
 
     Private Function isFirstCommitCandidatePathForAsyncLock(ByVal filePath As String,
                                                             ByVal repoRootPathForBackground As String,
-                                                            ByVal savedPathForBackground As String) As Boolean
+                                                            ByVal localState As AsyncLocalSvnState) As Boolean
         If String.IsNullOrWhiteSpace(filePath) Then Return False
         If Not File.Exists(filePath) Then Return False
         If Not isCadFilePath(filePath) Then Return False
         If Not isPathInsideRepoRootForBackground(filePath, repoRootPathForBackground) Then Return False
 
-        Try
-            Dim statusChar As Char = getFirstSvnStatusCharForBackground(filePath, savedPathForBackground)
-            Return statusChar = "?"c OrElse statusChar = "A"c
-        Catch
-            Return False
-        End Try
+        If localState Is Nothing Then Return False
+        Return localState.StatusChar = "?"c OrElse localState.StatusChar = "A"c
     End Function
 
     Private Function isPathInsideRepoRootForBackground(ByVal filePath As String,
@@ -18310,10 +18313,11 @@ Public Module svnModule
         End Try
     End Function
 
-    Private Function getFirstSvnStatusCharForBackground(ByVal filePath As String,
-                                                        ByVal savedPathForBackground As String) As Char
-        If String.IsNullOrWhiteSpace(filePath) Then Return ChrW(0)
-        If Not File.Exists(filePath) Then Return ChrW(0)
+    Private Function getLocalSvnStateForAsyncLock(ByVal filePath As String,
+                                                   ByVal savedPathForBackground As String) As AsyncLocalSvnState
+        Dim state As New AsyncLocalSvnState()
+        If String.IsNullOrWhiteSpace(filePath) Then Return state
+        If Not File.Exists(filePath) Then Return state
 
         Try
             Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
@@ -18323,19 +18327,30 @@ Public Module svnModule
             )
 
             If statusResult.outputError IsNot Nothing AndAlso statusResult.outputError.Trim() <> "" Then
-                Return ChrW(0)
+                Return state
             End If
 
-            Dim statusText As String = ""
-            If statusResult.output IsNot Nothing Then statusText = statusResult.output.Trim()
+            Dim statusText As String = If(statusResult.output, "")
+            Dim lines() As String = statusText.Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
 
-            If String.IsNullOrWhiteSpace(statusText) Then Return " "c
+            If lines.Length = 0 Then
+                state.StatusChar = " "c
+                Return state
+            End If
 
-            Return statusText(0)
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+                If state.StatusChar = ChrW(0) Then state.StatusChar = line(0)
+                If line.Length >= 6 AndAlso line(5) = "K"c Then state.HasLocalLockToken = True
+            Next
 
         Catch
-            Return ChrW(0)
         End Try
+
+        Return state
     End Function
 
     Private Function pathHasLocalSvnLockTokenBackground(ByVal filePath As String,
@@ -18379,6 +18394,8 @@ Public Module svnModule
                                                        ByVal savedPathForBackground As String) As AsyncGetLocksResult
         Dim result As New AsyncGetLocksResult()
         result.AttemptedPaths = selectedPaths
+        Dim totalWatch As Stopwatch = Stopwatch.StartNew()
+        Dim phaseWatch As Stopwatch = Stopwatch.StartNew()
 
         Try
             Dim filteredPaths() As String = filterExistingCadFilePathsOnly(selectedPaths)
@@ -18394,14 +18411,20 @@ Public Module svnModule
             Dim alreadyLockedPaths As New List(Of String)()
 
             For Each filePath As String In filteredPaths
-                If isFirstCommitCandidatePathForAsyncLock(filePath, repoRootPathForBackground, savedPathForBackground) Then
+                'One local status command supplies both the first-commit state and the local
+                'K-token state. The previous two-query sequence doubled svn.exe startup and
+                'working-copy database work for every selected file.
+                Dim localState As AsyncLocalSvnState =
+                    getLocalSvnStateForAsyncLock(filePath, savedPathForBackground)
+
+                If isFirstCommitCandidatePathForAsyncLock(filePath, repoRootPathForBackground, localState) Then
                     Try
                         File.SetAttributes(filePath, File.GetAttributes(filePath) And Not FileAttributes.ReadOnly)
                     Catch
                     End Try
 
                     firstCommitPaths.Add(filePath)
-                ElseIf pathHasLocalSvnLockTokenBackground(filePath, savedPathForBackground) Then
+                ElseIf localState.HasLocalLockToken Then
                     'The working copy already owns the SVN lock token. This is the stale-cache /
                     'read-only recovery case: do not call svn lock again and do not tell the user
                     'they must unlock/relock. Reconcile the UI and SOLIDWORKS write state instead.
@@ -18415,6 +18438,13 @@ Public Module svnModule
                     lockablePaths.Add(filePath)
                 End If
             Next
+
+            writeOperationLog(
+                "Get Locks local classification: " & phaseWatch.ElapsedMilliseconds.ToString() &
+                " ms; lockable=" & lockablePaths.Count.ToString() &
+                "; alreadyOwned=" & alreadyLockedPaths.Count.ToString() &
+                "; firstCommit=" & firstCommitPaths.Count.ToString()
+            )
 
             If lockablePaths.Count = 0 Then
                 If alreadyLockedPaths.Count > 0 Then
@@ -18433,7 +18463,9 @@ Public Module svnModule
                 Return result
             End If
 
+            phaseWatch.Restart()
             Dim outOfDatePaths() As String = getOutOfDatePathsForAsyncLock(lockablePaths.ToArray(), result.Message, savedPathForBackground)
+            writeOperationLog("Get Locks latest-revision check: " & phaseWatch.ElapsedMilliseconds.ToString() & " ms")
             If result.Message <> "" Then
                 result.IsWarning = True
                 Return result
@@ -18448,7 +18480,9 @@ Public Module svnModule
                 Return result
             End If
 
+            phaseWatch.Restart()
             Dim releasedPaths() As String = getReleasedPathsForAsyncLock(lockablePaths.ToArray(), savedPathForBackground)
+            writeOperationLog("Get Locks release-state check: " & phaseWatch.ElapsedMilliseconds.ToString() & " ms")
             If releasedPaths IsNot Nothing AndAlso releasedPaths.Length > 0 AndAlso sMessage <> "#UP REV EDIT#" Then
                 Dim releasedSet As New HashSet(Of String)(releasedPaths.Select(Function(p) normalizeSvnPath(p)), StringComparer.OrdinalIgnoreCase)
                 Dim remaining As New List(Of String)()
@@ -18475,6 +18509,7 @@ Public Module svnModule
             'the entire request into a false total failure.
             Dim newlyLockedPaths As New List(Of String)()
             Dim lockFailureMessages As New List(Of String)()
+            phaseWatch.Restart()
 
             For Each filePath As String In lockablePaths
                 Dim lockResult As rawProcessReturn = runSvnLockForPathsBackground(
@@ -18502,6 +18537,8 @@ Public Module svnModule
                 lockFailureMessages.Add(Path.GetFileName(filePath) & ": " & lockError)
             Next
 
+            writeOperationLog("Get Locks lock command(s): " & phaseWatch.ElapsedMilliseconds.ToString() & " ms")
+
             Dim allOwnedPaths As New List(Of String)()
             allOwnedPaths.AddRange(alreadyLockedPaths)
             allOwnedPaths.AddRange(newlyLockedPaths)
@@ -18513,6 +18550,7 @@ Public Module svnModule
             End If
 
             If newlyLockedPaths.Count > 0 Then
+                phaseWatch.Restart()
                 Dim propResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
                     sSVNPath,
                     "propset addin:release_state ""||EDIT||"" " & quoteFilePathArgs(newlyLockedPaths.ToArray()),
@@ -18526,6 +18564,8 @@ Public Module svnModule
                     result.LockedPaths = allOwnedPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
                     Return result
                 End If
+
+                writeOperationLog("Get Locks edit-property update: " & phaseWatch.ElapsedMilliseconds.ToString() & " ms")
             End If
 
             For Each filePath As String In allOwnedPaths
@@ -18537,6 +18577,7 @@ Public Module svnModule
 
             result.Success = True
             result.LockedPaths = allOwnedPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+            writeOperationLog("Get Locks background total: " & totalWatch.ElapsedMilliseconds.ToString() & " ms")
 
             If lockFailureMessages.Count > 0 Then
                 result.IsWarning = True

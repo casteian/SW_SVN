@@ -54,7 +54,6 @@ Public Class UserControl1
     'Never change live document read-only state or refresh FeatureManager inside an SVN
     'completion callback. Queue stable file paths and reacquire COM objects later.
     Private WithEvents deferredSolidWorksUiTimer As System.Windows.Forms.Timer
-    Private WithEvents ownedLocksWarmupTimer As System.Windows.Forms.Timer
     Private ReadOnly pendingWriteAccessPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private ReadOnly pendingFeatureTreeRefreshPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private pendingSvnTreeStructureRefresh As Boolean = False
@@ -1724,28 +1723,6 @@ Public Class UserControl1
         deferredSolidWorksUiTimer.Interval = 350
         deferredSolidWorksUiTimer.Stop()
 
-        'Pre-warm the whole-working-copy "do I hold any locks" scan a few seconds after
-        'startup, quietly, while the user is just getting oriented rather than waiting on
-        'a close. By the time they actually try to close SOLIDWORKS, the answer is usually
-        'already cached, so that check no longer has to run the full scan from scratch.
-        ownedLocksWarmupTimer = New System.Windows.Forms.Timer()
-        ownedLocksWarmupTimer.Interval = 4000
-        ownedLocksWarmupTimer.Start()
-
-    End Sub
-
-    Private Sub ownedLocksWarmupTimer_Tick(sender As Object, e As EventArgs) Handles ownedLocksWarmupTimer.Tick
-        Try
-            ownedLocksWarmupTimer.Stop()
-            ownedLocksWarmupTimer.Dispose()
-        Catch
-        End Try
-
-        Try
-            If taskPaneClosing Then Exit Sub
-            svnModule.refreshOwnedLocksWholeCopySnapshotPublic()
-        Catch
-        End Try
     End Sub
 
     Private Sub UserControl1_Resize(sender As Object, e As EventArgs) Handles MyBase.Resize
@@ -2221,7 +2198,7 @@ Public Class UserControl1
         svnModuleInitialize(iSwApp, Me, statusOfAllOpenModels)
 
         localRepoPath.Text = My.Settings.localRepoPath
-        versionLabel.Text = "Version: 2026.07.13"
+        versionLabel.Text = "Version: 2026.08.24.1"
 
         ToolStripSplitButFolder.DropDown.AutoClose = True
 
@@ -2314,15 +2291,6 @@ Public Class UserControl1
             End If
         Catch
             deferredSolidWorksUiTimer = Nothing
-        End Try
-
-        Try
-            If ownedLocksWarmupTimer IsNot Nothing Then
-                ownedLocksWarmupTimer.Dispose()
-                ownedLocksWarmupTimer = Nothing
-            End If
-        Catch
-            ownedLocksWarmupTimer = Nothing
         End Try
 
         pendingWriteAccessPaths.Clear()
@@ -3241,17 +3209,34 @@ Public Class UserControl1
         Try
             System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.WaitCursor
 
-            statusOfAllOpenModels = New SVNStatus
-
-            'Local-only refresh.
-            'Do NOT call updateStatusOfAllModelsVariable here because that can hit the SVN server/repo
-            'and rebuild trees. Server update belongs under Get Latest, not Refresh Tree.
+            'Rebuild only the active shallow tree first. The replacement is constructed away
+            'from the visible/cached tree and swapped in only after it succeeds, so a slow or
+            'failed SOLIDWORKS component query cannot leave the task pane white.
             Try
-                updateLockStatusPublic(bRefreshAllTreeViews:=False)
+                refreshCurrentTreeViewOnly()
             Catch
             End Try
 
-            refreshCurrentTreeViewOnly()
+            'Local-only, active-tree status refresh. The old implementation called
+            'updateStatusLocally with no paths, which silently ran svn status and propget over
+            'the entire working copy on the SOLIDWORKS UI thread. A large set of virtual/new
+            'parts or imported references could therefore make SOLIDWORKS appear frozen.
+            Dim activeTreePaths() As String = collectCurrentTreeCadPaths()
+
+            Try
+                If activeTreePaths IsNot Nothing AndAlso activeTreePaths.Length > 0 Then
+                    updateLockStatusPublic(
+                        bRefreshAllTreeViews:=False,
+                        filePathsToRefresh:=activeTreePaths
+                    )
+                End If
+            Catch
+            End Try
+
+            Try
+                recolorCurrentTreeFromStatus()
+            Catch
+            End Try
 
             'Writable/read-only state is interaction-scoped. The two former calls below both
             'ran the legacy bulk SetReadOnlyState loop across every cached open document; they
@@ -3587,7 +3572,7 @@ Public Class UserControl1
             Try
                 refreshCurrentTreeViewOnly()
             Catch
-                TreeView1.Nodes.Clear()
+                'Keep the last known-good tree visible if SOLIDWORKS cannot rebuild it.
             End Try
             Exit Sub
         End If
@@ -3605,19 +3590,24 @@ Public Class UserControl1
         Try
             treeNodeTemp = allTreeViews(treeNodeIndex).Nodes(0)
         Catch
-            TreeView1.Nodes.Clear()
+            'Keep the last known-good tree visible if the replacement is unavailable.
             Exit Sub
         End Try
 
         Dim clonedNode As TreeNode = CType(treeNodeTemp.Clone(), TreeNode)
 
-        clearBatchTreeSelection(False)
-        TreeView1.Nodes.Clear()
-        TreeView1.Nodes.Insert(0, clonedNode)
-        TreeView1.Nodes(0).Expand()
-        'TreeView1.ExpandAll()
-        TreeView1.Show()
-        ensureTreeStartDragHandle()
+        TreeView1.BeginUpdate()
+        Try
+            clearBatchTreeSelection(False)
+            TreeView1.Nodes.Clear()
+            TreeView1.Nodes.Insert(0, clonedNode)
+            TreeView1.Nodes(0).Expand()
+            'TreeView1.ExpandAll()
+            TreeView1.Show()
+            ensureTreeStartDragHandle()
+        Finally
+            TreeView1.EndUpdate()
+        End Try
 
     End Sub
     Function findStoredTreeView(pathName As String, Optional bRetryWithRefresh As Boolean = True) As Integer
@@ -4268,6 +4258,7 @@ Public Class UserControl1
         Dim bUpdateTreeView As Boolean = (allTreeViewsIndexToUpdate >= 0 AndAlso Not IsNothing(allTreeViews))
         Dim sFileNameTemp As String
         Dim parentNode As TreeNode = Nothing
+        Dim replacementTree As TreeView = Nothing
         Dim modelDocList As New List(Of ModelDoc2)()
         Dim swConfMgr As ConfigurationManager
         Dim swConf As Configuration
@@ -4292,9 +4283,10 @@ Public Class UserControl1
             End Try
 
             If bUpdateTreeView Then
-                allTreeViews(allTreeViewsIndexToUpdate).Visible = False
-                allTreeViews(allTreeViewsIndexToUpdate) = Nothing
-                allTreeViews(allTreeViewsIndexToUpdate) = New TreeView
+                'Build off-screen and commit the replacement only after traversal succeeds.
+                'Never destroy the cached tree before making COM calls into SOLIDWORKS.
+                replacementTree = New TreeView
+                replacementTree.Visible = False
 
                 parentNode = New TreeNode(sFileNameTemp)
                 parentNode.Tag = modDocArr(i)
@@ -4369,7 +4361,7 @@ Public Class UserControl1
             Else
                 If bUpdateTreeView Then
                     setNodeColorFromStatus(parentNode)
-                    allTreeViews(allTreeViewsIndexToUpdate).Nodes.Add(parentNode)
+                    replacementTree.Nodes.Add(parentNode)
                 End If
 
                 addModelDocIfMissing(modelDocList, modDocArr(i), bUniqueOnly)
@@ -4385,10 +4377,12 @@ Public Class UserControl1
         Dim mdComponentArr() As ModelDoc2 = modelDocList.ToArray
 
         If bUpdateTreeView Then
-            allTreeViews(allTreeViewsIndexToUpdate).Sort()
-            If parentNode IsNot Nothing Then
-                allTreeViews(allTreeViewsIndexToUpdate).Nodes.Add(parentNode)
+            replacementTree.Sort()
+            If parentNode IsNot Nothing AndAlso replacementTree.Nodes.Count = 0 Then
+                replacementTree.Nodes.Add(parentNode)
             End If
+
+            allTreeViews(allTreeViewsIndexToUpdate) = replacementTree
         End If
 
         Return mdComponentArr

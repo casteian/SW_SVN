@@ -28,4 +28,6 @@ Imports System.Runtime.InteropServices
 
 <Assembly: AssemblyVersion("1.0.*")>
 
-<Assembly: ComVisibleAttribute(True)>
+' Keep implementation types private to .NET.  The SOLIDWORKS add-in entry point
+' opts in explicitly with <ComVisible(True)> on SwAddin.
+<Assembly: ComVisibleAttribute(False)>

@@ -85,7 +85,7 @@
     <DefineTrace>true</DefineTrace>
     <DebugSymbols>false</DebugSymbols>
     <Optimize>true</Optimize>
-    <RegisterForComInterop>true</RegisterForComInterop>
+    <RegisterForComInterop>false</RegisterForComInterop>
     <RemoveIntegerChecks>false</RemoveIntegerChecks>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <WarningLevel>1</WarningLevel>
