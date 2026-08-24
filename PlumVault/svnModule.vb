@@ -100,6 +100,7 @@ Public Module svnModule
     Private internalSolidWorksSaveDepth As Integer = 0
     Private newDocumentTeamSaveWorkflowInProgress As Boolean = False
     Private managedActiveDocumentSaveQueued As Boolean = False
+    Private managedActiveDocumentSaveQueuedUtc As DateTime = DateTime.MinValue
     Private pendingAutomaticSaveCommitPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
     Private ReadOnly automaticSaveStateSync As New Object()
     Private postFirstCommitLockPendingPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
@@ -5142,7 +5143,16 @@ Public Module svnModule
 
             If command <> SW_COMMAND_SAVE Then Return 0
 
-            If managedActiveDocumentSaveQueued Then Return -1
+            If managedActiveDocumentSaveQueued Then
+                'The queued isolated save normally starts within one UI turn. If the flag is
+                'still set long after queuing (e.g. the BeginInvoke delegate was lost during a
+                'task-pane teardown), a permanently stuck flag would silently turn every future
+                'Ctrl+S into a no-op for the rest of the session. Self-heal like the other
+                'guard queues: treat a stale flag as lost and requeue this save normally.
+                If (DateTime.UtcNow - managedActiveDocumentSaveQueuedUtc).TotalSeconds < 15.0 Then Return -1
+                managedActiveDocumentSaveQueued = False
+                writeOperationLog("Stale queued managed save flag cleared; requeuing Ctrl+S save.")
+            End If
 
             If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse Not myUserControl.IsHandleCreated Then
                 'A native save of a managed assembly may save/rebuild referenced documents and
@@ -5158,6 +5168,7 @@ Public Module svnModule
             End If
 
             managedActiveDocumentSaveQueued = True
+            managedActiveDocumentSaveQueuedUtc = DateTime.UtcNow
 
             Try
                 Dim queuedPath As String = currentPath
