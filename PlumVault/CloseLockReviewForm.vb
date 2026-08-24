@@ -244,7 +244,7 @@ Public Class CloseLockReviewForm
 
         Dim revertColumn As New DataGridViewButtonColumn()
         revertColumn.Name = "Revert"
-        revertColumn.HeaderText = "Discard"
+        revertColumn.HeaderText = "Revert"
         revertColumn.UseColumnTextForButtonValue = False
         revertColumn.Width = 90
         revertColumn.MinimumWidth = 90
@@ -735,7 +735,7 @@ Public Class CloseLockReviewForm
                 'a deliberate retry, but require the user to return to the document first.
                 item.IsSafeToUnlock = False
                 item.ResultText = If(String.IsNullOrWhiteSpace(errorMessage),
-                                     "Discard did not complete; no Release was attempted",
+                                     "Revert did not complete; no lock return was attempted",
                                      errorMessage)
                 row.Cells("Unlock").Value = If(item.IsStillLocked, "Return first", "Unlocked")
                 row.Cells("Result").Value = item.ResultText
