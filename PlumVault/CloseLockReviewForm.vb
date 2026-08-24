@@ -134,7 +134,7 @@ Public Class CloseLockReviewForm
             "These files need a close decision. Red rows contain edits made without your SVN lock; select Get Lock, then Commit. " &
             "Yellow rows are locked by you and green rows have been successfully unlocked." &
             Environment.NewLine &
-            "For each changed file, Commit to keep your work or Revert to discard it. Unlock files whose work is complete. " &
+            "For each changed file, Commit to keep your work or Revert to discard it and return its lock. Unlock clean files whose work is complete. " &
             "You may retain any lock you still need. Continuing close is the final decision: saved local SVN changes remain on disk, " &
             "but unsaved changes still only in SOLIDWORKS will be discarded without another Save/Don't Save prompt." &
             Environment.NewLine &
@@ -683,12 +683,12 @@ Public Class CloseLockReviewForm
         returnButton.Enabled = False
         continueButton.Enabled = False
         grid.Enabled = False
-        row.Cells("Result").Value = "Waiting for discard confirmation..."
+        row.Cells("Result").Value = "Waiting for revert confirmation..."
         grid.Refresh()
 
         If svnModule.revertPathFromCloseReviewPublic(item.FilePath, errorMessage) Then
             UseWaitCursor = True
-            row.Cells("Result").Value = "Discarding changes and reloading the SOLIDWORKS file..."
+            row.Cells("Result").Value = "Reverting changes, reloading the SOLIDWORKS file, then returning its lock..."
             Exit Sub
         End If
 
@@ -696,7 +696,7 @@ Public Class CloseLockReviewForm
             If Not String.IsNullOrWhiteSpace(errorMessage) Then
                 item.ResultText = errorMessage
                 row.Cells("Result").Value = errorMessage
-                row.Cells("Result").Style.ForeColor = If(errorMessage.StartsWith("Discard cancelled", StringComparison.OrdinalIgnoreCase),
+                row.Cells("Result").Style.ForeColor = If(errorMessage.StartsWith("Revert cancelled", StringComparison.OrdinalIgnoreCase),
                                                            Color.DarkGoldenrod,
                                                            Color.DarkRed)
             End If
@@ -744,41 +744,75 @@ Public Class CloseLockReviewForm
                 Exit Try
             End If
 
-            Dim querySucceeded As Boolean = False
-            Dim refreshError As String = ""
-            Dim refreshed As CloseLockReviewItem = svnModule.refreshPathFromCloseReviewPublic(
-                completedPath,
-                querySucceeded,
-                refreshError
-            )
+            Dim lockWasHeld As Boolean = item.IsStillLocked
+            Dim lockReturned As Boolean = Not lockWasHeld
+            Dim returnLockError As String = ""
 
-            If Not querySucceeded Then
-                'The discard routine verified both the SOLIDWORKS SaveFlag and local SVN
-                'status before reporting success, but a failed lock refresh means we no longer
-                'know whether Release is applicable. Fail closed until the next review/refresh.
-                item.IsSafeToUnlock = False
-                item.CanCommit = False
-                item.CanRevert = False
-                item.StateText = "Discarded; lock status needs refresh"
-                item.ResultText = If(String.IsNullOrWhiteSpace(refreshError),
-                                     "Return to SOLIDWORKS and refresh SVN status",
-                                     refreshError)
-            ElseIf refreshed Is Nothing Then
+            If lockWasHeld Then
+                lockReturned = svnModule.unlockPathFromCloseReviewPublic(completedPath, returnLockError)
+            End If
+
+            If lockReturned Then
+                item.RequiresLockBeforeCommit = False
+                item.CanGetLock = False
                 item.IsSafeToUnlock = True
                 item.IsStillLocked = False
                 item.CanCommit = False
                 item.CanRevert = False
-                item.StateText = "Changes discarded; no lock held"
-                item.ResultText = "Discarded successfully"
+                item.StateText = If(lockWasHeld,
+                                    "Reverted; lock returned",
+                                    "Reverted; no lock held")
+                item.ResultText = If(lockWasHeld,
+                                     "Reverted and lock returned",
+                                     "Reverted successfully; no lock was held")
             Else
-                item.IsSafeToUnlock = refreshed.IsSafeToUnlock
-                item.IsStillLocked = refreshed.IsStillLocked
-                item.CanCommit = refreshed.CanCommit
-                item.CanRevert = refreshed.CanRevert
-                item.StateText = refreshed.StateText
-                item.ResultText = If(refreshed.IsSafeToUnlock,
-                                     "Changes discarded; lock retained",
-                                     refreshed.ResultText)
+                'The destructive half has already completed and was verified clean. If the
+                'network/SVN unlock fails, refresh only this path so the table never claims a
+                'lock was returned when it is still held (or vice versa).
+                Dim querySucceeded As Boolean = False
+                Dim refreshError As String = ""
+                Dim refreshed As CloseLockReviewItem = svnModule.refreshPathFromCloseReviewPublic(
+                    completedPath,
+                    querySucceeded,
+                    refreshError
+                )
+
+                If querySucceeded AndAlso refreshed Is Nothing Then
+                    item.RequiresLockBeforeCommit = False
+                    item.CanGetLock = False
+                    item.IsSafeToUnlock = True
+                    item.IsStillLocked = False
+                    item.CanCommit = False
+                    item.CanRevert = False
+                    item.StateText = "Reverted; lock returned"
+                    item.ResultText = "Reverted and lock returned"
+                ElseIf querySucceeded Then
+                    item.RequiresLockBeforeCommit = False
+                    item.CanGetLock = False
+                    item.IsSafeToUnlock = refreshed.IsSafeToUnlock
+                    item.IsStillLocked = refreshed.IsStillLocked
+                    item.CanCommit = False
+                    item.CanRevert = False
+                    item.StateText = "Reverted; lock retained"
+                    item.ResultText = "Reverted, but the lock could not be returned"
+                    If Not String.IsNullOrWhiteSpace(returnLockError) Then
+                        item.ResultText &= ": " & returnLockError
+                    End If
+                Else
+                    'Revert succeeded, but neither the unlock nor the follow-up status check
+                    'proved the lock state. Keep the original lock state and fail closed.
+                    item.IsSafeToUnlock = False
+                    item.CanCommit = False
+                    item.CanRevert = False
+                    item.StateText = "Reverted; lock return needs verification"
+                    item.ResultText = "Reverted, but PlumVault could not verify that the lock was returned"
+
+                    If Not String.IsNullOrWhiteSpace(returnLockError) Then
+                        item.ResultText &= ": " & returnLockError
+                    ElseIf Not String.IsNullOrWhiteSpace(refreshError) Then
+                        item.ResultText &= ": " & refreshError
+                    End If
+                End If
             End If
 
             row.Cells("State").Value = item.StateText

@@ -163,7 +163,11 @@ outside of an edit Claude just made:
   A dirty commit target is likewise switched synchronously immediately before
   its required `Save3`. Bulk `SetReadOnlyState(False)` calls can trigger rebuild/false-dirty
   cascades across sibling documents; do not restore broad every-locked-open-document
-  reconciliation.
+  reconciliation. A quiet timer may perform one background `svn status -u` for only the
+  exact active edit target every three minutes. It merges that one row into the cache so a
+  stolen/broken token is rejected by the next edit guard; it must never expand to dependencies,
+  replace the whole status model, run on the SOLIDWORKS UI thread, or mutate document writable
+  state.
 - **The visibly selected SVN-tree CAD row is the single-file action target.** It is authoritative
   for Get Locks, Commit, and other single-row file actions whether selected by a direct task-pane
   click or by graphical-selection synchronization from SOLIDWORKS. Never display one selected

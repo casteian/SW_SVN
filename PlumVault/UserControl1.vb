@@ -66,6 +66,9 @@ Public Class UserControl1
     Private refreshTreeNeedsUpdate As Boolean = False
     Private normalRefreshTreeBackColor As Color
     Private lastLiveCheckedActivePath As String = ""
+    Private quietActiveStatusCheckInProgress As Boolean = False
+    Private lastQuietActiveStatusCheckUtc As DateTime = DateTime.UtcNow
+    Private Const QUIET_ACTIVE_STATUS_INTERVAL_MINUTES As Double = 3.0
     Private lastGraphicalSelectionPath As String = ""
     Private lastGraphicalSelectionComponentName As String = ""
     Private lastExplicitSvnTreeClickUtc As DateTime = DateTime.MinValue
@@ -1758,9 +1761,10 @@ Public Class UserControl1
     End Sub
 
     Private Sub liveChangeCheckTimer_Tick(sender As Object, e As EventArgs) Handles liveChangeCheckTimer.Tick
-        'Speed fix:
-        'Do NOT run SVN server checks on a timer.
-        'The old live check could call svn status -u against the repo and make SOLIDWORKS feel frozen.
+        'Speed rule:
+        'Never run a whole-tree/repository status check from this timer. The old live check did
+        'that on the UI thread and made SOLIDWORKS feel frozen. The bounded helper below starts
+        'at most one background status request for the exact active edit target every 3 minutes.
         '
         'Shutdown safety:
         'SOLIDWORKS can disconnect the add-in COM application object while a WinForms timer tick is
@@ -1801,6 +1805,95 @@ Public Class UserControl1
             lastLiveCheckedActivePath = activePath
             setRefreshTreeButtonNormal()
         End If
+
+        Dim quietStatusPath As String = activePath
+        Try
+            quietStatusPath = svnModule.getActiveInteractionStatusPathPublic(activeModDoc)
+        Catch
+            quietStatusPath = activePath
+        End Try
+
+        tryStartQuietActiveDocumentStatusCheck(quietStatusPath)
+    End Sub
+
+    Private Sub tryStartQuietActiveDocumentStatusCheck(ByVal activePath As String)
+        If quietActiveStatusCheckInProgress OrElse syncStatusInProgress Then Exit Sub
+        If (DateTime.UtcNow - lastQuietActiveStatusCheckUtc).TotalMinutes < QUIET_ACTIVE_STATUS_INTERVAL_MINUTES Then Exit Sub
+        If String.IsNullOrWhiteSpace(activePath) OrElse Not File.Exists(activePath) Then Exit Sub
+
+        Try
+            If onlineCheckBox Is Nothing OrElse Not onlineCheckBox.Checked Then Exit Sub
+        Catch
+            Exit Sub
+        End Try
+
+        If Not svnModule.canRunQuietActiveServerStatusCheckPublic(activePath) Then Exit Sub
+
+        Dim pathForBackground As String = activePath
+        Dim savedPathForBackground As String = savedPATH
+        Dim requestStartedUtc As DateTime = DateTime.UtcNow
+        quietActiveStatusCheckInProgress = True
+        lastQuietActiveStatusCheckUtc = requestStartedUtc
+
+        System.Threading.Tasks.Task.Run(
+            Sub()
+                Dim errorMessage As String = ""
+                Dim serverStatus As SVNStatus = Nothing
+
+                Try
+                    serverStatus = svnModule.getQuietActiveDocumentServerStatusBackgroundPublic(
+                        pathForBackground,
+                        savedPathForBackground,
+                        errorMessage
+                    )
+                Catch ex As Exception
+                    errorMessage = ex.Message
+                End Try
+
+                Try
+                    If Me.IsHandleCreated Then
+                        Me.BeginInvoke(
+                            New MethodInvoker(
+                                Sub()
+                                    finishQuietActiveDocumentStatusCheck(
+                                        pathForBackground,
+                                        serverStatus,
+                                        errorMessage,
+                                        requestStartedUtc
+                                    )
+                                End Sub
+                            )
+                        )
+                    Else
+                        quietActiveStatusCheckInProgress = False
+                    End If
+                Catch
+                    quietActiveStatusCheckInProgress = False
+                End Try
+            End Sub
+        )
+    End Sub
+
+    Private Sub finishQuietActiveDocumentStatusCheck(ByVal checkedPath As String,
+                                                      ByVal serverStatus As SVNStatus,
+                                                      ByVal errorMessage As String,
+                                                      ByVal requestStartedUtc As DateTime)
+        quietActiveStatusCheckInProgress = False
+
+        'This poll is deliberately silent. A transient network/SVN failure must not interrupt
+        'modelling; the next three-minute interval tries again. A successful result updates
+        'only this path's cache, so the next edit guard can reject a stolen/broken lock without
+        'performing any network work on the SOLIDWORKS event thread.
+        If taskPaneClosing OrElse Not String.IsNullOrWhiteSpace(errorMessage) OrElse
+           serverStatus Is Nothing Then Exit Sub
+
+        If Not svnModule.canApplyQuietActiveServerStatusResultPublic(requestStartedUtc) Then Exit Sub
+
+        Try
+            svnModule.applyTargetedServerStatusFromBackgroundPublic(serverStatus)
+            recolorTreeNodesForFilePathsPublic(New String() {checkedPath})
+        Catch
+        End Try
     End Sub
 
     Private Sub graphicalSelectionSyncTimer_Tick(sender As Object, e As EventArgs) Handles graphicalSelectionSyncTimer.Tick
@@ -2792,10 +2885,18 @@ Public Class UserControl1
             Exit Sub
         End If
 
+        Dim serverStatusApplied As Boolean = False
         Try
             svnModule.applyServerStatusFromBackgroundPublic(serverStatus)
+            serverStatusApplied = True
         Catch
         End Try
+
+        If serverStatusApplied Then
+            'A successful manual Sync is newer and broader than the quiet active-document
+            'check, so begin the three-minute interval again from this completion time.
+            lastQuietActiveStatusCheckUtc = DateTime.UtcNow
+        End If
 
         Try
             recolorTreeNodesForFilePathsPublic(syncPaths)
@@ -5836,10 +5937,18 @@ Public Class UserControl1
 
 
         ElseIf status1.fp(0).lock6 = "O" OrElse
+            status1.fp(0).lock6 = "T" OrElse
+            status1.fp(0).lock6 = "B" OrElse
             (Not String.IsNullOrWhiteSpace(status1.fp(0).lockOwner) AndAlso status1.fp(0).lock6 <> "K") Then
             rootNode.BackColor = myCol.lockedBySomeoneElse
 
-            If Not String.IsNullOrWhiteSpace(status1.fp(0).lockOwner) Then
+            If status1.fp(0).lock6 = "T" Then
+                rootNode.ToolTipText = "Your local SVN lock token was stolen"
+                rootNode.Text &= " [Lock stolen]"
+            ElseIf status1.fp(0).lock6 = "B" Then
+                rootNode.ToolTipText = "Your local SVN lock token is broken"
+                rootNode.Text &= " [Lock broken]"
+            ElseIf Not String.IsNullOrWhiteSpace(status1.fp(0).lockOwner) Then
                 rootNode.ToolTipText = "Locked by: " & status1.fp(0).lockOwner
                 rootNode.Text &= " [Locked: " & status1.fp(0).lockOwner & "]"
             Else

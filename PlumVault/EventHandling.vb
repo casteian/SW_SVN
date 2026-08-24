@@ -765,11 +765,26 @@ Public Class AssemblyEventHandler
     End Function
 
     Private Function AssemblyDoc_ComponentMoveNotify2(ByRef Components As Object) As Integer
-        svnModule.handleAssemblyOwnedEditPostPublic(
-            iDocument,
-            "moving or rotating an assembly component",
-            allowActiveChildEditContext:=True
-        )
+        'The event payload identifies the component(s) that actually moved. Resolve their
+        'immediate owning assembly instead of borrowing a possibly stale Edit Part context or
+        'the top-level event document. A component move is persisted by its parent assembly;
+        'it is never a child-part geometry edit.
+        Dim owners() As ModelDoc2 =
+            svnModule.getAssemblyEditOwnersForMovedComponentsPublic(iDocument, Components)
+
+        If owners Is Nothing OrElse owners.Length = 0 Then
+            svnModule.handleAssemblyOwnedEditPostPublic(
+                iDocument,
+                "moving or rotating an assembly component"
+            )
+        Else
+            For Each owner As ModelDoc2 In owners
+                svnModule.handleAssemblyOwnedEditPostPublic(
+                    owner,
+                    "moving or rotating an assembly component"
+                )
+            Next
+        End If
         Return 0
     End Function
 
@@ -778,10 +793,14 @@ Public Class AssemblyEventHandler
         'Dragging a component into/out of a FeatureManager folder is persisted in the assembly
         'file even though geometry does not move. ComponentMoveNotify2 does not cover this tree
         'reorganization, so guard its purpose-built event explicitly.
+        Dim owner As ModelDoc2 =
+            svnModule.getAssemblyEditOwnerForComponentStatePublic(iDocument, sourceName)
+        If owner Is Nothing Then owner = iDocument
+
         svnModule.handleAssemblyOwnedEditPostPublic(
-            iDocument,
+            owner,
             "reorganizing " & sourceName & " in the FeatureManager tree",
-            allowActiveChildEditContext:=True
+            allowActiveChildEditContext:=False
         )
         Return 0
     End Function

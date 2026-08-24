@@ -463,7 +463,7 @@ Public Module svnModule
         endSolidWorksNativeMutation(description)
     End Sub
 
-    Public Function canRunDeferredSolidWorksUiMutationPublic() As Boolean
+    Public Function canRunDeferredSolidWorksUiMutationPublic(Optional ByVal allowCloseReview As Boolean = False) As Boolean
         SyncLock solidWorksNativeMutationSync
             If solidWorksNativeMutationInProgress Then Return False
         End SyncLock
@@ -471,7 +471,8 @@ Public Module svnModule
         If automaticSaveCommitPreparing Then Return False
         If legacyImportInProgress Then Return False
         If assemblyGuardUndoInProgress Then Return False
-        If closeGuardMessageShowing OrElse lockReviewMessageShowing Then Return False
+        If closeGuardMessageShowing Then Return False
+        If lockReviewMessageShowing AndAlso Not allowCloseReview Then Return False
         If asyncCommitInProgress Then Return False
 
         Return True
@@ -917,6 +918,21 @@ Public Module svnModule
         End If
 
         Return False
+    End Function
+
+    Private Function cachedServerStatusProvesLockUnavailable(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Try
+            Dim cached As SVNStatus.filePpty = Nothing
+            If Not tryFindCachedStatusProperty(filePath, cached) Then Return False
+
+            'SVN status -u lock column: O = other working copy, T = stolen token,
+            'B = broken token. These server-aware states override a stale local K token.
+            Return cached.lock6 = "O" OrElse cached.lock6 = "T" OrElse cached.lock6 = "B"
+        Catch
+            Return False
+        End Try
     End Function
 
     Public Sub noteAssemblySelectionContextPublic(ByVal assemblyDocument As ModelDoc2)
@@ -1825,6 +1841,66 @@ Public Module svnModule
         Return True
     End Function
 
+    Public Function canRunQuietActiveServerStatusCheckPublic(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) OrElse Not File.Exists(filePath) Then Return False
+        If Not isCadFilePath(filePath) OrElse Not isPathInsideLocalRepo(filePath) Then Return False
+
+        SyncLock solidWorksNativeMutationSync
+            If solidWorksNativeMutationInProgress Then Return False
+        End SyncLock
+
+        If automaticSaveEventsSuppressed() OrElse
+           legacyImportInProgress OrElse
+           cadRelocationInProgress OrElse
+           closeReviewRevertInProgress OrElse
+           closeGuardMessageShowing OrElse
+           lockReviewMessageShowing OrElse
+           asyncGetLocksInProgress OrElse
+           asyncCommitInProgress OrElse
+           asyncCleanupInProgress OrElse
+           syncStatusInProgressOnControl() Then Return False
+
+        'New/unversioned files have no repository lock to verify. Use only the existing cache
+        'here; a quiet timer gate must never launch a local svn.exe process on the UI thread.
+        Try
+            Dim cached As SVNStatus.filePpty = Nothing
+            If tryFindCachedStatusProperty(filePath, cached) AndAlso
+               (cached.addDelChg1 = "?" OrElse cached.addDelChg1 = "A") Then Return False
+        Catch
+        End Try
+
+        Return True
+    End Function
+
+    Public Function getActiveInteractionStatusPathPublic(ByVal activeDocument As ModelDoc2) As String
+        If activeDocument Is Nothing Then Return ""
+
+        Try
+            If activeDocument.GetType() = swDocumentTypes_e.swDocASSEMBLY Then
+                Dim editTarget As ModelDoc2 = getAssemblyEditTargetDocumentSafe(activeDocument)
+                If editTarget IsNot Nothing Then
+                    Dim editTargetPath As String = editTarget.GetPathName()
+                    If Not String.IsNullOrWhiteSpace(editTargetPath) Then Return editTargetPath
+                End If
+            End If
+
+            Return activeDocument.GetPathName()
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Public Function canApplyQuietActiveServerStatusResultPublic(ByVal requestStartedUtc As DateTime) As Boolean
+        'Never let a slow poll overwrite a newer explicit action. All Get Locks, Commit,
+        'Unlock, Refresh, and Sync paths update this cache timestamp when their result lands.
+        If statusCacheLastWriteUtc > requestStartedUtc Then Return False
+
+        If asyncGetLocksInProgress OrElse asyncCommitInProgress OrElse
+           asyncCleanupInProgress OrElse syncStatusInProgressOnControl() Then Return False
+
+        Return True
+    End Function
+
     Private Sub queuePendingAssemblySuppressionExpiry(ByVal openedUtc As DateTime)
         If myUserControl Is Nothing OrElse myUserControl.IsDisposed OrElse
            Not myUserControl.IsHandleCreated Then Exit Sub
@@ -2073,6 +2149,11 @@ Public Module svnModule
 
         'Do not trust the UI status cache here: the user may have unlocked through Explorer.
         'Edit access requires the working copy's live local K token.
+        If cachedServerStatusProvesLockUnavailable(childPath) Then
+            showManualLockRequired(childPath, "start this edit")
+            Return -1
+        End If
+
         Dim hasLock As Boolean = userHasLocalSvnLockTokenForPath(childPath, allowCachedToken:=False)
         If Not hasLock Then
             showManualLockRequired(childPath, "start this edit")
@@ -2169,7 +2250,8 @@ Public Module svnModule
             "; target=" & targetPath
         )
 
-        If Not userHasLocalSvnLockTokenForPath(targetPath, allowCachedToken:=False) Then
+        If cachedServerStatusProvesLockUnavailable(targetPath) OrElse
+           Not userHasLocalSvnLockTokenForPath(targetPath, allowCachedToken:=False) Then
             showManualLockRequired(targetPath, actionDescription)
             Return 1
         End If
@@ -2249,7 +2331,8 @@ Public Module svnModule
             "; target=" & targetPath
         )
 
-        If Not userHasLocalSvnLockTokenForPath(targetPath, allowCachedToken:=False) Then
+        If cachedServerStatusProvesLockUnavailable(targetPath) OrElse
+           Not userHasLocalSvnLockTokenForPath(targetPath, allowCachedToken:=False) Then
             showManualLockRequired(targetPath, actionDescription)
             Return 1
         End If
@@ -4567,6 +4650,57 @@ Public Module svnModule
         End Try
 
         Return Nothing
+    End Function
+
+    Public Function getAssemblyEditOwnersForMovedComponentsPublic(ByVal eventAssembly As ModelDoc2,
+                                                                   ByVal componentsPayload As Object) As ModelDoc2()
+        If eventAssembly Is Nothing Then Return Nothing
+
+        Dim movedComponents As New List(Of Component2)()
+
+        Try
+            If TypeOf componentsPayload Is Component2 Then
+                movedComponents.Add(DirectCast(componentsPayload, Component2))
+            ElseIf componentsPayload IsNot Nothing AndAlso componentsPayload.GetType().IsArray Then
+                For Each item As Object In DirectCast(componentsPayload, System.Array)
+                    Dim component As Component2 = TryCast(item, Component2)
+                    If component IsNot Nothing Then movedComponents.Add(component)
+                Next
+            End If
+        Catch ex As Exception
+            writeOperationLog("Could not read moved-component event payload: " & ex.Message)
+        End Try
+
+        Dim owners As New List(Of ModelDoc2)()
+        Dim ownerPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        For Each movedComponent As Component2 In movedComponents
+            Dim owner As ModelDoc2 = eventAssembly
+
+            Try
+                Dim parentComponent As Component2 = movedComponent.GetParent()
+                If parentComponent IsNot Nothing Then
+                    Dim parentDocument As ModelDoc2 = TryCast(parentComponent.GetModelDoc2(), ModelDoc2)
+                    If isAssemblyDocumentSafe(parentDocument) Then owner = parentDocument
+                End If
+            Catch ex As Exception
+                writeOperationLog("Could not resolve moved-component owner: " & ex.Message)
+            End Try
+
+            Dim ownerKey As String = getAssemblyPathKeySafe(owner)
+            If String.IsNullOrWhiteSpace(ownerKey) Then
+                Try
+                    ownerKey = owner.GetTitle()
+                Catch
+                    ownerKey = Guid.NewGuid().ToString()
+                End Try
+            End If
+
+            If ownerPaths.Add(ownerKey) Then owners.Add(owner)
+        Next
+
+        If owners.Count = 0 Then owners.Add(eventAssembly)
+        Return owners.ToArray()
     End Function
 
     Public Sub handleAssemblyOwnedEditPostPublic(ByVal assemblyDocument As ModelDoc2,
@@ -9834,7 +9968,7 @@ Public Module svnModule
             Return False
         End If
 
-        If Not canRunDeferredSolidWorksUiMutationPublic() Then
+        If Not canRunDeferredSolidWorksUiMutationPublic(allowCloseReview:=True) Then
             errorMessage = "PlumVault is finishing another SOLIDWORKS document operation. Wait a moment and try again."
             Return False
         End If
@@ -9846,7 +9980,8 @@ Public Module svnModule
                 New String() {filePath},
                 bBreakLocks:=False,
                 bUseTortoise:=False,
-                sMessage:="Lock obtained from close review"
+                sMessage:="Lock obtained from close review",
+                allowCloseReview:=True
             )
         Catch ex As Exception
             pendingCloseReviewLockPath = ""
@@ -9946,15 +10081,15 @@ Public Module svnModule
         End If
 
         Dim response As swMessageBoxResult_e = iSwApp.SendMsgToUser2(
-            "Discard every change to " & Path.GetFileName(filePath) & "?" & vbCrLf & vbCrLf &
-            "This removes both unsaved SOLIDWORKS edits and saved local SVN changes. " &
-            "The SVN lock will be retained so you can continue working or release it from the table.",
+            "Revert every change to " & Path.GetFileName(filePath) & " and return its SVN lock?" & vbCrLf & vbCrLf &
+            "This permanently discards both unsaved SOLIDWORKS edits and saved local SVN changes. " &
+            "After SOLIDWORKS reloads the vault version, PlumVault will return the lock.",
             swMessageBoxIcon_e.swMbWarning,
-            swMessageBoxBtn_e.swMbOkCancel
+            swMessageBoxBtn_e.swMbYesNo
         )
 
-        If response <> swMessageBoxResult_e.swMbHitOk Then
-            errorMessage = "Discard cancelled; no changes were removed."
+        If response <> swMessageBoxResult_e.swMbHitYes Then
+            errorMessage = "Revert cancelled; no changes were removed and the lock was retained."
             Return False
         End If
 
@@ -11723,6 +11858,81 @@ Public Module svnModule
         End Try
     End Function
 
+    Public Function getQuietActiveDocumentServerStatusBackgroundPublic(ByVal filePath As String,
+                                                                        ByVal savedPathForBackground As String,
+                                                                        ByRef errorMessage As String) As SVNStatus
+        errorMessage = ""
+
+        Dim filteredPaths() As String = filterExistingCadFilePathsOnly(New String() {filePath})
+        If filteredPaths Is Nothing OrElse filteredPaths.Length = 0 Then Return Nothing
+
+        Dim targetPath As String = filteredPaths(0)
+
+        Try
+            'Exactly one server request and no lock-owner/release-property follow-up calls.
+            'Column 6 is enough for edit protection: K is ours, while O/T/B means the lock is
+            'owned elsewhere, stolen, or broken. This runs only on a background worker.
+            Dim args As String = "status -vu --non-interactive " &
+                quoteFilePathArgs(New String() {targetPath})
+            Dim statusResult As rawProcessReturn = runSvnProcessBackgroundNoUi(
+                sSVNPath,
+                args,
+                savedPathForBackground
+            )
+
+            Dim errorText As String = ""
+            If statusResult.outputError IsNot Nothing Then errorText = statusResult.outputError.Trim()
+            If errorText <> "" Then
+                errorMessage = errorText
+                Return Nothing
+            End If
+
+            If String.IsNullOrWhiteSpace(statusResult.output) Then Return Nothing
+
+            Dim lines() As String = statusResult.output.Split(
+                New String() {vbCrLf, vbLf},
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+            For Each line As String In lines
+                If String.IsNullOrWhiteSpace(line) Then Continue For
+                If line.StartsWith("Status against revision", StringComparison.OrdinalIgnoreCase) Then Continue For
+
+                Dim matchedPath As String = findMatchingTargetPathInStatusLine(
+                    line,
+                    New String() {targetPath}
+                )
+                If String.IsNullOrWhiteSpace(matchedPath) Then Continue For
+
+                Dim entry As New SVNStatus.filePpty()
+                entry.filename = matchedPath
+                entry.modDoc = Nothing
+                entry.bReconnect = False
+                entry.revertUpdate = getLatestType.none
+                entry.addDelChg1 = getStatusColumn(line, 0)
+                entry.pptyMods2 = getStatusColumn(line, 1)
+                entry.workingDirLock3 = getStatusColumn(line, 2)
+                entry.addWithHist4 = getStatusColumn(line, 3)
+                entry.switchWParent5 = getStatusColumn(line, 4)
+                entry.lock6 = getStatusColumn(line, 5)
+                entry.lockOwner = ""
+                entry.tree7 = getStatusColumn(line, 6)
+                entry.upToDate9 = getStatusColumn(line, 8)
+                entry.released = ""
+
+                Dim output As New SVNStatus()
+                ReDim output.fp(0)
+                output.fp(0) = entry
+                Return output
+            Next
+
+            Return Nothing
+        Catch ex As Exception
+            errorMessage = ex.Message
+            Return Nothing
+        End Try
+    End Function
+
     Private Function getServerStatusChunkOptimized(ByVal chunk() As String,
                                                    ByVal savedPathForBackground As String,
                                                    ByVal chunkIndex As Integer) As SyncStatusChunkResult
@@ -11884,6 +12094,15 @@ Public Module svnModule
             End If
         Catch
         End Try
+    End Sub
+
+    Public Sub applyTargetedServerStatusFromBackgroundPublic(ByVal serverStatus As SVNStatus)
+        If serverStatus Is Nothing OrElse serverStatus.fp Is Nothing Then Exit Sub
+
+        'A quiet active-file poll must merge one authoritative row into the bounded cache.
+        'Replacing statusOfAllOpenModels here would erase every sibling row and make the task
+        'pane appear disconnected until the next full Sync.
+        rebuildStatusCacheFromStatus(serverStatus, markAsServerSync:=False)
     End Sub
 
     Private Function chunkFilePathsForBackground(ByVal filePaths() As String,
@@ -17894,8 +18113,9 @@ Public Module svnModule
     Public Sub getLocksOfPathsAsync(ByVal selectedPaths() As String,
                                     Optional bBreakLocks As Boolean = False,
                                     Optional bUseTortoise As Boolean = False,
-                                    Optional sMessage As String = "")
-        If Not canRunDeferredSolidWorksUiMutationPublic() Then
+                                    Optional sMessage As String = "",
+                                    Optional allowCloseReview As Boolean = False)
+        If Not canRunDeferredSolidWorksUiMutationPublic(allowCloseReview) Then
             iSwApp.SendMsgToUser2(
                 "PlumVault is finishing another SOLIDWORKS document operation." & vbCrLf & vbCrLf &
                 "Wait a moment, then click Get Locks again.",
