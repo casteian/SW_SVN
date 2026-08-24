@@ -4848,6 +4848,19 @@ Public Class UserControl1
             Exit Sub
         End Try
 
+        'Suspend painting for the whole mutation. Clearing, re-adding node-by-node, and
+        'sorting an owner-drawn TreeView without BeginUpdate repaints on every step - the
+        'visible "tree flashing" during Sync/expand on component-heavy assemblies.
+        Dim owningTree As TreeView = node.TreeView
+
+        Try
+            If owningTree IsNot Nothing Then owningTree.BeginUpdate()
+        Catch
+            owningTree = Nothing
+        End Try
+
+        Try
+
         node.Nodes.Clear()
 
         For Each child As Object In childArr
@@ -4897,6 +4910,13 @@ Public Class UserControl1
         Try
             node.TreeView.Sort()
         Catch
+        End Try
+
+        Finally
+            Try
+                If owningTree IsNot Nothing Then owningTree.EndUpdate()
+            Catch
+            End Try
         End Try
     End Sub
 
@@ -5441,6 +5461,23 @@ Public Class UserControl1
                         normalizedPath,
                         File.GetAttributes(normalizedPath) And Not FileAttributes.ReadOnly
                     )
+                End If
+            Catch
+            End Try
+
+            'Sync/Get Locks completion and window activation all funnel here. Never even
+            'enqueue a file whose native writable transition is known/predicted pathological
+            '(virtual/STEP-heavy) - the disk attribute above is already cleared, and the
+            'explicit edit/save precheck performs the live transition when actually needed.
+            'An in-flight Edit Component replay target is still enqueued so its transition
+            'and replay complete normally.
+            Try
+                If svnModule.shouldSkipBackgroundWritableTransitionPublic(normalizedPath) AndAlso
+                   Not svnModule.isPendingInContextAutoEditTargetPublic(normalizedPath) Then
+                    svnModule.logOperationPublic(
+                        "Known-slow writable transition not queued: " & normalizedPath
+                    )
+                    Continue For
                 End If
             Catch
             End Try
