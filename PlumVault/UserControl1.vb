@@ -3252,6 +3252,26 @@ Public Class UserControl1
 
             setRefreshTreeButtonNormal()
 
+        Catch ex As Exception
+            'Refresh is a routine button and must never let an exception escape into the
+            'SOLIDWORKS message loop - that terminates the whole application. A brand-new,
+            'never-saved assembly (GetPathName = "") with imported/virtual children is the
+            'known stress case. Log the real error for diagnosis and tell the user plainly.
+            Try
+                svnModule.logOperationPublic("Refresh failed: " & ex.ToString())
+            Catch
+            End Try
+
+            Try
+                iSwApp.SendMsgToUser2(
+                    "Refresh could not complete." & vbCrLf & vbCrLf &
+                    "If the active document is new and unsaved, save and commit it first, then Refresh again.",
+                    swMessageBoxIcon_e.swMbWarning,
+                    swMessageBoxBtn_e.swMbOk
+                )
+            Catch
+            End Try
+
         Finally
             System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default
         End Try
@@ -3270,6 +3290,14 @@ Public Class UserControl1
 
         If Not (modDoc Is Nothing) Then
             sSuggestedPath = modDoc.GetPathName
+
+            'A new, never-saved document has no path. FileInfo("") throws an unhandled
+            'ArgumentException here, which crashes SOLIDWORKS from a plain button click.
+            If String.IsNullOrWhiteSpace(sSuggestedPath) Then
+                pickFolder()
+                Exit Sub
+            End If
+
             Dim currentDir As DirectoryInfo = New FileInfo(sSuggestedPath).Directory
 
             If (ModifierKeys And Keys.Shift) = Keys.Shift Then
