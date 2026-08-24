@@ -16,6 +16,7 @@ Imports System.Xml
 Imports System.Security.Policy
 'Imports System.Configuration
 
+<ComVisible(True)>
 <ProgId("SVN_AddIn")>
 Public Class UserControl1
 
