@@ -5531,6 +5531,20 @@ Public Class UserControl1
                     If stateReadable Then
                         If Not isReadOnly Then
                             removeFromQueue = True
+                        ElseIf svnModule.isKnownSlowWritableTransitionPathPublic(filePath) Then
+                            'This file's native writable transition previously blocked the
+                            'SOLIDWORKS UI thread for a pathological duration. Never repeat it
+                            'from this background timer; the explicit edit/save precheck will
+                            'perform it if the user actually works on the file. The lock and
+                            'the on-disk attribute are already correct, so drop it silently.
+                            Try
+                                svnModule.logOperationPublic(
+                                    "Known-slow writable transition skipped by deferred timer: " & filePath
+                                )
+                            Catch
+                            End Try
+
+                            removeFromQueue = True
                         Else
                             Try
                                 If File.Exists(filePath) Then
@@ -5542,9 +5556,19 @@ Public Class UserControl1
                             Catch
                             End Try
 
+                            Dim transitionWatch As Stopwatch = Stopwatch.StartNew()
+
                             Try
                                 doc.SetReadOnlyState(False)
                             Catch ex As COMException
+                            Catch
+                            End Try
+
+                            Try
+                                svnModule.noteWritableTransitionDurationPublic(
+                                    filePath,
+                                    transitionWatch.ElapsedMilliseconds
+                                )
                             Catch
                             End Try
 

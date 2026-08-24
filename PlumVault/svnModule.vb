@@ -1785,6 +1785,88 @@ Public Module svnModule
         Return 0
     End Function
 
+    'ModelDoc2.SetReadOnlyState(False) internally rebuilds the document, which on a
+    'virtual/STEP-import-heavy assembly has been measured at 5+ minutes of blocked UI while a
+    'normal part takes ~2 seconds. There is no safe way to predict this in advance (traversing
+    'the component tree to "detect" such assemblies is itself what froze document open in an
+    'earlier attempt), so the transition is measured whenever it actually runs and any file
+    'that ever proves pathologically slow is remembered - in memory and on disk, so the
+    'knowledge survives restarts. Pre-emptive/background transitions (Get Locks completion,
+    'window-switch reconciliation) skip known-slow files entirely; the explicit edit/save
+    'precheck still transitions them synchronously because there the user has explicitly
+    'chosen to edit that exact document and the one-time wait is unavoidable.
+    Private Const SLOW_WRITABLE_TRANSITION_THRESHOLD_MS As Long = 5000
+    Private ReadOnly slowWritableTransitionSync As New Object()
+    Private slowWritableTransitionPaths As HashSet(Of String) = Nothing
+
+    Private Function getSlowWritableTransitionStorePath() As String
+        Try
+            Return Path.Combine(
+                System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
+                "PlumVault",
+                "PlumVault_SlowWritableTransitions.txt"
+            )
+        Catch
+            Return ""
+        End Try
+    End Function
+
+    Private Sub ensureSlowWritableTransitionPathsLoaded()
+        'Callers hold slowWritableTransitionSync.
+        If slowWritableTransitionPaths IsNot Nothing Then Exit Sub
+
+        slowWritableTransitionPaths = New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+        Try
+            Dim storePath As String = getSlowWritableTransitionStorePath()
+            If String.IsNullOrWhiteSpace(storePath) OrElse Not File.Exists(storePath) Then Exit Sub
+
+            For Each line As String In File.ReadAllLines(storePath)
+                If Not String.IsNullOrWhiteSpace(line) Then slowWritableTransitionPaths.Add(line.Trim())
+            Next
+        Catch
+            'A missing/unreadable store only loses the cross-session memory; behavior falls
+            'back to measuring again, never to anything unsafe.
+        End Try
+    End Sub
+
+    Public Function isKnownSlowWritableTransitionPathPublic(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        Dim key As String = normalizeFullPathSafe(filePath)
+
+        SyncLock slowWritableTransitionSync
+            ensureSlowWritableTransitionPathsLoaded()
+            Return slowWritableTransitionPaths.Contains(key)
+        End SyncLock
+    End Function
+
+    Public Sub noteWritableTransitionDurationPublic(ByVal filePath As String, ByVal elapsedMs As Long)
+        If String.IsNullOrWhiteSpace(filePath) Then Exit Sub
+        If elapsedMs < SLOW_WRITABLE_TRANSITION_THRESHOLD_MS Then Exit Sub
+
+        Dim key As String = normalizeFullPathSafe(filePath)
+
+        SyncLock slowWritableTransitionSync
+            ensureSlowWritableTransitionPathsLoaded()
+            If Not slowWritableTransitionPaths.Add(key) Then Exit Sub
+
+            Try
+                Dim storePath As String = getSlowWritableTransitionStorePath()
+                If Not String.IsNullOrWhiteSpace(storePath) Then
+                    Directory.CreateDirectory(Path.GetDirectoryName(storePath))
+                    File.WriteAllLines(storePath, slowWritableTransitionPaths.ToArray())
+                End If
+            Catch
+            End Try
+        End SyncLock
+
+        writeOperationLog(
+            "Slow writable transition recorded (" & elapsedMs.ToString() & " ms); " &
+            "future background transitions will skip: " & key
+        )
+    End Sub
+
     Private Function ensureOpenCadDocumentWritableNow(ByVal filePath As String,
                                                        ByVal openDocument As ModelDoc2,
                                                        ByRef failureReason As String) As Boolean
@@ -1822,6 +1904,8 @@ Public Module svnModule
 
         If Not isReadOnly Then Return True
 
+        Dim transitionWatch As Stopwatch = Stopwatch.StartNew()
+
         Try
             'This is intentionally synchronous and scoped to one explicit interaction target.
             'The user already owns its live SVN lock and is about to edit/save this exact file.
@@ -1829,9 +1913,14 @@ Public Module svnModule
             'documents can trigger sibling rebuild and false-dirty cascades.
             openDocument.SetReadOnlyState(False)
         Catch ex As Exception
+            noteWritableTransitionDurationPublic(filePath, transitionWatch.ElapsedMilliseconds)
             failureReason = "SOLIDWORKS could not release its internal read-only state: " & ex.Message
             Return False
         End Try
+
+        'Remember pathologically slow transitions so background reconciliation never repeats
+        'them for this file. This explicit path itself still runs when the user edits/saves.
+        noteWritableTransitionDurationPublic(filePath, transitionWatch.ElapsedMilliseconds)
 
         Try
             If openDocument.IsOpenedReadOnly() Then
@@ -18758,6 +18847,21 @@ Public Module svnModule
                 'Any transient COM failure keeps the existing deferred retry as a fallback.
                 For Each writablePath As String In immediateWritablePaths
                     Dim writableFailure As String = ""
+
+                    'A file that previously took pathologically long in SetReadOnlyState is
+                    'never transitioned pre-emptively again (the disk read-only attribute is
+                    'already cleared by the lock itself). The explicit edit/save precheck
+                    'still transitions it when the user actually works on it. The in-flight
+                    'auto-edit target is exempt from the skip: that edit is about to replay
+                    'and must observe a writable document now.
+                    If isKnownSlowWritableTransitionPathPublic(writablePath) AndAlso
+                       Not (autoEditWasAttempted AndAlso pathsAreSame(writablePath, autoEditTargetPath)) Then
+                        writeOperationLog(
+                            "Known-slow writable transition skipped after Get Locks: " & writablePath
+                        )
+                        Continue For
+                    End If
+
                     Dim openDocument As ModelDoc2 = getOpenModelByPathSafe(writablePath)
 
                     If ensureOpenCadDocumentWritableNow(writablePath, openDocument, writableFailure) Then
