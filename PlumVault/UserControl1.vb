@@ -4660,11 +4660,19 @@ Public Class UserControl1
                     End Try
                 End If
 
-                Try
-                    modDocChild = TryCast(swChildComp.GetModelDoc2(), ModelDoc2)
-                Catch
-                    modDocChild = Nothing
-                End Try
+                'Do not touch a virtual component's in-memory ModelDoc2 during tree building.
+                'A just-imported STEP/virtual child can still be settling inside SOLIDWORKS,
+                'and GetModelDoc2 on it from a Refresh has been implicated in UI freezes.
+                'Virtual components are never added to the model list anyway, and the node
+                'text/stable path both come from the Component2. Only when the component has
+                'no path at all is the doc still fetched, so the child is never dropped.
+                If Not childIsVirtual OrElse String.IsNullOrWhiteSpace(childPath) Then
+                    Try
+                        modDocChild = TryCast(swChildComp.GetModelDoc2(), ModelDoc2)
+                    Catch
+                        modDocChild = Nothing
+                    End Try
+                End If
             End If
 
             If String.IsNullOrWhiteSpace(childPath) AndAlso modDocChild Is Nothing Then
