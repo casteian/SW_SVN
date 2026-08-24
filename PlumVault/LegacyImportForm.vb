@@ -274,6 +274,9 @@ Public Class LegacyImportForm
         _grid.AllowUserToResizeRows = False
         _grid.AutoGenerateColumns = False
         _grid.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells
+        'Two-line headers mark which columns are editable; wrap + autosize so the hint shows.
+        _grid.ColumnHeadersDefaultCellStyle.WrapMode = DataGridViewTriState.True
+        _grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize
         _grid.BackgroundColor = SystemColors.Window
         _grid.BorderStyle = BorderStyle.Fixed3D
         _grid.EditMode = DataGridViewEditMode.EditOnEnter
@@ -320,7 +323,7 @@ Public Class LegacyImportForm
 
         Dim newIdColumn As New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
-            .HeaderText = "New ID / filename",
+            .HeaderText = "New ID / filename" & vbCrLf & "(click cell and type)",
             .Width = 180,
             .MinimumWidth = 150
         }

@@ -215,6 +215,9 @@ Public Class ExternalReferenceImportForm
         _grid.EnableHeadersVisualStyles = False
         _grid.ColumnHeadersDefaultCellStyle.Font = New Font("Segoe UI", 9.5F, FontStyle.Bold)
         _grid.ColumnHeadersDefaultCellStyle.BackColor = SystemColors.Control
+        'Two-line headers mark which columns are editable; wrap + autosize so the hint shows.
+        _grid.ColumnHeadersDefaultCellStyle.WrapMode = DataGridViewTriState.True
+        _grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize
         _grid.DefaultCellStyle.Font = New Font("Segoe UI", 9.25F, FontStyle.Regular)
         _grid.DefaultCellStyle.Padding = New Padding(3, 2, 3, 2)
         _grid.RowTemplate.Height = 32
@@ -260,14 +263,14 @@ Public Class ExternalReferenceImportForm
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_NEW_ID,
-            .HeaderText = "New ID / filename",
+            .HeaderText = "New ID / filename" & vbCrLf & "(click cell and type)",
             .Width = 150,
             .MinimumWidth = 130
         })
 
         _grid.Columns.Add(New DataGridViewTextBoxColumn() With {
             .Name = COL_DESTINATION,
-            .HeaderText = "Destination folder",
+            .HeaderText = "Destination folder" & vbCrLf & "(type or Browse)",
             .Width = 190,
             .MinimumWidth = 160
         })
