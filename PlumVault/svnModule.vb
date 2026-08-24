@@ -4355,6 +4355,8 @@ Public Module svnModule
     'restore the EditUndo2 call without confirming SolidWorks' interactive-edit behavior first.
     Public Sub handlePartOwnedEditPostPublic(ByVal partDocument As ModelDoc2, ByVal actionDescription As String)
         If partDocument Is Nothing Then Exit Sub
+        'Commit-time rebuild notifications on unrelated open documents must not warn.
+        If warnOnlyGuardInPostSaveGrace() Then Exit Sub
         If assemblyEditGuardSuppressed(partDocument) Then Exit Sub
         If assemblyHasRequiredLockFast(partDocument) Then Exit Sub
         If consumeAssemblyRebuildGenericModifyAllowance(partDocument) Then Exit Sub
@@ -4910,6 +4912,9 @@ Public Module svnModule
                If(pendingSuppressionEventAssembly, assemblyDocument)
            ) Then Exit Sub
 
+        'Commit-time rebuild notifications on unrelated open documents must not warn.
+        If warnOnlyGuardInPostSaveGrace() Then Exit Sub
+
         If allowRebuildModifyFallback Then
             If consumeAssemblyRebuildGenericModifyAllowance(assemblyDocument) Then Exit Sub
         Else
@@ -5205,7 +5210,22 @@ Public Module svnModule
 
     Private Sub endInternalSolidWorksSave()
         If internalSolidWorksSaveDepth > 0 Then internalSolidWorksSaveDepth -= 1
+        If internalSolidWorksSaveDepth = 0 Then lastInternalSaveEndedUtc = DateTime.UtcNow
     End Sub
+
+    Private lastInternalSaveEndedUtc As DateTime = DateTime.MinValue
+
+    'PlumVault's own controlled save/commit rebuilds the whole open assembly tree, and the
+    'resulting generic Modify/AddItem notifications on OTHER open, unlocked documents arrive
+    'AFTER the internal-save gate has already closed (the commit itself runs asynchronously).
+    'Without this grace, one commit of a locked top assembly produced a one-time flurry of
+    '"not locked by you" warnings naming unrelated sub-assemblies the user never touched.
+    'This suppresses only the WARN-ONLY post guards - every cancellable pre-event block is
+    'unaffected, so no protection is lost during the window.
+    Private Function warnOnlyGuardInPostSaveGrace() As Boolean
+        If asyncCommitInProgress Then Return True
+        Return (DateTime.UtcNow - lastInternalSaveEndedUtc).TotalSeconds < 20.0
+    End Function
 
     Private Function getCadExtensionForDocument(ByVal doc As ModelDoc2) As String
         If doc Is Nothing Then Return ""
@@ -17912,6 +17932,32 @@ Public Module svnModule
             'does not remain green until the user manually clicks Refresh.
             updateLockStatusPublic(bRefreshAllTreeViews:=False)
             refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+        Catch
+        End Try
+
+        'The immediate refresh above can race TortoiseSVN's working-copy finalization: a row
+        'scanned mid-finalize reads as locally modified and shows a stale [Not committed]
+        'until the user happens to run Get Locks/Sync. One short one-shot settle re-read of
+        'the same local status corrects any such row automatically. Local-only, no server.
+        Try
+            Dim settleTimer As New System.Windows.Forms.Timer() With {.Interval = 2500}
+            AddHandler settleTimer.Tick,
+                Sub(sender As Object, e As EventArgs)
+                    Try
+                        settleTimer.Stop()
+                        settleTimer.Dispose()
+                    Catch
+                    End Try
+
+                    Try
+                        If myUserControl Is Nothing OrElse myUserControl.IsDisposed Then Exit Sub
+                        updateLockStatusPublic(bRefreshAllTreeViews:=False)
+                        refreshActiveTreeAfterSvnAction(bUpdateLocalLockStatus:=False)
+                        writeOperationLog("Post-commit settle status re-read completed.")
+                    Catch
+                    End Try
+                End Sub
+            settleTimer.Start()
         Catch
         End Try
 
