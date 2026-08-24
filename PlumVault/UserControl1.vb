@@ -4307,7 +4307,7 @@ Public Class UserControl1
                 swConf = swConfMgr.ActiveConfiguration
                 swRootComp = swConf.GetRootComponent3(True)
 
-                TraverseComponent(swRootComp, modelDocList, 1, parentNode, bUniqueOnly, bResolveLightweight, iTreeDepthLimit)
+                TraverseComponent(swRootComp, modelDocList, 1, parentNode, bUniqueOnly, bResolveLightweight, iTreeDepthLimit, getSafeModelPath(modDocArr(i)))
 
                 If bUpdateTreeView AndAlso iTreeDepthLimit < 0 Then
                     addMissingComponentsFromFlatAssemblyList(CType(modDocArr(i), AssemblyDoc), modelDocList, parentNode, bUniqueOnly, bResolveLightweight)
@@ -4527,7 +4527,8 @@ Public Class UserControl1
                          Optional ByRef rootNode As TreeNode = Nothing,
                          Optional ByVal bUniqueOnly As Boolean = True,
                          Optional ByVal bResolveLightweight As Boolean = False,
-                         Optional ByVal iTreeDepthLimit As Integer = -1)
+                         Optional ByVal iTreeDepthLimit As Integer = -1,
+                         Optional ByVal rootAssemblyPath As String = "")
 
         'Keeps suppressed/lightweight components visible in the tree.
         'Suppressed components are not unsuppressed automatically.
@@ -4607,6 +4608,17 @@ Public Class UserControl1
             End Try
 
             Dim childIsVirtual As Boolean = isComponentVirtualSafe(swChildComp)
+
+            'Free byproduct of the traversal this tree build is already doing: remember that
+            'this root assembly embeds virtual/imported components, so background writable
+            'transitions (the multi-minute SetReadOnlyState rebuild) never touch it - learned
+            'BEFORE the cost is ever paid, unlike the measured-slow store.
+            If childIsVirtual AndAlso Not String.IsNullOrWhiteSpace(rootAssemblyPath) Then
+                Try
+                    svnModule.noteAssemblyContainsVirtualComponentsPublic(rootAssemblyPath)
+                Catch
+                End Try
+            End If
             Dim childPath As String = getSafeComponentPath(swChildComp)
             Dim childSuppression As Integer = getSafeComponentSuppression(swChildComp)
 
@@ -4679,7 +4691,7 @@ Public Class UserControl1
                     Continue For
                 End If
 
-                TraverseComponent(swChildComp, mdComponentList, nLevel + 1, parentNode, bUniqueOnly, bResolveLightweight, iTreeDepthLimit)
+                TraverseComponent(swChildComp, mdComponentList, nLevel + 1, parentNode, bUniqueOnly, bResolveLightweight, iTreeDepthLimit, rootAssemblyPath)
 
             Else
 
@@ -5531,7 +5543,8 @@ Public Class UserControl1
                     If stateReadable Then
                         If Not isReadOnly Then
                             removeFromQueue = True
-                        ElseIf svnModule.isKnownSlowWritableTransitionPathPublic(filePath) Then
+                        ElseIf svnModule.shouldSkipBackgroundWritableTransitionPublic(filePath) AndAlso
+                               Not svnModule.isPendingInContextAutoEditTargetPublic(filePath) Then
                             'This file's native writable transition previously blocked the
                             'SOLIDWORKS UI thread for a pathological duration. Never repeat it
                             'from this background timer; the explicit edit/save precheck will

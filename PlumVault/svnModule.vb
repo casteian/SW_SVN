@@ -1841,6 +1841,56 @@ Public Module svnModule
         End SyncLock
     End Function
 
+    'Assemblies observed (during ordinary task-pane tree building, which already inspects
+    'Component2.IsVirtual per child at zero added cost) to contain virtual/imported embedded
+    'components. Their native writable transition is presumed pathological BEFORE it has ever
+    'been paid once, unlike the measured store above which only learns after the fact.
+    Private ReadOnly virtualContainingAssemblyPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+
+    Public Sub noteAssemblyContainsVirtualComponentsPublic(ByVal assemblyPath As String)
+        If String.IsNullOrWhiteSpace(assemblyPath) Then Exit Sub
+
+        Dim key As String = normalizeFullPathSafe(assemblyPath)
+
+        SyncLock slowWritableTransitionSync
+            If Not virtualContainingAssemblyPaths.Add(key) Then Exit Sub
+        End SyncLock
+
+        writeOperationLog("Assembly contains virtual/imported components; background writable transitions disabled: " & key)
+    End Sub
+
+    'True when a background (non-user-initiated) SetReadOnlyState transition must be skipped:
+    'measured-slow files, assemblies known to embed virtual/imported components, and
+    'imported neutral-format/temp/virtual file names. Explicit edit/save prechecks do NOT use
+    'this - the user chose that exact document, so the transition runs there regardless.
+    Public Function shouldSkipBackgroundWritableTransitionPublic(ByVal filePath As String) As Boolean
+        If String.IsNullOrWhiteSpace(filePath) Then Return False
+
+        If isKnownSlowWritableTransitionPathPublic(filePath) Then Return True
+
+        Dim key As String = normalizeFullPathSafe(filePath)
+
+        SyncLock slowWritableTransitionSync
+            If virtualContainingAssemblyPaths.Contains(key) Then Return True
+        End SyncLock
+
+        Try
+            If isSolidWorksTempOrVirtualPath(filePath) Then Return True
+
+            '"Name.stp.SLDPRT"-style imported vendor files carry dumb translated geometry
+            'whose rebuild cost is unpredictable; never transition them in the background.
+            Dim innerExt As String = Path.GetExtension(Path.GetFileNameWithoutExtension(filePath))
+            If Not String.IsNullOrWhiteSpace(innerExt) Then
+                For Each candidate As String In neutralCadImportExtensions
+                    If String.Equals(innerExt, candidate, StringComparison.OrdinalIgnoreCase) Then Return True
+                Next
+            End If
+        Catch
+        End Try
+
+        Return False
+    End Function
+
     Public Sub noteWritableTransitionDurationPublic(ByVal filePath As String, ByVal elapsedMs As Long)
         If String.IsNullOrWhiteSpace(filePath) Then Exit Sub
         If elapsedMs < SLOW_WRITABLE_TRANSITION_THRESHOLD_MS Then Exit Sub
@@ -2374,7 +2424,10 @@ Public Module svnModule
         Dim targetDocument As ModelDoc2 = Nothing
         Dim targetPath As String = ""
 
-        If eventType = swDocumentTypes_e.swDocPART Then
+        If eventType = swDocumentTypes_e.swDocPART OrElse
+           eventType = swDocumentTypes_e.swDocDRAWING Then
+            'A drawing's views/annotations/dimensions belong to the drawing file itself, so
+            'deleting them requires the drawing's own lock - same single-file rule as a part.
             targetDocument = eventDocument
         ElseIf eventType = swDocumentTypes_e.swDocASSEMBLY Then
             Dim selectedObject As Object = Nothing
@@ -2960,6 +3013,19 @@ Public Module svnModule
         Catch
         End Try
     End Sub
+
+    'The deferred writable-state timer must not skip a known-slow file that a pending
+    'Edit Component replay is waiting on: reporting success without the transition would
+    'replay the edit against a still-read-only document. Mirrors the immediate Get Locks
+    'loop's auto-edit exemption.
+    Public Function isPendingInContextAutoEditTargetPublic(ByVal filePath As String) As Boolean
+        Try
+            Dim request As PendingInContextAutoEdit = pendingInContextAutoEditRequest
+            Return request IsNot Nothing AndAlso pathsAreSame(request.ChildPath, filePath)
+        Catch
+            Return False
+        End Try
+    End Function
 
     Public Sub noteDeferredWriteAccessResultPublic(ByVal filePath As String, ByVal succeeded As Boolean)
         Dim request As PendingInContextAutoEdit = pendingInContextAutoEditRequest
@@ -18854,7 +18920,7 @@ Public Module svnModule
                     'still transitions it when the user actually works on it. The in-flight
                     'auto-edit target is exempt from the skip: that edit is about to replay
                     'and must observe a writable document now.
-                    If isKnownSlowWritableTransitionPathPublic(writablePath) AndAlso
+                    If shouldSkipBackgroundWritableTransitionPublic(writablePath) AndAlso
                        Not (autoEditWasAttempted AndAlso pathsAreSame(writablePath, autoEditTargetPath)) Then
                         writeOperationLog(
                             "Known-slow writable transition skipped after Get Locks: " & writablePath

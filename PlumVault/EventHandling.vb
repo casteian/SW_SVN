@@ -1002,6 +1002,16 @@ Public Class DrawingEventHandler
         AddHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
         AddHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
 
+        'Drawing edit protection, mirroring PartEventHandler and reusing the same path-based
+        'guard machinery: deletes are blocked by a cancellable pre-event; adds/modifies are
+        'warning-only post-events shielded by the shared per-path rebuild tracker so view
+        'regeneration after a referenced model changed is never mistaken for a user edit.
+        AddHandler iDrawing.ModifyNotify, AddressOf Me.DrawingDoc_ModifyNotify
+        AddHandler iDrawing.AddItemNotify, AddressOf Me.DrawingDoc_AddItemNotify
+        AddHandler iDrawing.DeleteItemPreNotify, AddressOf Me.DrawingDoc_DeleteItemPreNotify
+        AddHandler iDrawing.RegenNotify, AddressOf Me.DrawingDoc_RegenNotify
+        AddHandler iDrawing.RegenPostNotify, AddressOf Me.DrawingDoc_RegenPostNotify
+
         SolidWorksCtrlWCloseGuardKeyboardHook.Install()
         ConnectModelViews()
 
@@ -1018,6 +1028,11 @@ Public Class DrawingEventHandler
             RemoveHandler iDrawing.FileSaveAsNotify2, AddressOf Me.DrawingDoc_FileSaveAsNotify2
             RemoveHandler iDrawing.FileSavePostNotify, AddressOf Me.DrawingDoc_FileSavePostNotify
             RemoveHandler iDrawing.NewSelectionNotify, AddressOf Me.DrawingDoc_NewSelectionNotify
+            RemoveHandler iDrawing.ModifyNotify, AddressOf Me.DrawingDoc_ModifyNotify
+            RemoveHandler iDrawing.AddItemNotify, AddressOf Me.DrawingDoc_AddItemNotify
+            RemoveHandler iDrawing.DeleteItemPreNotify, AddressOf Me.DrawingDoc_DeleteItemPreNotify
+            RemoveHandler iDrawing.RegenNotify, AddressOf Me.DrawingDoc_RegenNotify
+            RemoveHandler iDrawing.RegenPostNotify, AddressOf Me.DrawingDoc_RegenPostNotify
             RemoveHandler iSwApp.FileCloseNotify, AddressOf Me.SwApp_FileCloseNotify
         Catch
             'The SOLIDWORKS document may already have released its COM connection.
@@ -1060,6 +1075,35 @@ Public Class DrawingEventHandler
 
     Function DrawingDoc_NewSelectionNotify() As Integer
 
+    End Function
+
+    Private Function DrawingDoc_ModifyNotify() As Integer
+        svnModule.handlePartOwnedEditPostPublic(iDocument, "editing this drawing")
+        Return 0
+    End Function
+
+    Private Function DrawingDoc_AddItemNotify(ByVal EntityType As Integer,
+                                               ByVal itemName As String) As Integer
+        svnModule.handlePartOwnedEditPostPublic(iDocument, "adding " & itemName & " to this drawing")
+        Return 0
+    End Function
+
+    Private Function DrawingDoc_DeleteItemPreNotify(ByVal EntityType As Integer,
+                                                     ByVal itemName As String) As Integer
+        Return svnModule.blockSelectedCadDestructiveEditPrePublic(
+            iDocument,
+            "delete " & itemName & " from this drawing"
+        )
+    End Function
+
+    Private Function DrawingDoc_RegenNotify() As Integer
+        svnModule.beginAssemblyRebuildPublic(iDocument)
+        Return 0
+    End Function
+
+    Private Function DrawingDoc_RegenPostNotify() As Integer
+        svnModule.endAssemblyRebuildPublic(iDocument)
+        Return 0
     End Function
 
     Private Function SwApp_FileCloseNotify(ByVal FileName As String, ByVal Reason As Integer) As Integer
